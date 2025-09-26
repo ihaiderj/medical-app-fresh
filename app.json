@@ -20,10 +20,23 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.ihaiderj.medicalapp.dev"
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-asset",
+      "expo-dev-client",
+      "expo-document-picker",
+      "expo-image-picker",
+      "expo-file-system"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "e1898a77-f735-4f1a-bea4-03517c9161f2"
+      }
     }
   }
 }
