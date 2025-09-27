@@ -1,4 +1,5 @@
 import { supabase } from './supabase'
+import { AuthService } from './AuthService'
 
 export interface MRDashboardStats {
   active_presentations: number
@@ -669,10 +670,80 @@ export class MRService {
         return { success: false, error: error.message }
       }
 
+      // Log activity
+      try {
+        const userResult = await AuthService.getCurrentUser()
+        if (userResult.success && userResult.user) {
+          const brochureTitle = data?.[0]?.title || 'Unknown brochure'
+          await this.logActivity(userResult.user.id, 'brochure_view', `Viewed ${brochureTitle}`)
+        }
+      } catch (activityError) {
+        console.log('Failed to log activity:', activityError)
+      }
+
       console.log('View count updated successfully:', data)
       return { success: true, data }
     } catch (error) {
       return { success: false, error: 'Failed to track view' }
+    }
+  }
+
+  // Track brochure download
+  static async trackBrochureDownload(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data, error } = await supabase
+        .from('brochures')
+        .update({ 
+          download_count: supabase.sql`download_count + 1`,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', brochureId)
+        .select()
+
+      if (error) {
+        console.error('Download count update error:', error)
+        return { success: false, error: error.message }
+      }
+
+      // Log activity
+      try {
+        const userResult = await AuthService.getCurrentUser()
+        if (userResult.success && userResult.user) {
+          const brochureTitle = data?.[0]?.title || 'Unknown brochure'
+          await this.logActivity(userResult.user.id, 'brochure_download', `Downloaded ${brochureTitle}`)
+        }
+      } catch (activityError) {
+        console.log('Failed to log activity:', activityError)
+      }
+
+      console.log('Download count updated successfully:', data)
+      return { success: true, data }
+    } catch (error) {
+      return { success: false, error: 'Failed to track download' }
+    }
+  }
+
+  // Log activity function
+  static async logActivity(userId: string, activityType: string, description: string, metadata?: any): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      console.log('Attempting to log activity:', { userId, activityType, description })
+      const { data, error } = await supabase.rpc('log_activity', {
+        p_user_id: userId,
+        p_activity_type: activityType,
+        p_description: description,
+        p_metadata: metadata || null
+      })
+
+      if (error) {
+        console.error('Activity log error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Activity logged successfully:', data)
+      return { success: true, data }
+    } catch (error) {
+      console.error('Activity log error:', error)
+      return { success: false, error: 'Failed to log activity' }
     }
   }
 }

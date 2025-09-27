@@ -29,6 +29,8 @@ interface SavedBrochure extends MRAssignedBrochure {
   localPath: string
   customTitle: string
   downloadedAt: string
+  localViewCount: number
+  localDownloadCount: number
 }
 
 export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
@@ -153,6 +155,23 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                 // Use existing thumbnail
                 thumbnails[brochure.brochure_id] = result.data.thumbnailUri
               }
+            } else {
+              // Brochure not processed yet, process it to get thumbnail
+              console.log('Processing new ZIP brochure for thumbnail:', brochure.title)
+              if (brochure.file_url) {
+                const processResult = await BrochureManagementService.processZipFile(
+                  brochure.brochure_id,
+                  brochure.file_url,
+                  brochure.title
+                )
+                if (processResult.success) {
+                  // Now try to generate thumbnail
+                  const thumbnailResult = await BrochureManagementService.generateThumbnail(brochure.brochure_id)
+                  if (thumbnailResult.success && thumbnailResult.thumbnailUri) {
+                    thumbnails[brochure.brochure_id] = thumbnailResult.thumbnailUri
+                  }
+                }
+              }
             }
           } catch (error) {
             console.log('Could not load thumbnail for brochure:', brochure.brochure_id, error)
@@ -236,7 +255,9 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
         localId,
         localPath,
         customTitle,
-        downloadedAt: new Date().toISOString()
+        downloadedAt: new Date().toISOString(),
+        localViewCount: 0,
+        localDownloadCount: 1
       }
 
       // Add to saved brochures
@@ -249,6 +270,17 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
 
       // Track download
       await MRService.trackBrochureDownload(brochure.brochure_id)
+
+      // Update the download count in the available brochures list
+      console.log('Updating download count for brochure ID:', brochure.brochure_id)
+      const updatedAvailable = availableBrochures.map(b => {
+        const shouldUpdate = b.brochure_id === brochure.brochure_id
+        console.log(`Brochure ${b.title} (${b.brochure_id}): ${shouldUpdate ? 'UPDATING' : 'NOT UPDATING'}`)
+        return shouldUpdate 
+          ? { ...b, download_count: (b.download_count || 0) + 1 }
+          : b
+      })
+      setAvailableBrochures(updatedAvailable)
 
       // Switch to saved tab
       setActiveTab('saved')
@@ -267,6 +299,20 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
 
       // Track view
       await MRService.trackBrochureView(brochure.brochure_id)
+      
+      // If it's a saved brochure, increment local view count
+      if ('localId' in brochure) {
+        const updatedSaved = savedBrochures.map(b => 
+          b.localId === brochure.localId 
+            ? { ...b, localViewCount: b.localViewCount + 1 }
+            : b
+        )
+        setSavedBrochures(updatedSaved)
+        
+        // Save to AsyncStorage
+        const key = `mr_saved_brochures_${currentUserId}`
+        await AsyncStorage.setItem(key, JSON.stringify(updatedSaved))
+      }
 
       // Determine file URL
       let fileUrl = brochure.file_url
@@ -381,6 +427,13 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
               const key = `mr_saved_brochures_${currentUserId}`
               await AsyncStorage.setItem(key, JSON.stringify(updatedSaved))
 
+              // Log delete activity
+              try {
+                await MRService.logActivity(currentUserId, 'brochure_delete', `Deleted ${brochure.customTitle}`)
+              } catch (error) {
+                console.log('Failed to log delete activity:', error)
+              }
+
               Alert.alert("Success", "Brochure deleted successfully")
             } catch (error) {
               console.error('Delete error:', error)
@@ -429,6 +482,12 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
       <StatusBar style="dark" />
         {/* Header */}
         <View style={styles.header}>
+          <TouchableOpacity
+            style={styles.backButton}
+            onPress={() => navigation.goBack()}
+          >
+            <Ionicons name="arrow-back" size={24} color="#1f2937" />
+          </TouchableOpacity>
             <Text style={styles.headerTitle}>My Brochures</Text>
           <TouchableOpacity
             style={styles.filterButton}
@@ -545,11 +604,17 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                         By: {brochure.uploaded_by_name || 'Administrator'}
                       </Text>
                       <View style={styles.brochureStats}>
+                        {isSaved && (
+                          <Text style={styles.brochureStat}>
+                            <Ionicons name="eye" size={14} color="#6b7280" /> {(brochure as SavedBrochure).localViewCount || 0}
+                          </Text>
+                        )}
                         <Text style={styles.brochureStat}>
-                          <Ionicons name="eye" size={14} color="#6b7280" /> {brochure.view_count || 0}
-                        </Text>
-                        <Text style={styles.brochureStat}>
-                          <Ionicons name="download" size={14} color="#6b7280" /> {brochure.download_count || 0}
+                          <Ionicons name="download" size={14} color="#6b7280" /> {
+                            isSaved 
+                              ? (brochure as SavedBrochure).localDownloadCount || 0
+                              : brochure.download_count || 0
+                          }
                         </Text>
                   </View>
                       {isSaved && (
@@ -700,16 +765,21 @@ const styles = StyleSheet.create({
   },
   header: {
     flexDirection: "row",
-    justifyContent: "space-between",
     alignItems: "center",
+    justifyContent: "space-between",
     paddingHorizontal: 20,
     paddingVertical: 16,
+    paddingTop: 20,
     backgroundColor: "#ffffff",
     borderBottomWidth: 1,
     borderBottomColor: "#e5e7eb",
+    top: 20,
+  },
+  backButton: {
+    padding: 8,
   },
   headerTitle: {
-    fontSize: 24,
+    fontSize: 18,
     fontWeight: "bold",
     color: "#1f2937",
   },
@@ -788,7 +858,7 @@ const styles = StyleSheet.create({
     height: 80,
     borderRadius: 8,
     backgroundColor: "#f3f4f6",
-    resizeMode: "cover",
+    resizeMode: "contain",
   },
   placeholderImage: {
     justifyContent: "center",

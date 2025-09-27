@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import {
   View,
   Text,
@@ -9,7 +9,9 @@ import {
   Image,
   Dimensions,
   Alert,
+  Animated,
 } from "react-native"
+import { PinchGestureHandler, State } from 'react-native-gesture-handler'
 import { Ionicons } from "@expo/vector-icons"
 import { StatusBar } from "expo-status-bar"
 import * as ScreenOrientation from 'expo-screen-orientation'
@@ -36,6 +38,10 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
   const [selectedSlideIndex, setSelectedSlideIndex] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
   const [convertedPresentation, setConvertedPresentation] = useState<PresentationData | null>(null)
+  
+  // Zoom functionality
+  const scale = useRef(new Animated.Value(1)).current
+  const lastScale = useRef(1)
 
   // Lock orientation to landscape for better PDF viewing
   useEffect(() => {

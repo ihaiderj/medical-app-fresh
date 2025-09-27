@@ -31,6 +31,8 @@ interface BrochureData {
   tags?: string[]
   is_public: boolean
   created_at: string
+  view_count?: number
+  download_count?: number
 }
 
 interface ViewAllBrochuresScreenProps {
@@ -179,6 +181,14 @@ export default function ViewAllBrochuresScreen({ navigation }: ViewAllBrochuresS
       )}
 
       <View style={styles.brochureStats}>
+        <View style={styles.statItem}>
+          <Ionicons name="eye" size={16} color="#6b7280" />
+          <Text style={styles.statText}>{brochure.view_count || 0} views</Text>
+        </View>
+        <View style={styles.statItem}>
+          <Ionicons name="download" size={16} color="#6b7280" />
+          <Text style={styles.statText}>{brochure.download_count || 0} downloads</Text>
+        </View>
         {brochure.pages && (
           <View style={styles.statItem}>
             <Ionicons name="document" size={16} color="#6b7280" />
@@ -556,6 +566,7 @@ const styles = StyleSheet.create({
     height: 60,
     borderRadius: 8,
     backgroundColor: '#f3f4f6',
+    resizeMode: 'contain',
   },
   thumbnailPlaceholder: {
     width: 60,
@@ -575,7 +586,8 @@ const styles = StyleSheet.create({
   },
   brochureStats: {
     flexDirection: 'row',
-    gap: 16,
+    flexWrap: 'wrap',
+    gap: 12,
     marginBottom: 12,
   },
   statItem: {

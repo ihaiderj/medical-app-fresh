@@ -114,19 +114,13 @@ export class BrochureManagementService {
         console.log('Created slides from real ZIP:', slides.length)
       } catch (error) {
         console.error('ZIP extraction failed:', error)
-        // Fallback: Create placeholder slides matching your ZIP count
-        for (let i = 1; i <= 40; i++) {
-          slides.push({
-            id: `${brochureId}_slide_${i}`,
-            title: `Slide ${i.toString().padStart(3, '0')}`,
-            fileName: `slide_${i.toString().padStart(3, '0')}.jpg`,
-            imageUri: `https://picsum.photos/800/600?random=${i}`,
-            order: i,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          })
-        }
-        console.log('Created fallback slides:', slides.length)
+        // Don't create fallback slides - return error instead
+        return { success: false, error: 'Failed to extract ZIP file. File may be corrupted or inaccessible.' }
+      }
+      
+      // If no slides were extracted, return error
+      if (slides.length === 0) {
+        return { success: false, error: 'No image files found in ZIP archive.' }
       }
       
       // Create brochure data

@@ -9,6 +9,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AuthService } from './src/services/AuthService';
 import LoginScreen from './src/screens/LoginScreen';
 import AdminDashboardScreen from './src/screens/admin/AdminDashboardScreen';
+import AdminTabs from './src/screens/admin/AdminTabs';
 import AddMRScreen from './src/screens/admin/AddMRScreen';
 import ViewAllMRsScreen from './src/screens/admin/ViewAllMRsScreen';
 import AddBrochureScreen from './src/screens/admin/AddBrochureScreen';
@@ -126,7 +127,7 @@ export default function App() {
     <SafeAreaProvider>
       <NavigationContainer>
         <Stack.Navigator 
-          initialRouteName={isAuthenticated ? (userRole === 'admin' ? 'AdminDashboard' : 'MRTabs') : 'Welcome'}
+          initialRouteName={isAuthenticated ? (userRole === 'admin' ? 'AdminTabs' : 'MRTabs') : 'Welcome'}
           screenOptions={{
             headerShown: false,
             contentStyle: { backgroundColor: '#ffffff' }
@@ -142,6 +143,13 @@ export default function App() {
         <Stack.Screen 
           name="Login" 
           component={LoginScreen}
+          options={{
+            statusBarStyle: 'dark'
+          }}
+        />
+        <Stack.Screen 
+          name="AdminTabs" 
+          component={AdminTabs}
           options={{
             statusBarStyle: 'dark'
           }}

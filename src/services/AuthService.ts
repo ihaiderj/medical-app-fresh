@@ -84,6 +84,20 @@ export class AuthService {
           is_active: profile.is_active,
         }
         this.setCurrentUser(userProfile)
+        
+        // Log login activity
+        try {
+          console.log('Attempting to log login activity for user:', profile.id)
+          const result = await supabase.rpc('log_activity', {
+            p_user_id: profile.id,
+            p_activity_type: 'login',
+            p_description: `Logged in as ${profile.role}`
+          })
+          console.log('Login activity logged successfully:', result)
+        } catch (error) {
+          console.error('Failed to log login activity:', error)
+        }
+        
         return {
           success: true,
           user: userProfile,
@@ -128,6 +142,20 @@ export class AuthService {
         is_active: customUser.is_active,
       }
       this.setCurrentUser(userProfile)
+      
+      // Log login activity
+      try {
+        console.log('Attempting to log MR login activity for user:', customUser.id)
+        const result = await supabase.rpc('log_activity', {
+          p_user_id: customUser.id,
+          p_activity_type: 'login',
+          p_description: `Logged in as ${customUser.role}`
+        })
+        console.log('MR login activity logged successfully:', result)
+      } catch (error) {
+        console.error('Failed to log MR login activity:', error)
+      }
+      
       return {
         success: true,
         user: userProfile,

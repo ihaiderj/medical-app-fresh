@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import {
   View,
   Text,
@@ -11,7 +11,20 @@ import {
   TextInput,
   Image,
   FlatList,
+  Dimensions,
 } from 'react-native'
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withTiming,
+  withSpring,
+  runOnJS,
+} from 'react-native-reanimated'
+import {
+  Gesture,
+  GestureDetector,
+  GestureHandlerRootView,
+} from 'react-native-gesture-handler'
 import { StatusBar } from 'expo-status-bar'
 import { Ionicons } from '@expo/vector-icons'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -43,10 +56,110 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [alphabetFilters, setAlphabetFilters] = useState<string[]>([])
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null)
   const [showCheckboxes, setShowCheckboxes] = useState(false)
+  const [isSlideListCollapsed, setIsSlideListCollapsed] = useState(false)
+  
+  // Zoom functionality with reanimated
+  const scale = useSharedValue(1)
+  const translateX = useSharedValue(0)
+  const translateY = useSharedValue(0)
+  const savedScale = useSharedValue(1)
+  
+  const { width: screenWidth, height: screenHeight } = Dimensions.get('window')
+  const imageSize = 360 // Base image size
 
   useEffect(() => {
     loadBrochureData()
   }, [])
+
+  // Pinch gesture
+  const pinchGesture = Gesture.Pinch()
+    .onStart(() => {
+      'worklet';
+      savedScale.value = scale.value
+    })
+    .onUpdate((event) => {
+      'worklet';
+      const newScale = savedScale.value * event.scale
+      scale.value = Math.min(Math.max(newScale, 1), 4) // Limit scale between 1x and 4x
+    })
+    .onEnd(() => {
+      'worklet';
+      if (scale.value < 1) {
+        scale.value = withSpring(1)
+        translateX.value = withSpring(0)
+        translateY.value = withSpring(0)
+      }
+      savedScale.value = scale.value
+    })
+
+  // Pan gesture for moving the image when zoomed
+  const panGesture = Gesture.Pan()
+    .onUpdate((event) => {
+      'worklet';
+      if (scale.value > 1) {
+        const maxTranslateX = (imageSize * scale.value - imageSize) / 2
+        const maxTranslateY = (imageSize * scale.value - imageSize) / 2
+        
+        translateX.value = Math.min(
+          Math.max(event.translationX, -maxTranslateX),
+          maxTranslateX
+        )
+        translateY.value = Math.min(
+          Math.max(event.translationY, -maxTranslateY),
+          maxTranslateY
+        )
+      }
+    })
+
+  // Double tap gesture
+  const doubleTapGesture = Gesture.Tap()
+    .numberOfTaps(2)
+    .onEnd((event) => {
+      'worklet';
+      if (scale.value === 1) {
+        // Zoom in to 2x at the tap position
+        const tapX = event.x - imageSize / 2
+        const tapY = event.y - imageSize / 2
+        
+        scale.value = withSpring(2)
+        translateX.value = withSpring(-tapX * 0.5) // Adjust for centering
+        translateY.value = withSpring(-tapY * 0.5)
+        savedScale.value = 2
+      } else {
+        // Zoom out to 1x
+        scale.value = withSpring(1)
+        translateX.value = withSpring(0)
+        translateY.value = withSpring(0)
+        savedScale.value = 1
+      }
+    })
+
+  // Combine gestures
+  const composedGestures = Gesture.Simultaneous(
+    pinchGesture,
+    panGesture,
+    doubleTapGesture
+  )
+
+  // Animated style for the image
+  const animatedStyle = useAnimatedStyle(() => {
+    'worklet';
+    return {
+      transform: [
+        { translateX: translateX.value },
+        { translateY: translateY.value },
+        { scale: scale.value },
+      ],
+    }
+  })
+
+  // Reset zoom function
+  const resetZoom = () => {
+    scale.value = withSpring(1)
+    translateX.value = withSpring(0)
+    translateY.value = withSpring(0)
+    savedScale.value = 1
+  }
 
   const loadBrochureData = async () => {
     setIsLoading(true)
@@ -534,7 +647,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const filteredSlides = getFilteredSlides()
 
   return (
-    <SafeAreaView style={styles.container}>
+    <GestureHandlerRootView style={styles.container}>
+      <SafeAreaView style={styles.container}>
       <StatusBar style="dark" />
       
       {/* Header */}
@@ -768,15 +882,31 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         </View>
       ) : (
         <View style={styles.content}>
-          {/* Slides List */}
-          <View style={styles.slidesList}>
-            <Text style={styles.sectionTitle}>
-              Slides ({filteredSlides.length})
-            </Text>
-            <FlatList
-              data={filteredSlides}
-              keyExtractor={(item) => item.id}
-              renderItem={({ item }) => (
+          {/* Collapsible Slides List */}
+          {!isSlideListCollapsed ? (
+            <View style={styles.slidesList}>
+              <View style={styles.sectionHeader}>
+                <Text style={styles.sectionTitle}>
+                  ({filteredSlides.length})
+                </Text>
+                <TouchableOpacity 
+                  style={styles.collapseButton}
+                  onPress={() => setIsSlideListCollapsed(true)}
+                >
+                  <Ionicons 
+                    name="chevron-back" 
+                    size={20} 
+                    color="#8b5cf6" 
+                  />
+                  {/* <Text style={styles.collapseButtonText}>
+                    Hide
+                  </Text> */}
+                </TouchableOpacity>
+              </View>
+              <FlatList
+                data={filteredSlides}
+                keyExtractor={(item) => item.id}
+                renderItem={({ item }) => (
                 <TouchableOpacity
                   style={[
                     styles.slideItem,
@@ -786,56 +916,93 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                   onPress={() => handleSlidePress(item)}
                   onLongPress={() => handleSlideLongPress(item)}
                 >
-                  <View style={styles.slideContent}>
-                    <Image source={{ uri: item.imageUri }} style={styles.slideThumb} />
+                  <View style={styles.slideItemContainer}>
+                    <View style={styles.slideInfo}>
+                      <Text style={styles.slideTitle} numberOfLines={2}>
+                        {item.title}
+                      </Text>
+                      <Text style={styles.slideOrder}>#{item.order}</Text>
+                    </View>
                     
-                    {/* Checkbox and View overlay */}
-                    {showCheckboxes && (
-                      <View style={styles.overlayContainer}>
-                        <TouchableOpacity
-                          style={styles.viewIconContainer}
-                          onPress={() => setSelectedSlide(item)}
-                        >
-                          <View style={styles.viewIcon}>
-                            <Ionicons name="eye" size={14} color="#8b5cf6" />
-                          </View>
-                        </TouchableOpacity>
-                        
-                        <TouchableOpacity
-                          style={styles.checkboxContainer}
-                          onPress={() => toggleSlideSelection(item.id)}
-                        >
-                          <View style={[
-                            styles.checkbox,
-                            selectedSlides.includes(item.id) && styles.checkboxSelected
-                          ]}>
-                            {selectedSlides.includes(item.id) && (
-                              <Ionicons name="checkmark" size={16} color="#ffffff" />
-                            )}
-                          </View>
-                        </TouchableOpacity>
-                      </View>
-                    )}
-                  </View>
-                  
-                  <View style={styles.slideInfo}>
-                    <Text style={styles.slideTitle} numberOfLines={1}>
-                      {item.title}
-                    </Text>
-                    <Text style={styles.slideOrder}>#{item.order}</Text>
+                    <View style={styles.slideContent}>
+                      <Image source={{ uri: item.imageUri }} style={styles.slideThumb} />
+                      
+                      {/* Checkbox and View overlay */}
+                      {showCheckboxes && (
+                        <View style={styles.overlayContainer}>
+                          <TouchableOpacity
+                            style={styles.viewIconContainer}
+                            onPress={() => setSelectedSlide(item)}
+                          >
+                            <View style={styles.viewIcon}>
+                              <Ionicons name="eye" size={14} color="#8b5cf6" />
+                            </View>
+                          </TouchableOpacity>
+                          
+                          <TouchableOpacity
+                            style={styles.checkboxContainer}
+                            onPress={() => toggleSlideSelection(item.id)}
+                          >
+                            <View style={[
+                              styles.checkbox,
+                              selectedSlides.includes(item.id) && styles.checkboxSelected
+                            ]}>
+                              {selectedSlides.includes(item.id) && (
+                                <Ionicons name="checkmark" size={16} color="#ffffff" />
+                              )}
+                            </View>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+                    </View>
                   </View>
                 </TouchableOpacity>
               )}
-              style={styles.slidesList}
-            />
-          </View>
+              />
+            </View>
+          ) : (
+            /* Collapsed State - Show button only */
+            <View style={styles.collapsedSidePanel}>
+              <TouchableOpacity 
+                style={styles.showButton}
+                onPress={() => setIsSlideListCollapsed(false)}
+              >
+                <Ionicons 
+                  name="chevron-forward" 
+                  size={20} 
+                  color="#8b5cf6" 
+                />
+                {/* <Text style={styles.showButtonText}>Show</Text> */}
+                <Text style={styles.slideCount}>({filteredSlides.length})</Text>
+              </TouchableOpacity>
+            </View>
+          )}
 
           {/* Selected Slide Preview */}
-          <View style={styles.slidePreview}>
+          <View style={[styles.slidePreview, isSlideListCollapsed && styles.slidePreviewExpanded]}>
             {selectedSlide ? (
               <>
                 <Text style={styles.previewBrochureTitle}>{brochureTitle}</Text>
-                <Image source={{ uri: selectedSlide.imageUri }} style={styles.previewImage} />
+                {console.log('Selected slide:', selectedSlide.id, 'ImageURI:', selectedSlide.imageUri)}
+                <View style={styles.imageContainer}>
+                  <GestureDetector gesture={composedGestures}>
+                    <Animated.View style={styles.gestureContainer}>
+                      <Animated.Image
+                        source={{ uri: selectedSlide.imageUri }}
+                        style={[styles.previewImage, animatedStyle]}
+                        onError={(error) => console.log('Image load error:', error.nativeEvent)}
+                        onLoad={() => console.log('Image loaded successfully for:', selectedSlide.imageUri)}
+                      />
+                    </Animated.View>
+                  </GestureDetector>
+                  <TouchableOpacity 
+                    style={styles.resetZoomButton} 
+                    onPress={resetZoom}
+                  >
+                    <Ionicons name="contract-outline" size={20} color="#8b5cf6" />
+                    <Text style={styles.resetZoomText}>Reset</Text>
+                  </TouchableOpacity>
+                </View>
                 <Text style={styles.previewSlideNumber}>Slide #{selectedSlide.order}</Text>
                 <Text style={styles.previewSlideTitle}>{selectedSlide.title}</Text>
               </>
@@ -1040,7 +1207,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+      </SafeAreaView>
+    </GestureHandlerRootView>
   )
 }
 
@@ -1267,26 +1435,78 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
   },
   slidesList: {
-    flex: 1,
+    flex: 0.15,
     backgroundColor: '#ffffff',
+    minWidth: 70,
+    maxWidth: 100,
   },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: 'bold',
-    color: '#1f2937',
+  collapsedSidePanel: {
+    width: 60,
+    backgroundColor: '#f9fafb',
+    borderRightWidth: 1,
+    borderRightColor: '#e5e7eb',
+    paddingVertical: 16,
+    alignItems: 'center',
+  },
+  showButton: {
+    flexDirection: 'column',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    borderRadius: 6,
+    backgroundColor: '#f3f4f6',
+    gap: 4,
+  },
+  showButtonText: {
+    fontSize: 10,
+    color: '#8b5cf6',
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  slideCount: {
+    fontSize: 8,
+    color: '#6b7280',
+    fontWeight: '400',
+    textAlign: 'center',
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     paddingHorizontal: 16,
     paddingVertical: 12,
     backgroundColor: '#f9fafb',
     borderBottomWidth: 1,
     borderBottomColor: '#e5e7eb',
   },
-  slideItem: {
+  collapseButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#f3f4f6',
+    gap: 4,
+  },
+  collapseButtonText: {
+    fontSize: 12,
+    color: '#8b5cf6',
+    fontWeight: '600',
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#1f2937',
+    flex: 1,
+  },
+  slideItem: {
+    paddingHorizontal: 8,
+    paddingVertical: 6,
     borderBottomWidth: 1,
     borderBottomColor: '#f3f4f6',
+  },
+  slideItemContainer: {
+    flexDirection: 'column',
   },
   slideItemActive: {
     backgroundColor: '#f0f9ff',
@@ -1298,6 +1518,8 @@ const styles = StyleSheet.create({
   },
   slideContent: {
     position: 'relative',
+    alignItems: 'center',
+    marginTop: 8,
   },
   overlayContainer: {
     position: 'absolute',
@@ -1342,32 +1564,40 @@ const styles = StyleSheet.create({
     borderColor: '#8b5cf6',
   },
   slideThumb: {
-    width: 60,
-    height: 40,
+    width: 50,
+    height: 35,
     borderRadius: 4,
     backgroundColor: '#f3f4f6',
-    marginRight: 12,
+    resizeMode: 'contain',
   },
   slideInfo: {
-    flex: 1,
+    alignItems: 'center',
+    paddingHorizontal: 4,
   },
   slideTitle: {
-    fontSize: 14,
+    fontSize: 10,
     fontWeight: '600',
     color: '#1f2937',
+    textAlign: 'left',
     marginBottom: 2,
+    lineHeight: 12,
   },
   slideOrder: {
-    fontSize: 12,
+    fontSize: 8,
     color: '#6b7280',
+    fontWeight: '500',
   },
   slidePreview: {
-    flex: 1.5,
+    flex: 0.90,
     backgroundColor: '#f9fafb',
     borderLeftWidth: 1,
     borderLeftColor: '#e5e7eb',
     padding: 16,
     alignItems: 'center',
+  },
+  slidePreviewExpanded: {
+    flex: 1,
+    borderLeftWidth: 0,
   },
   previewBrochureTitle: {
     fontSize: 14,
@@ -1383,12 +1613,55 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     textAlign: 'center',
   },
-  previewImage: {
+  imageContainer: {
     width: '100%',
-    height: 300,
+    height: 400,
+    marginBottom: 16,
     borderRadius: 8,
     backgroundColor: '#ffffff',
-    marginBottom: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  gestureContainer: {
+    width: '100%',
+    height: 380,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  previewImage: {
+    width: '95%',
+    height: '95%',
+    maxWidth: 350,
+    maxHeight: 350,
+    borderRadius: 8,
+    backgroundColor: '#ffffff',
+    resizeMode: 'contain',
+  },
+  resetZoomButton: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    gap: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  resetZoomText: {
+    fontSize: 12,
+    color: '#8b5cf6',
+    fontWeight: '600',
   },
   previewSlideTitle: {
     fontSize: 18,

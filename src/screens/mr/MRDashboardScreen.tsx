@@ -15,6 +15,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [upcomingMeetings, setUpcomingMeetings] = useState<MRUpcomingMeeting[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [userProfile, setUserProfile] = useState<any>(null)
+  const [availableBrochuresCount, setAvailableBrochuresCount] = useState(0)
 
   // Load dashboard data on component mount
   useEffect(() => {
@@ -33,11 +34,13 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         const [
           statsResult,
           activitiesResult,
-          meetingsResult
+          meetingsResult,
+          brochuresResult
         ] = await Promise.all([
           MRService.getDashboardStats(userResult.user.id),
           MRService.getRecentActivities(userResult.user.id, 5),
-          MRService.getUpcomingMeetings(userResult.user.id, 3)
+          MRService.getUpcomingMeetings(userResult.user.id, 3),
+          MRService.getAssignedBrochures(userResult.user.id)
         ])
 
         // Set dashboard stats
@@ -53,6 +56,11 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         // Set upcoming meetings
         if (meetingsResult.success && meetingsResult.data) {
           setUpcomingMeetings(meetingsResult.data)
+        }
+
+        // Set available brochures count
+        if (brochuresResult.success && brochuresResult.data) {
+          setAvailableBrochuresCount(brochuresResult.data.length)
         }
       }
     } catch (error) {
@@ -127,12 +135,12 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   }
 
   const stats = dashboardStats ? [
-    { label: "Brochures Available", value: dashboardStats.brochures_available?.toString() || "0", icon: "document", color: "#8b5cf6" },
+    { label: "Brochures Available", value: availableBrochuresCount.toString(), icon: "document", color: "#8b5cf6" },
     { label: "Scheduled Meetings", value: dashboardStats.scheduled_meetings.toString(), icon: "calendar", color: "#d97706" },
     { label: "Doctors Connected", value: dashboardStats.doctors_connected.toString(), icon: "people", color: "#ef4444" },
     { label: "This Month Meetings", value: dashboardStats.monthly_meetings.toString(), icon: "trending-up", color: "#6b7280" },
   ] : [
-    { label: "Brochures Available", value: "0", icon: "document", color: "#8b5cf6" },
+    { label: "Brochures Available", value: availableBrochuresCount.toString(), icon: "document", color: "#8b5cf6" },
     { label: "Scheduled Meetings", value: "0", icon: "calendar", color: "#d97706" },
     { label: "Doctors Connected", value: "0", icon: "people", color: "#ef4444" },
     { label: "This Month Meetings", value: "0", icon: "trending-up", color: "#6b7280" },
@@ -140,7 +148,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
 
   const quickActions = [
     { title: "Schedule Meeting", icon: "calendar-outline", action: () => navigation.navigate("Doctors") },
-    { title: "View Brochures", icon: "document-outline", action: () => navigation.navigate("Brochures") },
+    { title: `View Brochures (${availableBrochuresCount})`, icon: "document-outline", action: () => navigation.navigate("Brochures") },
     { title: "Upload Brochure", icon: "cloud-upload-outline", action: () => navigation.navigate("AddBrochure") },
     { title: "Meeting Records", icon: "list-outline", action: () => navigation.navigate("Meetings") },
   ]
