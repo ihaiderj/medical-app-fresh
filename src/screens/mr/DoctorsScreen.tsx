@@ -23,9 +23,10 @@ import { DoctorValidation, DoctorFormData } from "../../utils/doctorValidation"
 
 interface DoctorsScreenProps {
   navigation: any
+  route?: any
 }
 
-export default function DoctorsScreen({ navigation }: DoctorsScreenProps) {
+export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps) {
   const [searchQuery, setSearchQuery] = useState("")
   const [selectedSpecialty, setSelectedSpecialty] = useState("All")
   const [showAddModal, setShowAddModal] = useState(false)
@@ -52,7 +53,25 @@ export default function DoctorsScreen({ navigation }: DoctorsScreenProps) {
   // Load doctors on component mount
   useEffect(() => {
     loadDoctors()
+    
+    // Check if we should open add modal (from group creation flow)
+    if (route?.params?.openAddModal) {
+      setShowAddModal(true)
+    }
   }, [])
+
+  // Handle successful doctor addition from group creation flow
+  useEffect(() => {
+    if (route?.params?.returnToGroup && !showAddModal) {
+      // Return to brochure viewer after doctor is added
+      const { brochureId, brochureTitle } = route.params
+      navigation.navigate('BrochureViewer', {
+        brochureId,
+        brochureTitle,
+        newDoctorAdded: true
+      })
+    }
+  }, [showAddModal, route?.params])
 
   const loadDoctors = async () => {
     setIsLoading(true)

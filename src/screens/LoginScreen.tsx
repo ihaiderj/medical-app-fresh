@@ -3,6 +3,8 @@ import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, Aler
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
 import { AuthService } from "../services/AuthService"
+import { BackgroundSyncService } from "../services/backgroundSyncService"
+import { SmartSyncService } from "../services/smartSyncService"
 
 interface LoginScreenProps {
   navigation: any
@@ -14,6 +16,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
   const [userType, setUserType] = useState<"admin" | "mr">("mr")
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
+  const [rememberMe, setRememberMe] = useState(true)
 
   // Check if user is already logged in
   useEffect(() => {
@@ -44,9 +47,12 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
     setIsLoading(true)
 
     try {
-      const result = await AuthService.signIn(email, password)
+      const result = await AuthService.login(email, password, rememberMe)
       
       if (result.success && result.user) {
+        // Initialize smart sync service for logged-in users
+        await SmartSyncService.initialize()
+        
         // Navigate based on user role
         if (result.user.role === 'admin') {
           navigation.replace("AdminTabs")
@@ -131,6 +137,19 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
               <Ionicons name={showPassword ? "eye-off-outline" : "eye-outline"} size={20} color="#6b7280" />
             </TouchableOpacity>
           </View>
+
+          {/* Remember Me Checkbox */}
+          <TouchableOpacity 
+            style={styles.rememberMeContainer} 
+            onPress={() => setRememberMe(!rememberMe)}
+          >
+            <View style={[styles.checkbox, rememberMe && styles.checkboxChecked]}>
+              {rememberMe && (
+                <Ionicons name="checkmark" size={16} color="#ffffff" />
+              )}
+            </View>
+            <Text style={styles.rememberMeText}>Keep me signed in for 30 days</Text>
+          </TouchableOpacity>
 
           <TouchableOpacity 
             style={[styles.loginButton, isLoading && styles.loginButtonDisabled]} 
@@ -273,6 +292,32 @@ const styles = StyleSheet.create({
   },
   loginButtonDisabled: {
     opacity: 0.7,
+  },
+  rememberMeContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 24,
+    paddingVertical: 8,
+  },
+  checkbox: {
+    width: 20,
+    height: 20,
+    borderWidth: 2,
+    borderColor: "#d1d5db",
+    borderRadius: 4,
+    marginRight: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#ffffff",
+  },
+  checkboxChecked: {
+    backgroundColor: "#8b5cf6",
+    borderColor: "#8b5cf6",
+  },
+  rememberMeText: {
+    fontSize: 14,
+    color: "#6b7280",
+    flex: 1,
   },
   footer: {
     alignItems: "center",

@@ -4,7 +4,6 @@
  */
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as SecureStore from 'expo-secure-store'
-import { AuthService } from './AuthService'
 
 interface PersistentSession {
   userId: string
@@ -133,7 +132,9 @@ export class PersistentAuthService {
       
       // Attempt login with saved credentials
       console.log('Attempting auto-login for:', credentials.email)
-      const loginResult = await AuthService.login(credentials.email, credentials.password)
+      // Import AuthService here to avoid circular dependency
+      const { AuthService } = await import('./AuthService')
+      const loginResult = await AuthService.signIn(credentials.email, credentials.password)
       
       if (loginResult.success) {
         console.log('Auto-login successful')

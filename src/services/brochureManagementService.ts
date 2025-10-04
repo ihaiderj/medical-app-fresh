@@ -1,6 +1,18 @@
 import * as FileSystem from 'expo-file-system'
-import { unzip } from 'react-native-zip-archive'
+import { Platform } from 'react-native'
 import { supabase } from './supabase'
+import { brochureSyncService, BrochureSyncData } from './brochureSyncService'
+
+// Conditionally import react-native-zip-archive only for native platforms
+let unzip: any = null
+if (Platform.OS !== 'web') {
+  try {
+    const zipArchive = require('react-native-zip-archive')
+    unzip = zipArchive.unzip
+  } catch (error) {
+    console.warn('react-native-zip-archive not available:', error)
+  }
+}
 
 export interface BrochureSlide {
   id: string
@@ -8,7 +20,8 @@ export interface BrochureSlide {
   fileName: string
   imageUri: string
   order: number
-  groupId?: string
+  groupId?: string // Deprecated - kept for backward compatibility
+  groupIds?: string[] // New: slides can belong to multiple groups
   createdAt: string
   updatedAt: string
 }
@@ -20,6 +33,7 @@ export interface SlideGroup {
   slideIds: string[]
   order: number
   createdAt: string
+  updatedAt: string
 }
 
 export interface BrochureData {
@@ -33,6 +47,11 @@ export interface BrochureData {
   totalSlides: number
   createdAt: string
   updatedAt: string
+  // Sync metadata
+  lastSyncedAt?: string
+  localLastModified: string
+  needsSync: boolean
+  isModified: boolean
 }
 
 export class BrochureManagementService {
@@ -135,7 +154,10 @@ export class BrochureManagementService {
           console.log('ZIP file downloaded to:', localZipPath)
         }
         
-        // Extract ZIP file using react-native-zip-archive
+        // Extract ZIP file using react-native-zip-archive (native only)
+        if (!unzip) {
+          throw new Error('ZIP extraction not supported on this platform')
+        }
         await unzip(localZipPath, slidesDir)
         console.log('ZIP extracted to:', slidesDir)
         
@@ -183,7 +205,8 @@ export class BrochureManagementService {
         return { success: false, error: 'No image files found in ZIP archive.' }
       }
       
-      // Create brochure data
+      // Create brochure data with sync metadata
+      const now = new Date().toISOString()
       const brochureData: BrochureData = {
         id: brochureId,
         title: brochureTitle,
@@ -192,8 +215,12 @@ export class BrochureManagementService {
         groups: [],
         thumbnailUri: slides[0]?.imageUri, // This will be the first extracted image
         totalSlides: slides.length,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        createdAt: now,
+        updatedAt: now,
+        // Sync metadata
+        localLastModified: now,
+        needsSync: false, // New brochures don't need sync initially
+        isModified: false
       }
       
       // Save brochure metadata
@@ -241,6 +268,40 @@ export class BrochureManagementService {
       
       const dataString = await FileSystem.readAsStringAsync(dataPath)
       const brochureData = JSON.parse(dataString) as BrochureData
+      
+      // Migrate data to include new sync metadata and missing fields
+      let needsSave = false
+      const now = new Date().toISOString()
+      
+      // Migrate groups to include updatedAt if missing
+      brochureData.groups.forEach(group => {
+        if (!group.updatedAt) {
+          group.updatedAt = group.createdAt || now
+          needsSave = true
+        }
+      })
+      
+      // Migrate brochure data to include sync metadata if missing
+      if (!brochureData.localLastModified) {
+        brochureData.localLastModified = brochureData.updatedAt || now
+        needsSave = true
+      }
+      
+      if (brochureData.needsSync === undefined) {
+        brochureData.needsSync = false
+        needsSave = true
+      }
+      
+      if (brochureData.isModified === undefined) {
+        brochureData.isModified = false
+        needsSave = true
+      }
+      
+      // Save migrated data if needed
+      if (needsSave) {
+        console.log('BrochureManager: Migrating brochure data with sync metadata')
+        await FileSystem.writeAsStringAsync(dataPath, JSON.stringify(brochureData, null, 2))
+      }
       
       return { success: true, data: brochureData }
     } catch (error) {
@@ -343,9 +404,13 @@ export class BrochureManagementService {
         return { success: false, error: 'Slide not found' }
       }
       
+      const now = new Date().toISOString()
       brochureData.slides[slideIndex].title = newTitle
-      brochureData.slides[slideIndex].updatedAt = new Date().toISOString()
-      brochureData.updatedAt = new Date().toISOString()
+      brochureData.slides[slideIndex].updatedAt = now
+      brochureData.updatedAt = now
+      brochureData.localLastModified = now
+      brochureData.isModified = true
+      brochureData.needsSync = true
       
       // Save data (user-specific if userId provided)
       if (userId) {
@@ -446,17 +511,42 @@ export class BrochureManagementService {
         color: color,
         slideIds: slideIds,
         order: brochureData.groups.length + 1,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
       }
       
       brochureData.groups.push(newGroup)
       
-      // Update slides to include group reference
+      // Mark brochure as modified
+      const now = new Date().toISOString()
+      brochureData.updatedAt = now
+      brochureData.localLastModified = now
+      brochureData.isModified = true
+      brochureData.needsSync = true
+      
+      // Update slides to include group reference (support multiple groups)
       slideIds.forEach(slideId => {
         const slideIndex = brochureData.slides.findIndex(slide => slide.id === slideId)
         if (slideIndex !== -1) {
-          brochureData.slides[slideIndex].groupId = groupId
-          brochureData.slides[slideIndex].updatedAt = new Date().toISOString()
+          const slide = brochureData.slides[slideIndex]
+          
+          // Initialize groupIds array if it doesn't exist
+          if (!slide.groupIds) {
+            slide.groupIds = []
+            // Migrate old groupId to groupIds if it exists
+            if (slide.groupId) {
+              slide.groupIds.push(slide.groupId)
+            }
+          }
+          
+          // Add to new group if not already included
+          if (!slide.groupIds.includes(groupId)) {
+            slide.groupIds.push(groupId)
+          }
+          
+          // Keep backward compatibility
+          slide.groupId = groupId // Last group assigned (for backward compatibility)
+          slide.updatedAt = new Date().toISOString()
         }
       })
       
@@ -489,7 +579,15 @@ export class BrochureManagementService {
         return { success: false, error: 'Brochure not found' }
       }
       
-      const groupSlides = brochureData.slides.filter(slide => slide.groupId === groupId)
+      // Support both old and new group membership formats
+      const groupSlides = brochureData.slides.filter(slide => {
+        // Check new format first (groupIds array)
+        if (slide.groupIds && slide.groupIds.includes(groupId)) {
+          return true
+        }
+        // Fallback to old format (single groupId)
+        return slide.groupId === groupId
+      })
       
       return { success: true, slides: groupSlides }
     } catch (error) {
@@ -670,6 +768,223 @@ export class BrochureManagementService {
     } catch (error) {
       console.error('Get alphabet filters error:', error)
       return { success: false, error: 'Failed to get alphabet filters' }
+    }
+  }
+
+  /**
+   * Mark brochure as modified (for sync tracking)
+   */
+  static async markBrochureAsModified(brochureId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const result = await this.getBrochureData(brochureId)
+      if (!result.success || !result.data) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      const now = new Date().toISOString()
+      result.data.isModified = true
+      result.data.needsSync = true
+      result.data.localLastModified = now
+      result.data.updatedAt = now
+
+      // Save updated metadata
+      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      await FileSystem.writeAsStringAsync(
+        `${brochureDir}brochure_data.json`,
+        JSON.stringify(result.data, null, 2)
+      )
+
+      console.log('BrochureManager: Marked as modified:', brochureId)
+      return { success: true }
+    } catch (error) {
+      console.error('Mark brochure modified error:', error)
+      return { success: false, error: 'Failed to mark brochure as modified' }
+    }
+  }
+
+  /**
+   * Mark brochure as synced
+   */
+  static async markBrochureAsSynced(brochureId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const result = await this.getBrochureData(brochureId)
+      if (!result.success || !result.data) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      result.data.needsSync = false
+      result.data.isModified = false
+      result.data.lastSyncedAt = new Date().toISOString()
+
+      // Save updated metadata
+      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      await FileSystem.writeAsStringAsync(
+        `${brochureDir}brochure_data.json`,
+        JSON.stringify(result.data, null, 2)
+      )
+
+      console.log('BrochureManager: Marked as synced:', brochureId)
+      return { success: true }
+    } catch (error) {
+      console.error('Mark brochure synced error:', error)
+      return { success: false, error: 'Failed to mark brochure as synced' }
+    }
+  }
+
+  /**
+   * Get all modified brochures that need sync
+   */
+  static async getModifiedBrochures(): Promise<{ success: boolean; data?: string[]; error?: string }> {
+    try {
+      // Get all brochure directories
+      const brochuresDir = this.STORAGE_DIR
+      const dirInfo = await FileSystem.getInfoAsync(brochuresDir)
+      
+      if (!dirInfo.exists) {
+        return { success: true, data: [] }
+      }
+
+      const brochureDirs = await FileSystem.readDirectoryAsync(brochuresDir)
+      const modifiedBrochures: string[] = []
+
+      for (const dir of brochureDirs) {
+        const dataPath = `${brochuresDir}${dir}/brochure_data.json`
+        const fileInfo = await FileSystem.getInfoAsync(dataPath)
+        
+        if (fileInfo.exists) {
+          const dataString = await FileSystem.readAsStringAsync(dataPath)
+          const brochureData = JSON.parse(dataString) as BrochureData
+          
+          if (brochureData.needsSync || brochureData.isModified) {
+            modifiedBrochures.push(brochureData.id)
+          }
+        }
+      }
+
+      return { success: true, data: modifiedBrochures }
+    } catch (error) {
+      console.error('Get modified brochures error:', error)
+      return { success: false, error: 'Failed to get modified brochures' }
+    }
+  }
+
+  /**
+   * Sync brochure changes to server
+   */
+  static async syncBrochureToServer(
+    mrId: string,
+    brochureId: string,
+    brochureTitle: string,
+    slides: BrochureSlide[],
+    groups: SlideGroup[]
+  ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
+    try {
+      return await brochureSyncService.syncBrochureToServer(
+        mrId,
+        brochureId,
+        brochureTitle,
+        slides,
+        groups
+      )
+    } catch (error) {
+      console.error('Brochure sync error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to sync brochure'
+      }
+    }
+  }
+
+  /**
+   * Check if brochure has server changes
+   */
+  static async checkBrochureSyncStatus(
+    mrId: string,
+    brochureId: string,
+    localLastModified?: string
+  ): Promise<{ 
+    success: boolean; 
+    data?: { 
+      hasServerChanges: boolean; 
+      needsDownload: boolean; 
+      serverLastModified?: string; 
+      localLastModified?: string; 
+    }; 
+    error?: string 
+  }> {
+    try {
+      return await brochureSyncService.checkBrochureSyncStatus(
+        mrId,
+        brochureId,
+        localLastModified
+      )
+    } catch (error) {
+      console.error('Brochure sync status check error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to check sync status'
+      }
+    }
+  }
+
+  /**
+   * Download brochure changes from server
+   */
+  static async downloadBrochureChanges(
+    mrId: string,
+    brochureId: string
+  ): Promise<{ 
+    success: boolean; 
+    data?: BrochureSyncData; 
+    error?: string 
+  }> {
+    try {
+      return await brochureSyncService.downloadBrochureChanges(mrId, brochureId)
+    } catch (error) {
+      console.error('Brochure download error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to download brochure changes'
+      }
+    }
+  }
+
+  /**
+   * Apply downloaded brochure changes to local storage
+   */
+  static async applyBrochureChanges(
+    brochureId: string,
+    syncData: BrochureSyncData
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      
+      // Create updated brochure data
+      const brochureData: BrochureData = {
+        id: brochureId,
+        title: syncData.brochureTitle,
+        category: 'General',
+        slides: syncData.slides,
+        groups: syncData.groups,
+        thumbnailUri: syncData.slides[0]?.imageUri,
+        totalSlides: syncData.totalSlides,
+        createdAt: new Date().toISOString(),
+        updatedAt: syncData.lastModified
+      }
+
+      // Save updated brochure data
+      await FileSystem.writeAsStringAsync(
+        `${brochureDir}brochure_data.json`,
+        JSON.stringify(brochureData, null, 2)
+      )
+
+      return { success: true }
+    } catch (error) {
+      console.error('Apply brochure changes error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to apply brochure changes'
+      }
     }
   }
 }

@@ -5,6 +5,8 @@ import React, { useState, useEffect } from "react"
 import { useFocusEffect } from '@react-navigation/native'
 import { AdminService, DashboardStats, RecentActivity, MRPerformance, BrochureAnalytics } from "../../services/AdminService"
 import { AuthService } from "../../services/AuthService"
+import { BackgroundSyncService } from "../../services/backgroundSyncService"
+import { SmartSyncService } from "../../services/smartSyncService"
 
 interface AdminDashboardScreenProps {
   navigation: any
@@ -124,6 +126,9 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
           style: "destructive",
           onPress: async () => {
             try {
+              // Stop sync service before logout
+              SmartSyncService.stop()
+              
               const result = await AuthService.logout()
               if (result.success) {
                 navigation.reset({

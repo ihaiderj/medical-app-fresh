@@ -309,6 +309,54 @@ export class AuthService {
       }
     })
   }
+
+  /**
+   * Logout with persistent data clearing
+   */
+  static async logout(): Promise<{ success: boolean; error?: string }> {
+    try {
+      console.log('Logging out and clearing persistent data...')
+      
+      // Clear persistent session data
+      await PersistentAuthService.clearSession()
+      
+      // Sign out from Supabase
+      await supabase.auth.signOut()
+      
+      // Clear current user
+      this.clearCurrentUser()
+      
+      console.log('Logout completed successfully')
+      return { success: true }
+    } catch (error) {
+      console.error('Error during logout:', error)
+      return { success: false, error: 'Failed to logout completely' }
+    }
+  }
+
+  /**
+   * Attempt automatic login using persistent session
+   */
+  static async attemptAutoLogin(): Promise<AuthResult> {
+    try {
+      console.log('Checking for persistent session...')
+      
+      // Check if there's a valid persistent session
+      const autoLoginResult = await PersistentAuthService.attemptAutoLogin()
+      
+      if (autoLoginResult.success && autoLoginResult.user) {
+        console.log('Auto-login successful for user:', autoLoginResult.user.email)
+        this.setCurrentUser(autoLoginResult.user)
+        return { success: true, user: autoLoginResult.user }
+      } else {
+        console.log('No valid persistent session found')
+        return { success: false, error: autoLoginResult.error || 'No persistent session' }
+      }
+    } catch (error) {
+      console.error('Error in auto-login attempt:', error)
+      return { success: false, error: 'Auto-login failed' }
+    }
+  }
 }
 
 

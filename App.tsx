@@ -7,6 +7,9 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AuthService } from './src/services/AuthService';
+import useActivityTracker from './src/hooks/useActivityTracker';
+import { BackgroundSyncService } from './src/services/backgroundSyncService';
+import { SmartSyncService } from './src/services/smartSyncService';
 import LoginScreen from './src/screens/LoginScreen';
 import AdminDashboardScreen from './src/screens/admin/AdminDashboardScreen';
 import AdminTabs from './src/screens/admin/AdminTabs';
@@ -91,33 +94,57 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [userRole, setUserRole] = useState<'admin' | 'mr' | null>(null);
 
+  // Track user activity for persistent sessions
+  useActivityTracker();
+
   useEffect(() => {
     checkAuthState();
   }, []);
 
   const checkAuthState = async () => {
     try {
-      const isAuth = await AuthService.isAuthenticated();
+      console.log('Checking authentication state...')
+      
+      // First try auto-login with persistent session
+      const autoLoginResult = await AuthService.attemptAutoLogin()
+      if (autoLoginResult.success && autoLoginResult.user) {
+        console.log('Auto-login successful:', autoLoginResult.user.email)
+        setIsAuthenticated(true)
+        setUserRole(autoLoginResult.user.role)
+        
+        // Initialize smart sync service for logged-in users
+        await SmartSyncService.initialize()
+        
+        return
+      }
+      
+      // Fallback to regular auth check
+      const isAuth = await AuthService.isAuthenticated()
       if (isAuth) {
-        const result = await AuthService.getCurrentUser();
+        const result = await AuthService.getCurrentUser()
         if (result.success && result.user) {
-          setIsAuthenticated(true);
-          setUserRole(result.user.role);
+          setIsAuthenticated(true)
+          setUserRole(result.user.role)
+          
+          // Initialize background sync for logged-in users
+          await BackgroundSyncService.initialize()
         } else {
-          setIsAuthenticated(false);
-          setUserRole(null);
+          setIsAuthenticated(false)
+          setUserRole(null)
         }
       } else {
-        setIsAuthenticated(false);
-        setUserRole(null);
+        console.log('No authentication found')
+        setIsAuthenticated(false)
+        setUserRole(null)
       }
     } catch (error) {
-      setIsAuthenticated(false);
-      setUserRole(null);
+      console.error('Error checking auth state:', error)
+      setIsAuthenticated(false)
+      setUserRole(null)
     } finally {
-      setIsLoading(false);
+      setIsLoading(false)
     }
-  };
+  }
 
   if (isLoading) {
     return (

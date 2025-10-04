@@ -19,7 +19,8 @@ export interface MRRecentActivity {
 }
 
 export interface MRAssignedBrochure {
-  brochure_id: string
+  brochure_id?: string  // Legacy field name
+  id: string           // Actual field name from database
   title: string
   category: string
   description?: string

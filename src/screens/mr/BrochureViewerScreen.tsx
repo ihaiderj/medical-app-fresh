@@ -10,6 +10,9 @@ import {
   Dimensions,
   Alert,
   Animated,
+  Modal,
+  TextInput,
+  ActivityIndicator,
 } from "react-native"
 import { PinchGestureHandler, State } from 'react-native-gesture-handler'
 import { Ionicons } from "@expo/vector-icons"
@@ -39,24 +42,71 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
   const [isLoading, setIsLoading] = useState(true)
   const [convertedPresentation, setConvertedPresentation] = useState<PresentationData | null>(null)
   
+  
   // Zoom functionality
   const scale = useRef(new Animated.Value(1)).current
   const lastScale = useRef(1)
 
-  // Lock orientation to landscape for better PDF viewing
+  // Initialize with flexible orientation support
   useEffect(() => {
     console.log("BrochureViewer mounted with:", { brochureId, brochureTitle, brochureFile })
     
-    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE)
+    // Start with landscape but allow switching
+    initializeOrientation()
     
     // Load converted PDF images
     loadConvertedPresentation()
     
+    // Set up dimension change listener
+    const subscription = Dimensions.addEventListener('change', ({ window }) => {
+      setDimensions(window)
+      updateOrientationState(window)
+    })
+    
     // Cleanup: unlock orientation when component unmounts
     return () => {
       ScreenOrientation.unlockAsync()
+      subscription?.remove()
     }
   }, [])
+
+  // Initialize orientation
+  const initializeOrientation = async () => {
+    try {
+      // Allow both orientations
+      await ScreenOrientation.unlockAsync()
+      
+      // Get current orientation
+      const orientation = await ScreenOrientation.getOrientationAsync()
+      console.log('Initial orientation:', orientation)
+      updateOrientationFromEnum(orientation)
+      
+      // Set up orientation change listener
+      ScreenOrientation.addOrientationChangeListener(handleOrientationChange)
+    } catch (error) {
+      console.log("Orientation initialization error:", error)
+    }
+  }
+
+  // Handle orientation changes
+  const handleOrientationChange = (event: any) => {
+    updateOrientationFromEnum(event.orientationInfo.orientation)
+  }
+
+  // Update orientation state from enum
+  const updateOrientationFromEnum = (orientation: any) => {
+    const isLandscape = orientation === ScreenOrientation.Orientation.LANDSCAPE_LEFT || 
+                       orientation === ScreenOrientation.Orientation.LANDSCAPE_RIGHT
+    const newOrientation = isLandscape ? 'landscape' : 'portrait'
+    console.log('Orientation updated to:', newOrientation)
+    setCurrentOrientation(newOrientation)
+  }
+
+  // Update orientation state from dimensions
+  const updateOrientationState = (windowDimensions: any) => {
+    const isLandscape = windowDimensions.width > windowDimensions.height
+    setCurrentOrientation(isLandscape ? 'landscape' : 'portrait')
+  }
 
   const loadConvertedPresentation = async () => {
     try {
@@ -135,10 +185,6 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
     setSlides(fallbackSlides)
   }
 
-  const handleSlideSelect = (index: number) => {
-    setSelectedSlideIndex(index)
-  }
-
   const handlePreviousSlide = () => {
     if (selectedSlideIndex > 0) {
       setSelectedSlideIndex(selectedSlideIndex - 1)
@@ -150,6 +196,28 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
       setSelectedSlideIndex(selectedSlideIndex + 1)
     }
   }
+
+  const handleSlideSelect = (index: number) => {
+    setSelectedSlideIndex(index)
+    console.log('Selected slide:', slides[index]?.id, 'ImageURI:', slides[index]?.image)
+  }
+
+  // Add keyboard navigation support (for accessibility)
+  useEffect(() => {
+    const handleKeyPress = (event: any) => {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+        handlePreviousSlide()
+      } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+        handleNextSlide()
+      }
+    }
+
+    // Only add keyboard listener on web platform
+    if (typeof window !== 'undefined') {
+      window.addEventListener('keydown', handleKeyPress)
+      return () => window.removeEventListener('keydown', handleKeyPress)
+    }
+  }, [selectedSlideIndex, slides.length])
 
   const getImageSource = (imagePath: any) => {
     if (!imagePath) {
@@ -174,6 +242,7 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
     return { uri: imagePath }
   }
 
+
   const currentSlide = slides[selectedSlideIndex]
 
   return (
@@ -189,55 +258,89 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
         <View style={styles.headerCenter}>
           <Text style={styles.headerTitle}>{brochureTitle || "Visualet Fervid 23-080-2025"}</Text>
           <Text style={styles.headerSubtitle}>
-            {slides.length > 0 ? `Page ${selectedSlideIndex + 1} of ${slides.length}` : "Loading..."}
+            {slides.length > 0 ? `Page ${selectedSlideIndex + 1} of ${slides.length}` : "Loading..."} • {currentOrientation}
           </Text>
         </View>
-        <TouchableOpacity 
-          style={styles.fullscreenButton}
-          onPress={async () => {
-            try {
-              const currentOrientation = await ScreenOrientation.getOrientationAsync()
-              if (currentOrientation === ScreenOrientation.Orientation.PORTRAIT_UP) {
-                await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE)
-              } else {
-                await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT)
+        <View style={styles.headerActions}>
+          <TouchableOpacity 
+            style={styles.orientationButton}
+            onPress={async () => {
+              try {
+                console.log('Orientation button pressed, current:', currentOrientation)
+                if (currentOrientation === 'portrait') {
+                  console.log('Switching to landscape...')
+                  await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE)
+                } else {
+                  console.log('Switching to portrait...')
+                  await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT)
+                }
+              } catch (error) {
+                console.log("Orientation change error:", error)
               }
-            } catch (error) {
-              console.log("Orientation change error:", error)
-            }
-          }}
-        >
-          <Ionicons name="expand" size={24} color="#ffffff" />
-        </TouchableOpacity>
+            }}
+          >
+            <Ionicons 
+              name={currentOrientation === 'portrait' ? 'phone-landscape' : 'phone-portrait'} 
+              size={20} 
+              color="#ffffff" 
+            />
+            <Text style={styles.orientationButtonText}>
+              {currentOrientation === 'portrait' ? 'Landscape' : 'Portrait'}
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {/* Main Content */}
-      <View style={styles.contentContainer}>
-        {/* Slide List (Left Side) */}
-        <View style={styles.slideListContainer}>
-          <ScrollView style={styles.slideList} showsVerticalScrollIndicator={false}>
+      {/* Main Content - Responsive Layout */}
+      <View style={[
+        styles.contentContainer,
+        currentOrientation === 'portrait' ? styles.contentContainerPortrait : styles.contentContainerLandscape
+      ]}>
+        {/* Slide List - Responsive Position */}
+        <View style={[
+          styles.slideListContainer,
+          currentOrientation === 'portrait' ? styles.slideListContainerPortrait : styles.slideListContainerLandscape
+        ]}>
+          <ScrollView 
+            style={styles.slideList} 
+            horizontal={currentOrientation === 'portrait'}
+            showsVerticalScrollIndicator={currentOrientation === 'landscape'}
+            showsHorizontalScrollIndicator={currentOrientation === 'portrait'}
+          >
             {slides.map((slide, index) => (
               <TouchableOpacity
                 key={slide.id}
                 style={[
                   styles.slideListItem,
+                  currentOrientation === 'portrait' ? styles.slideListItemPortrait : styles.slideListItemLandscape,
                   index === selectedSlideIndex && styles.slideListItemActive
                 ]}
                 onPress={() => handleSlideSelect(index)}
               >
                 <Image 
                   source={getImageSource(slide.image)} 
-                  style={styles.slideListThumbnail}
+                  style={[
+                    styles.slideListThumbnail,
+                    currentOrientation === 'portrait' ? styles.slideListThumbnailPortrait : styles.slideListThumbnailLandscape
+                  ]}
                   resizeMode="cover"
                 />
-                <Text style={styles.slideListNumber}>{slide.pageNumber}</Text>
+                <Text style={[
+                  styles.slideListNumber,
+                  currentOrientation === 'portrait' && styles.slideListNumberPortrait
+                ]}>
+                  {slide.pageNumber}
+                </Text>
               </TouchableOpacity>
             ))}
           </ScrollView>
         </View>
 
-        {/* Main Slide Display (Right Side) */}
-        <View style={styles.mainSlideContainer}>
+        {/* Main Slide Display - Responsive Size */}
+        <View style={[
+          styles.mainSlideContainer,
+          currentOrientation === 'portrait' ? styles.mainSlideContainerPortrait : styles.mainSlideContainerLandscape
+        ]}>
           {isLoading ? (
             <View style={styles.loadingContainer}>
               <Text style={styles.loadingText}>Loading PDF Images...</Text>
@@ -245,10 +348,13 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
           ) : currentSlide ? (
             <Image 
               source={getImageSource(currentSlide.image)} 
-              style={styles.mainSlideImage}
+              style={[
+                styles.mainSlideImage,
+                currentOrientation === 'portrait' ? styles.mainSlideImagePortrait : styles.mainSlideImageLandscape
+              ]}
               resizeMode="contain"
               onError={(error) => console.log('Image load error:', error)}
-              onLoad={() => console.log('Image loaded successfully')}
+              onLoad={() => console.log('Image loaded successfully for:', currentSlide.image)}
             />
           ) : (
             <View style={styles.noSlideContainer}>
@@ -309,6 +415,31 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: "#4b5563",
   },
+  headerActions: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  orientationButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    gap: 6,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.3)",
+    minWidth: 100,
+    justifyContent: "center",
+  },
+  orientationButtonText: {
+    color: "#ffffff",
+    fontSize: 13,
+    fontWeight: "700",
+    textShadowColor: "rgba(0, 0, 0, 0.5)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
   backButton: {
     padding: 8,
     marginRight: 12,
@@ -334,13 +465,32 @@ const styles = StyleSheet.create({
   },
   contentContainer: {
     flex: 1,
-    flexDirection: "row",
+    flexDirection: "row", // Default landscape layout
+  },
+  contentContainerPortrait: {
+    flexDirection: "column", // Stack vertically in portrait
+  },
+  contentContainerLandscape: {
+    flexDirection: "row", // Side by side in landscape
   },
   slideListContainer: {
-    width: "15%",
+    width: "15%", // Default landscape
     backgroundColor: "#374151",
     borderRightWidth: 1,
     borderRightColor: "#4b5563",
+  },
+  slideListContainerPortrait: {
+    width: "100%",
+    height: "20%", // Top 20% in portrait
+    borderRightWidth: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: "#4b5563",
+  },
+  slideListContainerLandscape: {
+    width: "15%", // Left 15% in landscape
+    height: "100%",
+    borderRightWidth: 1,
+    borderBottomWidth: 0,
   },
   slideList: {
     flex: 1,
@@ -354,6 +504,15 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     marginHorizontal: 4,
   },
+  slideListItemPortrait: {
+    marginRight: 8, // Horizontal spacing in portrait
+    marginBottom: 0,
+    minWidth: 60, // Ensure minimum width for horizontal scroll
+  },
+  slideListItemLandscape: {
+    marginBottom: 4, // Vertical spacing in landscape
+    marginRight: 0,
+  },
   slideListItemActive: {
     backgroundColor: "#8b5cf6",
   },
@@ -363,11 +522,23 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     backgroundColor: "#6b7280",
   },
+  slideListThumbnailPortrait: {
+    width: 45, // Slightly smaller in portrait for horizontal scroll
+    height: 32,
+  },
+  slideListThumbnailLandscape: {
+    width: 50, // Standard size in landscape
+    height: 35,
+  },
   slideListNumber: {
     fontSize: 12,
     color: "#ffffff",
     marginTop: 4,
     fontWeight: "600",
+  },
+  slideListNumberPortrait: {
+    fontSize: 10, // Smaller text in portrait mode
+    marginTop: 2,
   },
   mainSlideContainer: {
     flex: 1,
@@ -375,9 +546,26 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
+  mainSlideContainerPortrait: {
+    flex: 1, // Take remaining space in portrait
+    padding: 16,
+  },
+  mainSlideContainerLandscape: {
+    flex: 1, // Take remaining space in landscape
+    padding: 20,
+  },
   mainSlideImage: {
     width: "100%",
     height: "100%",
+  },
+  mainSlideImagePortrait: {
+    width: "100%",
+    height: "70%", // Adjust for portrait layout
+    maxHeight: 400,
+  },
+  mainSlideImageLandscape: {
+    width: "100%",
+    height: "100%", // Full height in landscape
   },
   loadingContainer: {
     flex: 1,
@@ -410,6 +598,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#374151",
     borderTopWidth: 1,
     borderTopColor: "#4b5563",
+    minHeight: 60, // Ensure consistent height across orientations
   },
   navButton: {
     flexDirection: "row",
@@ -435,5 +624,219 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
     color: "#ffffff",
+  },
+  // Group creation modal styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  modalContent: {
+    backgroundColor: "#ffffff",
+    borderRadius: 16,
+    padding: 0,
+    width: "90%",
+    maxHeight: "80%",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: "#e5e7eb",
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#1f2937",
+  },
+  modalBody: {
+    padding: 20,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#1f2937",
+    marginBottom: 12,
+  },
+  doctorsContainer: {
+    gap: 12,
+    marginBottom: 16,
+  },
+  doctorCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: 12,
+    backgroundColor: "#f9fafb",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  doctorCardSelected: {
+    backgroundColor: "#ede9fe",
+    borderColor: "#8b5cf6",
+  },
+  doctorInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+  },
+  doctorAvatar: {
+    width: 40,
+    height: 40,
+    backgroundColor: "#ffffff",
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  avatarImage: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    resizeMode: "cover",
+  },
+  doctorDetails: {
+    flex: 1,
+  },
+  doctorName: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#1f2937",
+    marginBottom: 2,
+  },
+  doctorSpecialty: {
+    fontSize: 12,
+    color: "#8b5cf6",
+    marginBottom: 2,
+  },
+  doctorHospital: {
+    fontSize: 12,
+    color: "#6b7280",
+  },
+  emptyDoctors: {
+    alignItems: "center",
+    padding: 24,
+    backgroundColor: "#f9fafb",
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  emptyDoctorsText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#6b7280",
+    marginTop: 8,
+  },
+  emptyDoctorsSubtext: {
+    fontSize: 14,
+    color: "#9ca3af",
+    textAlign: "center",
+    marginTop: 4,
+  },
+  addDoctorButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 12,
+    backgroundColor: "#f0f9ff",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#bfdbfe",
+    marginBottom: 16,
+    gap: 8,
+  },
+  addDoctorButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#8b5cf6",
+  },
+  groupDetailsSection: {
+    marginTop: 16,
+    padding: 16,
+    backgroundColor: "#f8fafc",
+    borderRadius: 8,
+  },
+  inputGroup: {
+    marginBottom: 16,
+  },
+  inputLabel: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#374151",
+    marginBottom: 6,
+  },
+  groupNamePreview: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#8b5cf6",
+    padding: 12,
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  groupNameNote: {
+    fontSize: 12,
+    color: "#6b7280",
+    marginTop: 4,
+    fontStyle: "italic",
+  },
+  notesInput: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    color: "#1f2937",
+    textAlignVertical: "top",
+    minHeight: 80,
+  },
+  modalActions: {
+    flexDirection: "row",
+    padding: 20,
+    borderTopWidth: 1,
+    borderTopColor: "#e5e7eb",
+    gap: 12,
+  },
+  cancelButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+    alignItems: "center",
+  },
+  cancelButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#6b7280",
+  },
+  createButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    backgroundColor: "#8b5cf6",
+    alignItems: "center",
+  },
+  createButtonDisabled: {
+    backgroundColor: "#d1d5db",
+  },
+  createButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#ffffff",
+  },
+  loadingContainer: {
+    alignItems: "center",
+    padding: 24,
+  },
+  loadingText: {
+    fontSize: 14,
+    color: "#6b7280",
+    marginTop: 8,
   },
 })
