@@ -1,7 +1,8 @@
 import { View, Text, ScrollView, TouchableOpacity, StyleSheet, SafeAreaView, Modal, TextInput, Alert, ActivityIndicator } from "react-native"
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
-import { useState, useEffect } from "react"
+import React, { useState, useEffect } from "react"
+import { useFocusEffect } from '@react-navigation/native'
 import { AdminService, DashboardStats, RecentActivity, MRPerformance, BrochureAnalytics } from "../../services/AdminService"
 import { AuthService } from "../../services/AuthService"
 
@@ -13,9 +14,7 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
   const [showManageBrochures, setShowManageBrochures] = useState(false)
   const [showManageMRs, setShowManageMRs] = useState(false)
   const [showViewMeetings, setShowViewMeetings] = useState(false)
-  const [showSystemSettings, setShowSystemSettings] = useState(false)
   const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null)
-  const [recentActivities, setRecentActivities] = useState<RecentActivity[]>([])
   const [mrPerformance, setMRPerformance] = useState<MRPerformance[]>([])
   const [brochureAnalytics, setBrochureAnalytics] = useState<BrochureAnalytics[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -25,6 +24,13 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
   useEffect(() => {
     loadDashboardData()
   }, [])
+
+  // Refresh dashboard data when screen comes into focus
+  useFocusEffect(
+    React.useCallback(() => {
+      loadDashboardData()
+    }, [])
+  )
 
   const loadDashboardData = async () => {
     setIsLoading(true)
@@ -38,12 +44,10 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
       // Load all dashboard data in parallel
       const [
         statsResult,
-        activitiesResult,
         performanceResult,
         analyticsResult
       ] = await Promise.all([
         AdminService.getDashboardStats(),
-        AdminService.getRecentActivities(5),
         AdminService.getMRPerformanceStats(),
         AdminService.getBrochureAnalytics()
       ])
@@ -51,11 +55,6 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
       // Set dashboard stats
       if (statsResult.success && statsResult.data) {
         setDashboardStats(statsResult.data)
-      }
-
-      // Set recent activities
-      if (activitiesResult.success && activitiesResult.data) {
-        setRecentActivities(activitiesResult.data)
       }
 
       // Set MR performance
@@ -157,9 +156,6 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
       case "View All Meetings":
         setShowViewMeetings(true)
         break
-      case "System Settings":
-        setShowSystemSettings(true)
-        break
       default:
         Alert.alert("Coming Soon", "This feature is under development")
     }
@@ -170,7 +166,6 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
     { title: "View All Brochures", icon: "library", screen: "ViewAllBrochures" },
     { title: "Manage MRs", icon: "people", screen: "AdminMRs" },
     { title: "View All Meetings", icon: "calendar", screen: "AdminMeetings" },
-    { title: "System Settings", icon: "settings", screen: "AdminSettings" },
   ]
 
   return (
@@ -235,34 +230,6 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
           </View>
         </View>
 
-        {/* Recent Activity */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Recent System Activity</Text>
-          <View style={styles.activityContainer}>
-            {recentActivities.length > 0 ? (
-              recentActivities.map((activity, index) => (
-                <View key={activity.id || index} style={styles.activityItem}>
-                  <View style={styles.activityIcon}>
-                    <Ionicons name={getActivityIcon(activity.activity_type) as any} size={20} color="#8b5cf6" />
-                  </View>
-                  <View style={styles.activityContent}>
-                    <Text style={styles.activityTitle}>{activity.description}</Text>
-                    <Text style={styles.activitySubtitle}>
-                      {activity.user_name} • {formatTimeAgo(activity.created_at)}
-                    </Text>
-                  </View>
-                  <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
-                </View>
-              ))
-            ) : (
-              <View style={styles.emptyState}>
-                <Ionicons name="time-outline" size={48} color="#9ca3af" />
-                <Text style={styles.emptyStateText}>No recent activity</Text>
-                <Text style={styles.emptyStateSubtext}>Activity will appear here as users interact with the system</Text>
-              </View>
-            )}
-          </View>
-        </View>
 
       </ScrollView>
 
@@ -462,76 +429,6 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
         </View>
       </Modal>
 
-      {/* System Settings Modal */}
-      <Modal visible={showSystemSettings} transparent animationType="slide">
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>System Settings</Text>
-              <TouchableOpacity onPress={() => setShowSystemSettings(false)}>
-                <Ionicons name="close" size={24} color="#6b7280" />
-              </TouchableOpacity>
-            </View>
-            
-            <ScrollView style={styles.modalBody}>
-              <View style={styles.actionItem}>
-                <Ionicons name="notifications" size={24} color="#8b5cf6" />
-                <View style={styles.actionContent}>
-                  <Text style={styles.actionTitle}>Notification Settings</Text>
-                  <Text style={styles.actionSubtitle}>Configure system notifications</Text>
-                </View>
-                <TouchableOpacity style={styles.actionButton}>
-                  <Ionicons name="chevron-forward" size={20} color="#6b7280" />
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.actionItem}>
-                <Ionicons name="server" size={24} color="#8b5cf6" />
-                <View style={styles.actionContent}>
-                  <Text style={styles.actionTitle}>Server Configuration</Text>
-                  <Text style={styles.actionSubtitle}>Manage server settings and maintenance</Text>
-                </View>
-                <TouchableOpacity style={styles.actionButton}>
-                  <Ionicons name="chevron-forward" size={20} color="#6b7280" />
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.actionItem}>
-                <Ionicons name="shield" size={24} color="#8b5cf6" />
-                <View style={styles.actionContent}>
-                  <Text style={styles.actionTitle}>Security Settings</Text>
-                  <Text style={styles.actionSubtitle}>Configure security and access controls</Text>
-                </View>
-                <TouchableOpacity style={styles.actionButton}>
-                  <Ionicons name="chevron-forward" size={20} color="#6b7280" />
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.actionItem}>
-                <Ionicons name="cloud-download" size={24} color="#8b5cf6" />
-                <View style={styles.actionContent}>
-                  <Text style={styles.actionTitle}>Backup & Restore</Text>
-                  <Text style={styles.actionSubtitle}>Manage data backup and restore options</Text>
-                </View>
-                <TouchableOpacity style={styles.actionButton}>
-                  <Ionicons name="chevron-forward" size={20} color="#6b7280" />
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.actionItem}>
-                <Ionicons name="information-circle" size={24} color="#8b5cf6" />
-                <View style={styles.actionContent}>
-                  <Text style={styles.actionTitle}>System Information</Text>
-                  <Text style={styles.actionSubtitle}>View system version and status</Text>
-                </View>
-                <TouchableOpacity style={styles.actionButton}>
-                  <Ionicons name="chevron-forward" size={20} color="#6b7280" />
-                </TouchableOpacity>
-              </View>
-            </ScrollView>
-          </View>
-        </View>
-      </Modal>
       </SafeAreaView>
     </View>
   )

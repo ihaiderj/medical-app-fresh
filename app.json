@@ -1,14 +1,14 @@
 {
   "expo": {
-    "name": "medical-app-fresh",
+    "name": "Fervid",
     "slug": "medical-app-fresh",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/fervid-icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/fervid-logo.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },

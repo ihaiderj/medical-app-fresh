@@ -1,4 +1,5 @@
 import { supabase } from './supabase'
+import { PersistentAuthService } from './persistentAuthService'
 
 export interface UserProfile {
   id: string
@@ -43,7 +44,27 @@ export class AuthService {
   }
 
   /**
-   * Sign in with email and password
+   * Login with persistent authentication support
+   */
+  static async login(email: string, password: string, rememberMe: boolean = true): Promise<AuthResult> {
+    const result = await this.signIn(email, password)
+    
+    if (result.success && result.user) {
+      // Save session for persistent authentication
+      await PersistentAuthService.saveSession(
+        result.user.id,
+        result.user.email,
+        result.user.role,
+        password,
+        rememberMe
+      )
+    }
+    
+    return result
+  }
+
+  /**
+   * Sign in with email and password (original method)
    */
   static async signIn(email: string, password: string): Promise<AuthResult> {
     try {

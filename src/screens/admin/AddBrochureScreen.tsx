@@ -15,7 +15,9 @@ import { Ionicons } from '@expo/vector-icons'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import { AdminService } from '../../services/AdminService'
+import { FileStorageService, UploadProgress } from '../../services/fileStorageService'
 import { BrochureManagementService } from '../../services/brochureManagementService'
+import { fixStorageBucket } from '../../utils/fixStorageBucket'
 
 
 interface AddBrochureScreenProps {
@@ -37,6 +39,11 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
   } | null>(null)
   const [uploadType, setUploadType] = useState<'single' | 'zip'>('single')
   const [isLoading, setIsLoading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null)
+  const [isUploading, setIsUploading] = useState(false)
+  const [isProcessing, setIsProcessing] = useState(false)
+  const [showStorageFix, setShowStorageFix] = useState(false)
+  const [isFixingStorage, setIsFixingStorage] = useState(false)
 
   const handleInputChange = (field: string, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))
@@ -91,18 +98,57 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
 
   const handleSubmit = async () => {
     if (!validateForm()) return
+    if (!selectedFile) {
+      Alert.alert('Error', 'Please select a file first')
+      return
+    }
+
+    // Validate file size before upload
+    const fileSizeMB = selectedFile.fileSize / (1024 * 1024)
+    const maxSizeMB = 50
+    if (fileSizeMB > maxSizeMB) {
+      Alert.alert(
+        'File Too Large', 
+        `The selected file (${fileSizeMB.toFixed(1)}MB) exceeds the maximum allowed size of ${maxSizeMB}MB.\n\nPlease:\n• Compress your ZIP file\n• Reduce image quality\n• Remove unnecessary files\n\nTip: Use online ZIP compressors or reduce image resolution to under ${maxSizeMB}MB.`,
+        [{ text: 'OK' }]
+      )
+      return
+    }
 
     setIsLoading(true)
+    setIsUploading(true)
+    setUploadProgress(null)
+    
     try {
       if (uploadType === 'zip' && selectedFile) {
-        // First create brochure record in database to get the real brochure ID
+        // Step 1: Upload file to Supabase Storage with progress
+        console.log('Uploading file to Supabase Storage...')
+        const uploadResult = await FileStorageService.uploadFile(
+          selectedFile.uri,
+          selectedFile.fileName,
+          (progress) => {
+            setUploadProgress(progress)
+            // Remove duplicate console.log - already logged in FileStorageService
+          }
+        )
+
+        if (!uploadResult.success || !uploadResult.publicUrl) {
+          throw new Error(uploadResult.error || 'Failed to upload file')
+        }
+
+        console.log('File uploaded successfully to:', uploadResult.publicUrl)
+        setUploadProgress(null)
+        setIsUploading(false)
+        setIsProcessing(true)
+
+        // Step 2: Create brochure record in database with public URL
         const result = await AdminService.createBrochure(
           formData.title,
           formData.category,
           formData.description || undefined,
-          selectedFile.uri, // Keep original ZIP file URL
+          uploadResult.publicUrl, // Use public URL from Supabase Storage
           selectedFile.fileName,
-          'application/zip',
+          selectedFile.mimeType || 'application/zip',
           undefined, // No thumbnail yet
           undefined, // Pages will be updated after processing
           `${Math.round(selectedFile.fileSize / 1024)}KB`,
@@ -110,15 +156,40 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
         )
         
         if (result.success && result.data?.brochure_id) {
-          // Now process ZIP file with the actual database brochure ID
+          // Step 3: Process ZIP file with the actual database brochure ID
           const brochureId = result.data.brochure_id
+          console.log('Processing ZIP file for slide extraction...')
           const zipResult = await BrochureManagementService.processZipFile(
             brochureId,
-            selectedFile.uri,
+            uploadResult.publicUrl, // Use public URL instead of local URI
             formData.title
           )
           
           if (zipResult.success && zipResult.brochureData) {
+            // Step 4: Upload thumbnail to Supabase Storage for cross-device access
+            let thumbnailUrl = zipResult.brochureData.thumbnailUri
+            
+            if (thumbnailUrl && thumbnailUrl.startsWith('file://')) {
+              console.log('Uploading thumbnail to Supabase Storage...')
+              try {
+                const thumbnailFileName = `thumbnail_${brochureId}.jpg`
+                const thumbnailUploadResult = await FileStorageService.uploadFile(
+                  thumbnailUrl,
+                  thumbnailFileName
+                )
+                
+                if (thumbnailUploadResult.success && thumbnailUploadResult.publicUrl) {
+                  thumbnailUrl = thumbnailUploadResult.publicUrl
+                  console.log('Thumbnail uploaded successfully:', thumbnailUrl)
+                } else {
+                  console.log('Thumbnail upload failed, using local path')
+                }
+              } catch (thumbnailError) {
+                console.log('Thumbnail upload error:', thumbnailError)
+                // Continue with local path
+              }
+            }
+            
             // Update brochure record with thumbnail and slide count
             const updateResult = await AdminService.updateBrochure(
               brochureId,
@@ -127,7 +198,7 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
               undefined, // category
               undefined, // tags
               undefined, // isPublic
-              zipResult.brochureData.thumbnailUri, // thumbnail
+              thumbnailUrl, // thumbnail (now public URL if upload succeeded)
               zipResult.brochureData.totalSlides // pages
             )
             
@@ -168,9 +239,48 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
         }
       }
     } catch (error) {
-      Alert.alert('Error', 'An unexpected error occurred')
+      console.error('Upload error:', error)
+      const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred'
+      
+      // Show storage fix option if it's a size limit error
+      if (errorMessage.includes('exceeded the maximum allowed size')) {
+        setShowStorageFix(true)
+        Alert.alert(
+          'Upload Failed',
+          'File size limit exceeded. This might be a storage bucket configuration issue.\n\nTry the "Fix Storage" button below to reset the storage bucket.',
+          [{ text: 'OK' }]
+        )
+      } else {
+        Alert.alert('Error', errorMessage)
+      }
     } finally {
       setIsLoading(false)
+      setIsUploading(false)
+      setIsProcessing(false)
+      setUploadProgress(null)
+    }
+  }
+
+  const handleFixStorage = async () => {
+    setIsFixingStorage(true)
+    try {
+      console.log('Attempting to fix storage bucket...')
+      const result = await fixStorageBucket()
+      
+      if (result.success) {
+        Alert.alert(
+          'Storage Fixed!',
+          'Storage bucket has been reset successfully. You can now try uploading your file again.',
+          [{ text: 'OK', onPress: () => setShowStorageFix(false) }]
+        )
+      } else {
+        Alert.alert('Fix Failed', result.error || 'Could not fix storage bucket')
+      }
+    } catch (error) {
+      console.error('Storage fix error:', error)
+      Alert.alert('Fix Failed', 'An error occurred while fixing storage')
+    } finally {
+      setIsFixingStorage(false)
     }
   }
 
@@ -321,6 +431,60 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
           </TouchableOpacity>
         </View>
 
+        {/* Upload Progress */}
+        {isUploading && uploadProgress && (
+          <View style={styles.progressContainer}>
+            <Text style={styles.progressText}>
+              Uploading to server... {uploadProgress.percentage}%
+            </Text>
+            <View style={styles.progressBar}>
+              <View 
+                style={[
+                  styles.progressFill, 
+                  { width: `${uploadProgress.percentage}%` }
+                ]} 
+              />
+            </View>
+            <Text style={styles.progressSize}>
+              {Math.round(uploadProgress.loaded / 1024)} KB / {Math.round(uploadProgress.total / 1024)} KB
+            </Text>
+          </View>
+        )}
+
+        {/* Processing Message */}
+        {isProcessing && (
+          <View style={styles.processingContainer}>
+            <ActivityIndicator size="large" color="#8b5cf6" />
+            <Text style={styles.processingText}>
+              Please wait while we are processing the build
+            </Text>
+            <Text style={styles.processingSubtext}>
+              Extracting slides and generating thumbnails...
+            </Text>
+          </View>
+        )}
+
+        {/* Fix Storage Button (shows when upload fails due to size limits) */}
+        {showStorageFix && (
+          <TouchableOpacity
+            style={[styles.fixStorageButton, isFixingStorage && styles.submitButtonDisabled]}
+            onPress={handleFixStorage}
+            disabled={isFixingStorage}
+          >
+            {isFixingStorage ? (
+              <>
+                <ActivityIndicator color="#ffffff" size="small" />
+                <Text style={styles.fixStorageButtonText}>Fixing Storage...</Text>
+              </>
+            ) : (
+              <>
+                <Ionicons name="build" size={20} color="#ffffff" />
+                <Text style={styles.fixStorageButtonText}>Fix Storage Bucket</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        )}
+
         {/* Submit Button */}
         <TouchableOpacity
           style={[styles.submitButton, isLoading && styles.submitButtonDisabled]}
@@ -328,7 +492,12 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
           disabled={isLoading}
         >
           {isLoading ? (
-            <ActivityIndicator color="#ffffff" size="small" />
+            <>
+              <ActivityIndicator color="#ffffff" size="small" />
+              <Text style={styles.submitButtonText}>
+                {isUploading ? 'Uploading...' : isProcessing ? 'Processing...' : 'Creating...'}
+              </Text>
+            </>
           ) : (
             <>
               <Ionicons name="add-circle" size={20} color="#ffffff" />
@@ -535,6 +704,76 @@ const styles = StyleSheet.create({
     opacity: 0.7,
   },
   submitButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  progressContainer: {
+    backgroundColor: '#f9fafb',
+    borderRadius: 8,
+    padding: 16,
+    marginVertical: 16,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  progressText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1f2937',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  progressBar: {
+    height: 8,
+    backgroundColor: '#e5e7eb',
+    borderRadius: 4,
+    overflow: 'hidden',
+    marginBottom: 8,
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: '#8b5cf6',
+    borderRadius: 4,
+  },
+  progressSize: {
+    fontSize: 12,
+    color: '#6b7280',
+    textAlign: 'center',
+  },
+  processingContainer: {
+    backgroundColor: '#f0f9ff',
+    borderRadius: 8,
+    padding: 20,
+    marginVertical: 16,
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    alignItems: 'center',
+  },
+  processingText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1f2937',
+    textAlign: 'center',
+    marginTop: 12,
+    marginBottom: 4,
+  },
+  processingSubtext: {
+    fontSize: 14,
+    color: '#6b7280',
+    textAlign: 'center',
+  },
+  fixStorageButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f59e0b',
+    paddingVertical: 16,
+    borderRadius: 8,
+    marginTop: 16,
+    marginBottom: 16,
+    gap: 8,
+  },
+  fixStorageButtonText: {
     fontSize: 16,
     fontWeight: '600',
     color: '#ffffff',

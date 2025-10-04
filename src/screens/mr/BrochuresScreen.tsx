@@ -19,6 +19,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRAssignedBrochure } from "../../services/MRService"
 import { BrochureManagementService } from "../../services/brochureManagementService"
+import { FileStorageService, DownloadProgress } from "../../services/fileStorageService"
 
 interface BrochuresScreenProps {
   navigation: any
@@ -44,6 +45,10 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
   const [activeTab, setActiveTab] = useState<'available' | 'saved'>('available')
   const [currentUserId, setCurrentUserId] = useState<string>('')
   const [brochureThumbnails, setBrochureThumbnails] = useState<{[key: string]: string}>({})
+  
+  // Download progress state
+  const [downloadProgress, setDownloadProgress] = useState<{[key: string]: DownloadProgress}>({})
+  const [downloadingBrochures, setDownloadingBrochures] = useState<Set<string>>(new Set())
   
   // Rename modal state
   const [showRenameModal, setShowRenameModal] = useState(false)
@@ -156,22 +161,10 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                 thumbnails[brochure.brochure_id] = result.data.thumbnailUri
               }
             } else {
-              // Brochure not processed yet, process it to get thumbnail
-              console.log('Processing new ZIP brochure for thumbnail:', brochure.title)
-              if (brochure.file_url) {
-                const processResult = await BrochureManagementService.processZipFile(
-                  brochure.brochure_id,
-                  brochure.file_url,
-                  brochure.title
-                )
-                if (processResult.success) {
-                  // Now try to generate thumbnail
-                  const thumbnailResult = await BrochureManagementService.generateThumbnail(brochure.brochure_id)
-                  if (thumbnailResult.success && thumbnailResult.thumbnailUri) {
-                    thumbnails[brochure.brochure_id] = thumbnailResult.thumbnailUri
-                  }
-                }
-              }
+              // Brochure not processed yet for MR - skip thumbnail processing
+              // MR users should not process ZIP files for thumbnails due to authentication issues
+              // Admin should process and set thumbnail_url in database
+              console.log('ZIP brochure not processed yet, skipping thumbnail generation for MR user')
             }
           } catch (error) {
             console.log('Could not load thumbnail for brochure:', brochure.brochure_id, error)
@@ -193,6 +186,9 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
       }
 
       console.log('Downloading brochure:', brochure.title)
+
+      // Add to downloading set
+      setDownloadingBrochures(prev => new Set([...prev, brochure.brochure_id]))
 
       // Create unique ID for this download
       const timestamp = Date.now()
@@ -221,18 +217,41 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
         customTitle = `${brochure.title} (${existingBrochuresWithSameTitle + 1})`
       }
 
-      // Download file
+      // Download file with progress tracking
       console.log('Downloading from:', brochure.file_url)
       console.log('Saving to:', localPath)
       
       if (brochure.file_url.startsWith('file://')) {
+        // Local file copy (legacy support)
         await FileSystem.copyAsync({
           from: brochure.file_url,
           to: localPath
         })
       } else {
-        await FileSystem.downloadAsync(brochure.file_url, localPath)
+        // Download from Supabase Storage with progress
+        const downloadResult = await FileStorageService.downloadFile(
+          brochure.file_url,
+          localPath,
+          (progress) => {
+            setDownloadProgress(prev => ({
+              ...prev,
+              [brochure.brochure_id]: progress
+            }))
+            console.log(`Download progress: ${progress.percentage}%`)
+          }
+        )
+
+        if (!downloadResult.success) {
+          throw new Error(downloadResult.error || 'Download failed')
+        }
       }
+
+      // Clear download progress
+      setDownloadProgress(prev => {
+        const updated = { ...prev }
+        delete updated[brochure.brochure_id]
+        return updated
+      })
 
       // If it's a ZIP file, process it immediately for future viewing
       if (brochure.file_type?.includes('zip')) {
@@ -270,6 +289,13 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
 
       // Track download
       await MRService.trackBrochureDownload(brochure.brochure_id)
+      
+      // Log download activity
+      try {
+        await MRService.logActivity(currentUserId, 'brochure_download', `Downloaded ${customTitle}`)
+      } catch (error) {
+        console.log('Failed to log download activity:', error)
+      }
 
       // Update the download count in the available brochures list
       console.log('Updating download count for brochure ID:', brochure.brochure_id)
@@ -288,7 +314,19 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
       Alert.alert("Success", "Brochure downloaded successfully!")
     } catch (error) {
       console.error('Download error:', error)
-      Alert.alert("Error", "Failed to download brochure")
+      Alert.alert("Error", error instanceof Error ? error.message : "Failed to download brochure")
+    } finally {
+      // Clean up download state
+      setDownloadingBrochures(prev => {
+        const updated = new Set(prev)
+        updated.delete(brochure.brochure_id)
+        return updated
+      })
+      setDownloadProgress(prev => {
+        const updated = { ...prev }
+        delete updated[brochure.brochure_id]
+        return updated
+      })
     }
   }
 
@@ -299,6 +337,14 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
 
       // Track view
       await MRService.trackBrochureView(brochure.brochure_id)
+      
+      // Log view activity
+      try {
+        const brochureTitle = 'customTitle' in brochure ? brochure.customTitle : brochure.title
+        await MRService.logActivity(currentUserId, 'brochure_view', `Viewed ${brochureTitle}`)
+      } catch (error) {
+        console.log('Failed to log view activity:', error)
+      }
       
       // If it's a saved brochure, increment local view count
       if ('localId' in brochure) {
@@ -635,13 +681,34 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                     </TouchableOpacity>
                     
                     {activeTab === 'available' && (
+                      <View style={styles.downloadSection}>
+                        {downloadingBrochures.has(brochure.brochure_id) ? (
+                          <View style={styles.downloadProgressContainer}>
+                            <View style={styles.downloadProgressHeader}>
+                              <ActivityIndicator size="small" color="#10b981" />
+                              <Text style={styles.downloadProgressText}>
+                                {downloadProgress[brochure.brochure_id]?.percentage || 0}%
+                              </Text>
+                            </View>
+                            <View style={styles.downloadProgressBar}>
+                              <View 
+                                style={[
+                                  styles.downloadProgressFill, 
+                                  { width: `${downloadProgress[brochure.brochure_id]?.percentage || 0}%` }
+                                ]} 
+                              />
+                            </View>
+                          </View>
+                        ) : (
                       <TouchableOpacity 
                         style={styles.actionButton}
-                        onPress={() => handleDownloadBrochure(brochure)}
+                            onPress={() => handleDownloadBrochure(brochure)}
                       >
-                        <Ionicons name="download" size={16} color="#10b981" />
-                        <Text style={styles.actionButtonText}>Download</Text>
+                            <Ionicons name="download" size={16} color="#10b981" />
+                            <Text style={styles.actionButtonText}>Download</Text>
                       </TouchableOpacity>
+                        )}
+                      </View>
                     )}
                     
                     {activeTab === 'saved' && (
@@ -1031,5 +1098,40 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
     color: "#ffffff",
+  },
+  downloadSection: {
+    flex: 1,
+  },
+  downloadProgressContainer: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: "#f0f9ff",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#bfdbfe",
+  },
+  downloadProgressHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 6,
+    gap: 8,
+  },
+  downloadProgressText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#10b981",
+  },
+  downloadProgressBar: {
+    height: 4,
+    backgroundColor: "#e5e7eb",
+    borderRadius: 2,
+    overflow: "hidden",
+  },
+  downloadProgressFill: {
+    height: "100%",
+    backgroundColor: "#10b981",
+    borderRadius: 2,
   },
 })

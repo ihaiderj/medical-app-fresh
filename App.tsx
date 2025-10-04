@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, SafeAreaView, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, SafeAreaView, ActivityIndicator, Image } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
@@ -34,8 +34,13 @@ function WelcomeScreen({ navigation }: { navigation: any }) {
     <SafeAreaView style={styles.container}>
       <StatusBar style="light" />
       <View style={styles.content}>
-        <Text style={styles.title}>MedPresent</Text>
-        <Text style={styles.subtitle}>Medical Presentation App</Text>
+        <Image 
+          source={require('./assets/fervid-logo.png')} 
+          style={styles.logo}
+          resizeMode="contain"
+        />
+        {/* <Text style={styles.title}>Fervid</Text> */}
+        <Text style={styles.subtitle}>Professional Medical Presentation Platform</Text>
         <TouchableOpacity 
           style={styles.button}
           onPress={() => navigation.navigate('Login')}
@@ -130,112 +135,110 @@ export default function App() {
           initialRouteName={isAuthenticated ? (userRole === 'admin' ? 'AdminTabs' : 'MRTabs') : 'Welcome'}
           screenOptions={{
             headerShown: false,
-            contentStyle: { backgroundColor: '#ffffff' }
           }}
         >
         <Stack.Screen 
           name="Welcome" 
           component={WelcomeScreen}
           options={{
-            statusBarStyle: 'light'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="Login" 
           component={LoginScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="AdminTabs" 
           component={AdminTabs}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="AdminDashboard" 
           component={AdminDashboardScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="AddMR" 
           component={AddMRScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="ViewAllMRs" 
           component={ViewAllMRsScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="AddBrochure" 
           component={AddBrochureScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="ViewAllBrochures" 
           component={ViewAllBrochuresScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="DocumentViewer" 
           component={DocumentViewerScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="AdminSlideManagement" 
           component={AdminSlideManagementScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="MRTabs" 
           component={MRTabs}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         {/* <Stack.Screen 
           name="PresentationMode" 
           component={PresentationModeScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         /> */}
         <Stack.Screen 
           name="SlideManagement" 
           component={SlideManagementScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="PDFConversion" 
           component={PDFConversionScreen}
           options={{
-            statusBarStyle: 'dark'
+            headerShown: false
           }}
         />
         <Stack.Screen 
           name="BrochureViewer" 
           component={BrochureViewerScreen}
           options={{
-            statusBarStyle: 'light',
             headerShown: false
           }}
         />
@@ -248,35 +251,41 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#8b5cf6',
+    backgroundColor: '#ffffff',
   },
   content: {
-    flex: 1,
+    flex: 0.8,
     alignItems: 'center',
     justifyContent: 'center',
     padding: 20,
-    paddingTop: 60,
+    paddingTop: 30,
+  },
+  logo: {
+    width: 180,
+    height: 180,
+    marginBottom: 0,
   },
   title: {
     fontSize: 32,
     fontWeight: 'bold',
-    color: 'white',
+    color: '#1f2937',
     marginBottom: 10,
   },
   subtitle: {
     fontSize: 18,
-    color: 'white',
+    color: '#6b7280',
+    marginTop: -40,
     marginBottom: 40,
     textAlign: 'center',
   },
   button: {
-    backgroundColor: 'white',
+    backgroundColor: '#8b5cf6',
     paddingHorizontal: 30,
     paddingVertical: 15,
     borderRadius: 25,
   },
   buttonText: {
-    color: '#8b5cf6',
+    color: 'white',
     fontSize: 18,
     fontWeight: 'bold',
   },

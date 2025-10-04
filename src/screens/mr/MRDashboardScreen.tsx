@@ -126,6 +126,37 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     }
   }
 
+  const handleClearActivities = async () => {
+    Alert.alert(
+      'Clear Activities',
+      'Are you sure you want to clear all recent activities? This action cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const userResult = await AuthService.getCurrentUser()
+              if (userResult.success && userResult.user) {
+                const result = await MRService.clearRecentActivities(userResult.user.id)
+                if (result.success) {
+                  setRecentActivities([])
+                  Alert.alert('Success', 'Recent activities cleared successfully')
+                } else {
+                  Alert.alert('Error', result.error || 'Failed to clear activities')
+                }
+              }
+            } catch (error) {
+              console.error('Clear activities error:', error)
+              Alert.alert('Error', 'Failed to clear activities')
+            }
+          }
+        }
+      ]
+    )
+  }
+
   // Helper function to get greeting based on time
   const getGreeting = () => {
     const hour = new Date().getHours()
@@ -213,7 +244,18 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
 
         {/* Recent Activity */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Recent Activity</Text>
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionTitle}>Recent Activity</Text>
+            {recentActivities.length > 0 && (
+              <TouchableOpacity 
+                style={styles.clearButton}
+                onPress={handleClearActivities}
+              >
+                <Ionicons name="trash-outline" size={16} color="#ef4444" />
+                <Text style={styles.clearButtonText}>Clear</Text>
+              </TouchableOpacity>
+            )}
+          </View>
           <View style={styles.activityContainer}>
             {recentActivities.length > 0 ? (
               recentActivities.map((activity, index) => (
@@ -354,11 +396,30 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     marginBottom: 24,
   },
+  sectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 16,
+  },
   sectionTitle: {
     fontSize: 18,
     fontWeight: "bold",
     color: "#1f2937",
-    marginBottom: 16,
+  },
+  clearButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: "#fef2f2",
+    gap: 4,
+  },
+  clearButtonText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#ef4444",
   },
   quickActionsGrid: {
     flexDirection: "row",

@@ -1,6 +1,7 @@
 import React from 'react'
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs'
 import { Ionicons } from '@expo/vector-icons'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import AdminDashboardScreen from './AdminDashboardScreen'
 import ViewAllMRsScreen from './ViewAllMRsScreen'
@@ -9,6 +10,8 @@ import ViewAllBrochuresScreen from './ViewAllBrochuresScreen'
 const Tab = createBottomTabNavigator()
 
 export default function AdminTabs() {
+  const insets = useSafeAreaInsets()
+  
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -34,9 +37,9 @@ export default function AdminTabs() {
           backgroundColor: '#ffffff',
           borderTopWidth: 1,
           borderTopColor: '#e5e7eb',
-          paddingBottom: 8,
+          paddingBottom: insets.bottom + 8,
           paddingTop: 8,
-          height: 70,
+          height: 70 + insets.bottom,
         },
         tabBarLabelStyle: {
           fontSize: 12,

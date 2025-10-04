@@ -753,6 +753,19 @@ export class AdminService {
   // Delete brochure
   static async deleteBrochure(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
+      // First get the brochure data to find file URLs
+      const { data: brochureData, error: fetchError } = await supabase
+        .from('brochures')
+        .select('file_url, thumbnail_url')
+        .eq('id', brochureId)
+        .single()
+
+      if (fetchError) {
+        console.error('Error fetching brochure for deletion:', fetchError)
+        return { success: false, error: fetchError.message }
+      }
+
+      // Delete from database first
       const { data, error } = await supabase
         .from('brochures')
         .delete()
@@ -763,6 +776,80 @@ export class AdminService {
         return { success: false, error: error.message }
       }
 
+      // Delete files from Supabase Storage
+      if (brochureData) {
+        try {
+          // Delete main file if it's stored in our storage
+          if (brochureData.file_url && brochureData.file_url.includes('supabase.co/storage')) {
+            console.log('Deleting file from storage:', brochureData.file_url)
+            
+            // Parse the URL to get the file path
+            // URL format: https://xxx.supabase.co/storage/v1/object/sign/brochures/uploads/filename.zip?token=...
+            // or: https://xxx.supabase.co/storage/v1/object/public/brochures/uploads/filename.zip
+            let filePath = ''
+            
+            if (brochureData.file_url.includes('/sign/brochures/')) {
+              // Signed URL format
+              const pathPart = brochureData.file_url.split('/sign/brochures/')[1]
+              filePath = pathPart.split('?')[0] // Remove token part
+            } else if (brochureData.file_url.includes('/public/brochures/')) {
+              // Public URL format
+              filePath = brochureData.file_url.split('/public/brochures/')[1]
+            } else {
+              // Fallback: try to get last two parts
+              const fileUrlParts = brochureData.file_url.split('/')
+              filePath = fileUrlParts.slice(-2).join('/')
+            }
+            
+            console.log('Extracted file path for deletion:', filePath)
+            
+            const { error: fileDeleteError } = await supabase.storage
+              .from('brochures')
+              .remove([filePath])
+            
+            if (fileDeleteError) {
+              console.error('Could not delete file from storage:', fileDeleteError.message)
+            } else {
+              console.log('File deleted from storage successfully')
+            }
+          }
+
+          // Delete thumbnail if it's stored in our storage
+          if (brochureData.thumbnail_url && brochureData.thumbnail_url.includes('supabase.co/storage')) {
+            console.log('Deleting thumbnail from storage:', brochureData.thumbnail_url)
+            
+            // Parse thumbnail URL similar to main file
+            let thumbnailPath = ''
+            
+            if (brochureData.thumbnail_url.includes('/sign/brochures/')) {
+              const pathPart = brochureData.thumbnail_url.split('/sign/brochures/')[1]
+              thumbnailPath = pathPart.split('?')[0]
+            } else if (brochureData.thumbnail_url.includes('/public/brochures/')) {
+              thumbnailPath = brochureData.thumbnail_url.split('/public/brochures/')[1]
+            } else {
+              const thumbnailUrlParts = brochureData.thumbnail_url.split('/')
+              thumbnailPath = thumbnailUrlParts.slice(-2).join('/')
+            }
+            
+            console.log('Extracted thumbnail path for deletion:', thumbnailPath)
+            
+            const { error: thumbnailDeleteError } = await supabase.storage
+              .from('brochures')
+              .remove([thumbnailPath])
+            
+            if (thumbnailDeleteError) {
+              console.error('Could not delete thumbnail from storage:', thumbnailDeleteError.message)
+            } else {
+              console.log('Thumbnail deleted from storage successfully')
+            }
+          }
+        } catch (storageError) {
+          console.log('Warning: Storage cleanup failed:', storageError)
+          // Don't fail the whole operation if storage cleanup fails
+        }
+      }
+
+      console.log('Brochure deleted successfully from database and storage')
       return { success: true, data }
     } catch (error) {
       console.error('Delete brochure error:', error)

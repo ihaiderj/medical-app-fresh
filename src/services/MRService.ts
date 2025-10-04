@@ -746,4 +746,77 @@ export class MRService {
       return { success: false, error: 'Failed to log activity' }
     }
   }
+
+  // Clear recent activities for a user
+  static async clearRecentActivities(userId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      console.log('Clearing recent activities for user:', userId)
+      const { data, error } = await supabase
+        .from('activity_logs')
+        .delete()
+        .eq('user_id', userId)
+
+      if (error) {
+        console.error('Clear activities error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Activities cleared successfully:', data)
+      return { success: true, data }
+    } catch (error) {
+      console.error('Clear activities error:', error)
+      return { success: false, error: 'Failed to clear activities' }
+    }
+  }
+
+  // Alias methods for doctor management to match DoctorsScreen expectations
+  static async addDoctor(mrId: string, doctorData: any): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('create_mr_doctor_assignment', {
+        p_mr_id: mrId,
+        p_first_name: doctorData.first_name,
+        p_last_name: doctorData.last_name,
+        p_specialty: doctorData.specialty,
+        p_hospital: doctorData.hospital,
+        p_phone: doctorData.phone,
+        p_email: doctorData.email,
+        p_location: doctorData.location,
+        p_notes: doctorData.notes,
+        p_profile_image_url: doctorData.profile_image_url
+      })
+
+      if (error) {
+        return { success: false, error: error.message }
+      }
+
+      return { success: true, data }
+    } catch (error) {
+      return { success: false, error: 'Failed to create doctor assignment' }
+    }
+  }
+
+  static async updateDoctor(doctorId: string, doctorData: any): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('update_mr_doctor_assignment', {
+        p_doctor_id: doctorId,
+        p_first_name: doctorData.first_name,
+        p_last_name: doctorData.last_name,
+        p_specialty: doctorData.specialty,
+        p_hospital: doctorData.hospital,
+        p_phone: doctorData.phone,
+        p_email: doctorData.email,
+        p_location: doctorData.location,
+        p_notes: doctorData.notes,
+        p_profile_image_url: doctorData.profile_image_url
+      })
+
+      if (error) {
+        return { success: false, error: error.message }
+      }
+
+      return { success: true, data }
+    } catch (error) {
+      return { success: false, error: 'Failed to update doctor assignment' }
+    }
+  }
 }

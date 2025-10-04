@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, Alert, ActivityIndicator } from "react-native"
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, Alert, ActivityIndicator, Image } from "react-native"
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
 import { AuthService } from "../services/AuthService"
@@ -27,7 +27,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
       if (result.success && result.user) {
         // Navigate based on user role
         if (result.user.role === 'admin') {
-          navigation.replace("AdminDashboard")
+          navigation.replace("AdminTabs")
         } else {
           navigation.replace("MRTabs")
         }
@@ -49,7 +49,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
       if (result.success && result.user) {
         // Navigate based on user role
         if (result.user.role === 'admin') {
-          navigation.replace("AdminDashboard")
+          navigation.replace("AdminTabs")
         } else {
           navigation.replace("MRTabs")
         }
@@ -71,9 +71,13 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
         {/* Header */}
         <View style={styles.header}>
           <View style={styles.logoContainer}>
-            <Ionicons name="medical" size={48} color="#8b5cf6" />
+            <Image 
+              source={require('../../assets/fervid-icon.png')} 
+              style={styles.logo}
+              resizeMode="contain"
+            />
           </View>
-          <Text style={styles.title}>MedRep Pro</Text>
+          <Text style={styles.title}>Fervid</Text>
           <Text style={styles.subtitle}>Professional Medical Presentations</Text>
         </View>
 
@@ -180,6 +184,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     marginBottom: 16,
+  },
+  logo: {
+    width: 60,
+    height: 60,
   },
   title: {
     fontSize: 28,

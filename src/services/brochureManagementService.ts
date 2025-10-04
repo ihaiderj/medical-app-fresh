@@ -1,5 +1,6 @@
 import * as FileSystem from 'expo-file-system'
 import { unzip } from 'react-native-zip-archive'
+import { supabase } from './supabase'
 
 export interface BrochureSlide {
   id: string
@@ -75,8 +76,67 @@ export class BrochureManagementService {
       let slides: BrochureSlide[] = []
       
       try {
+        // Check if zipUri is a remote URL, download it first
+        let localZipPath = zipUri
+        
+        if (zipUri.startsWith('http')) {
+          console.log('Downloading ZIP file from remote URL...')
+          const downloadPath = `${brochureDir}temp_brochure.zip`
+          
+          // Wait a moment for file to be available (sometimes there's a delay)
+          console.log('Waiting for file to be available...')
+          await new Promise(resolve => setTimeout(resolve, 2000))
+          
+          let downloadResult
+          let retries = 3
+          
+          while (retries > 0) {
+            try {
+              // Use FileSystem.downloadAsync with authentication headers
+              const { data: { session } } = await supabase.auth.getSession()
+              if (!session) {
+                throw new Error('User not authenticated')
+              }
+              
+              console.log('Downloading with authentication headers...')
+              
+              downloadResult = await FileSystem.downloadAsync(zipUri, downloadPath, {
+                headers: {
+                  'Authorization': `Bearer ${session.access_token}`,
+                  'Cache-Control': 'no-cache',
+                }
+              })
+              
+              console.log('Download result with auth:', downloadResult)
+              
+              if (downloadResult.status === 200) {
+                console.log('File downloaded successfully with authentication')
+                break // Success
+              } else {
+                console.log(`Download with auth failed: ${downloadResult.status}`)
+                throw new Error(`Download failed with status: ${downloadResult.status}`)
+              }
+            } catch (downloadError) {
+              console.error('Download error:', downloadError)
+              retries--
+              if (retries > 0) {
+                console.log(`Retrying download, attempts left: ${retries}`)
+                await new Promise(resolve => setTimeout(resolve, 1000))
+              }
+            }
+          }
+          
+          if (!downloadResult || downloadResult.status !== 200) {
+            console.error('All download attempts failed')
+            throw new Error(`Failed to download ZIP file after retries: ${downloadResult?.status || 'unknown error'}`)
+          }
+          
+          localZipPath = downloadResult.uri
+          console.log('ZIP file downloaded to:', localZipPath)
+        }
+        
         // Extract ZIP file using react-native-zip-archive
-        await unzip(zipUri, slidesDir)
+        await unzip(localZipPath, slidesDir)
         console.log('ZIP extracted to:', slidesDir)
         
         // Read extracted files
@@ -141,6 +201,21 @@ export class BrochureManagementService {
         `${brochureDir}brochure_data.json`,
         JSON.stringify(brochureData, null, 2)
       )
+      
+      // Clean up temporary ZIP file if it was downloaded
+      if (zipUri.startsWith('http')) {
+        try {
+          const tempZipPath = `${brochureDir}temp_brochure.zip`
+          const tempFileInfo = await FileSystem.getInfoAsync(tempZipPath)
+          if (tempFileInfo.exists) {
+            await FileSystem.deleteAsync(tempZipPath)
+            console.log('Temporary ZIP file cleaned up')
+          }
+        } catch (cleanupError) {
+          console.log('Could not clean up temporary ZIP file:', cleanupError)
+          // Not critical, continue
+        }
+      }
       
       console.log(`Processed ZIP file: ${slides.length} slides extracted`)
       return { success: true, brochureData }
