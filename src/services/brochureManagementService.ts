@@ -269,6 +269,11 @@ export class BrochureManagementService {
       const dataString = await FileSystem.readAsStringAsync(dataPath)
       const brochureData = JSON.parse(dataString) as BrochureData
       
+      console.log('BrochureManager: Loading brochure data for:', brochureId)
+      console.log('BrochureManager: Raw data slides count:', brochureData.slides.length)
+      console.log('BrochureManager: Raw data groups count:', brochureData.groups.length)
+      console.log('BrochureManager: Raw slide titles:', brochureData.slides.slice(0, 5).map(s => s.title))
+      
       // Migrate data to include new sync metadata and missing fields
       let needsSave = false
       const now = new Date().toISOString()
@@ -687,7 +692,16 @@ export class BrochureManagementService {
       
       brochureData.slides.push(newSlide)
       brochureData.totalSlides = brochureData.slides.length
-      brochureData.updatedAt = new Date().toISOString()
+      
+      const now = new Date().toISOString()
+      brochureData.updatedAt = now
+      brochureData.localLastModified = now
+      brochureData.isModified = true
+      brochureData.needsSync = true
+      
+      console.log('BrochureManager: Adding slide to brochure')
+      console.log('BrochureManager: New slides count:', brochureData.slides.length)
+      console.log('BrochureManager: New slide title:', title)
       
       // Save updated data
       const brochureDir = `${this.STORAGE_DIR}${brochureId}/`
@@ -695,6 +709,8 @@ export class BrochureManagementService {
         `${brochureDir}brochure_data.json`,
         JSON.stringify(brochureData, null, 2)
       )
+      
+      console.log('BrochureManager: Slide added successfully, total slides now:', brochureData.slides.length)
       
       return { success: true, slideId }
     } catch (error) {
@@ -879,13 +895,27 @@ export class BrochureManagementService {
     groups: SlideGroup[]
   ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
     try {
-      return await brochureSyncService.syncBrochureToServer(
+      console.log('BrochureSync: Uploading brochure data to server')
+      console.log('BrochureSync: Slides count:', slides.length)
+      console.log('BrochureSync: Groups count:', groups.length)
+      console.log('BrochureSync: Sample slide titles:', slides.slice(0, 3).map(s => s.title))
+      console.log('BrochureSync: Group names:', groups.map(g => g.name))
+      
+      const result = await brochureSyncService.syncBrochureToServer(
         mrId,
         brochureId,
         brochureTitle,
         slides,
         groups
       )
+      
+      if (result.success) {
+        console.log('BrochureSync: Successfully uploaded brochure data with', slides.length, 'slides and', groups.length, 'groups')
+      } else {
+        console.error('BrochureSync: Failed to upload brochure data:', result.error)
+      }
+      
+      return result
     } catch (error) {
       console.error('Brochure sync error:', error)
       return {
@@ -950,16 +980,48 @@ export class BrochureManagementService {
   }
 
   /**
-   * Apply downloaded brochure changes to local storage
+   * Apply downloaded brochure changes to local storage (smart merge)
    */
   static async applyBrochureChanges(
     brochureId: string,
     syncData: BrochureSyncData
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      console.log('BrochureSync: Applying downloaded changes')
+      console.log('BrochureSync: Downloaded slides count:', syncData.slides.length)
+      console.log('BrochureSync: Downloaded groups count:', syncData.groups.length)
+      console.log('BrochureSync: Downloaded slide titles:', syncData.slides.slice(0, 3).map(s => s.title))
+      console.log('BrochureSync: Downloaded group names:', syncData.groups.map(g => g.name))
       
-      // Create updated brochure data
+      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      const now = new Date().toISOString()
+      
+      // Check if local brochure data exists and has local modifications
+      const existingResult = await this.getBrochureData(brochureId)
+      let localModifications = null
+      
+      if (existingResult.success && existingResult.data) {
+        localModifications = {
+          hasLocalChanges: existingResult.data.isModified || existingResult.data.needsSync,
+          localTimestamp: existingResult.data.localLastModified,
+          serverTimestamp: syncData.lastModified
+        }
+        
+        console.log('BrochureSync: Local modifications check:', localModifications)
+        
+        // If local has newer changes, don't overwrite
+        if (localModifications.hasLocalChanges && localModifications.localTimestamp) {
+          const localTime = new Date(localModifications.localTimestamp).getTime()
+          const serverTime = new Date(localModifications.serverTimestamp).getTime()
+          
+          if (localTime > serverTime) {
+            console.log('BrochureSync: Local changes are newer, skipping server apply')
+            return { success: true }
+          }
+        }
+      }
+      
+      // Create updated brochure data with sync metadata
       const brochureData: BrochureData = {
         id: brochureId,
         title: syncData.brochureTitle,
@@ -968,8 +1030,13 @@ export class BrochureManagementService {
         groups: syncData.groups,
         thumbnailUri: syncData.slides[0]?.imageUri,
         totalSlides: syncData.totalSlides,
-        createdAt: new Date().toISOString(),
-        updatedAt: syncData.lastModified
+        createdAt: existingResult.data?.createdAt || now,
+        updatedAt: syncData.lastModified,
+        // Sync metadata
+        localLastModified: syncData.lastModified,
+        lastSyncedAt: now,
+        needsSync: false,
+        isModified: false
       }
 
       // Save updated brochure data
@@ -978,6 +1045,7 @@ export class BrochureManagementService {
         JSON.stringify(brochureData, null, 2)
       )
 
+      console.log('BrochureSync: Successfully applied changes with', syncData.slides.length, 'slides and', syncData.groups.length, 'groups')
       return { success: true }
     } catch (error) {
       console.error('Apply brochure changes error:', error)

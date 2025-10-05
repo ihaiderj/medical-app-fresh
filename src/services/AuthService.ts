@@ -1,5 +1,6 @@
 import { supabase } from './supabase'
 import { PersistentAuthService } from './persistentAuthService'
+import { SessionManagementService } from './sessionManagementService'
 
 export interface UserProfile {
   id: string
@@ -46,18 +47,42 @@ export class AuthService {
   /**
    * Login with persistent authentication support
    */
-  static async login(email: string, password: string, rememberMe: boolean = true): Promise<AuthResult> {
+  static async login(email: string, password: string, rememberMe: boolean = true): Promise<AuthResult & {
+    hasSessionConflict?: boolean
+    conflictDevice?: string
+  }> {
     const result = await this.signIn(email, password)
     
     if (result.success && result.user) {
-      // Save session for persistent authentication
-      await PersistentAuthService.saveSession(
-        result.user.id,
-        result.user.email,
-        result.user.role,
-        password,
-        rememberMe
-      )
+      // Register session and check for conflicts
+      const sessionResult = await SessionManagementService.registerSessionWithConflictCheck(result.user.id)
+      
+      if (sessionResult.success) {
+        // Save session for persistent authentication
+        await PersistentAuthService.saveSession(
+          result.user.id,
+          result.user.email,
+          result.user.role,
+          password,
+          rememberMe
+        )
+
+        return {
+          ...result,
+          hasSessionConflict: sessionResult.hasConflict,
+          conflictDevice: sessionResult.conflictDevice
+        }
+      } else {
+        console.warn('SessionManager: Failed to register session:', sessionResult.error)
+        // Continue with login even if session registration fails
+        await PersistentAuthService.saveSession(
+          result.user.id,
+          result.user.email,
+          result.user.role,
+          password,
+          rememberMe
+        )
+      }
     }
     
     return result

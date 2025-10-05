@@ -34,6 +34,15 @@ class BrochureSyncService {
     brochureData: BrochureSyncData
   ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
     try {
+      console.log('BrochureSync: Calling save_brochure_changes RPC function')
+      console.log('BrochureSync: Parameters:', { mrId, brochureId, brochureTitle })
+      console.log('BrochureSync: Data being uploaded:', {
+        slides: brochureData.slides.length,
+        groups: brochureData.groups.length,
+        slideNames: brochureData.slides.slice(0, 3).map(s => s.title),
+        groupNames: brochureData.groups.map(g => g.name)
+      })
+      
       const { data, error } = await supabase.rpc('save_brochure_changes', {
         p_mr_id: mrId,
         p_brochure_id: brochureId,
@@ -42,20 +51,22 @@ class BrochureSyncService {
       })
 
       if (error) {
-        console.error('Error saving brochure changes:', error)
+        console.error('BrochureSync: RPC Error saving brochure changes:', error)
         return { success: false, error: error.message }
       }
 
       if (!data?.success) {
+        console.error('BrochureSync: Server returned error:', data?.error)
         return { success: false, error: data?.error || 'Failed to save brochure changes' }
       }
 
+      console.log('BrochureSync: RPC call successful, data saved to server')
       return { 
         success: true, 
         lastModified: data.last_modified 
       }
     } catch (error) {
-      console.error('Brochure sync save error:', error)
+      console.error('BrochureSync: Exception during save:', error)
       return { 
         success: false, 
         error: error instanceof Error ? error.message : 'Unknown error occurred' 

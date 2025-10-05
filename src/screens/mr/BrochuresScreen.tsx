@@ -45,7 +45,7 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
   const [savedBrochures, setSavedBrochures] = useState<SavedBrochure[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [categories, setCategories] = useState<string[]>(["All"])
-  const [activeTab, setActiveTab] = useState<'available' | 'saved'>('available')
+  const [activeTab, setActiveTab] = useState<'available' | 'saved'>('saved')
   const [currentUserId, setCurrentUserId] = useState<string>('')
   const [brochureThumbnails, setBrochureThumbnails] = useState<{[key: string]: string}>({})
   
@@ -126,8 +126,17 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
           const downloadDir = FileSystem.documentDirectory + `mr_downloads/${userId}/`
           const expectedFiles = await FileSystem.readDirectoryAsync(downloadDir).catch(() => [])
           
-          // Find matching local file by brochure ID
-          const matchingFile = expectedFiles.find(file => file.includes(serverBrochure.brochure_id))
+          // Find matching local file by brochure ID (check both ZIP and data files)
+          const matchingFile = expectedFiles.find(file => 
+            file.includes(serverBrochure.brochure_id) || 
+            file.includes(serverBrochure.custom_title.replace(/[^a-zA-Z0-9]/g, '_'))
+          )
+          
+          // Also check if brochure data exists (more reliable than file check)
+          const brochureDataExists = await BrochureManagementService.getBrochureData(serverBrochure.brochure_id)
+          console.log('LoadSaved: Checking brochure:', serverBrochure.custom_title)
+          console.log('LoadSaved: File match:', !!matchingFile)
+          console.log('LoadSaved: Data exists:', brochureDataExists.success)
           
           if (matchingFile) {
             const localPath = downloadDir + matchingFile
@@ -146,33 +155,35 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
               }
               
               validSaved.push(localBrochure)
+              console.log('LoadSaved: Found existing file for:', serverBrochure.custom_title, 'at', localPath)
             } else {
-              // File doesn't exist locally, show as "needs re-download"
-              const brochureNeedsDownload: SavedBrochure = {
-                ...serverBrochure.original_brochure_data,
-                localId: `${serverBrochure.brochure_id}_needs_download`,
-                localPath: '', // Empty path indicates needs download
-                customTitle: serverBrochure.custom_title,
-                downloadedAt: serverBrochure.saved_at,
-                localViewCount: 0,
-                localDownloadCount: 0
-              }
-              
-              validSaved.push(brochureNeedsDownload)
+              // File exists but not accessible, mark for download but keep in list
+              console.log('LoadSaved: File not accessible for:', serverBrochure.custom_title)
             }
           } else {
-            // No local file found, show as "needs re-download"
-            const brochureNeedsDownload: SavedBrochure = {
-              ...serverBrochure.original_brochure_data,
-              localId: `${serverBrochure.brochure_id}_needs_download`,
-              localPath: '', // Empty path indicates needs download
-              customTitle: serverBrochure.custom_title,
-              downloadedAt: serverBrochure.saved_at,
-              localViewCount: 0,
-              localDownloadCount: 0
-            }
-            
-            validSaved.push(brochureNeedsDownload)
+            // No matching file found, but still show in list (will download on view)
+            console.log('LoadSaved: No local file found for:', serverBrochure.custom_title)
+          }
+          
+          // Always add to saved list - use brochure data existence as primary indicator
+          const savedBrochureEntry: SavedBrochure = {
+            ...serverBrochure.original_brochure_data,
+            localId: `${serverBrochure.brochure_id}_server`,
+            localPath: (matchingFile && brochureDataExists.success) ? (downloadDir + matchingFile) : '', 
+            customTitle: serverBrochure.custom_title,
+            downloadedAt: serverBrochure.saved_at,
+            localViewCount: 0,
+            localDownloadCount: 1
+          }
+          
+          // Only add if not already added above
+          const alreadyAdded = validSaved.some(saved => 
+            (saved.brochure_id || saved.id) === serverBrochure.brochure_id
+          )
+          
+          if (!alreadyAdded) {
+            validSaved.push(savedBrochureEntry)
+            console.log('LoadSaved: Added to saved list:', serverBrochure.custom_title, 'hasLocalData:', brochureDataExists.success)
           }
         }
         
@@ -347,13 +358,23 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
         console.log('Processing ZIP file for future viewing')
         try {
           if (brochureId) {
-            await BrochureManagementService.processZipFile(
-              brochureId,
-              localPath,
-              customTitle
-            )
+            // Check if brochure data already exists with modifications
+            const existingResult = await BrochureManagementService.getBrochureData(brochureId)
+            
+            if (existingResult.success && existingResult.data && 
+                (existingResult.data.isModified || existingResult.data.groups.length > 0)) {
+              console.log('ZIP Processing: Found existing modified brochure, skipping ZIP processing to preserve changes')
+              console.log('ZIP Processing: Existing groups:', existingResult.data.groups.map(g => g.name))
+              console.log('ZIP Processing: Modified slides:', existingResult.data.slides.filter(s => s.title !== s.fileName).length)
+            } else {
+              await BrochureManagementService.processZipFile(
+                brochureId,
+                localPath,
+                customTitle
+              )
+              console.log('ZIP file processed successfully')
+            }
           }
-          console.log('ZIP file processed successfully')
         } catch (error) {
           console.log('ZIP processing failed, will process on first view:', error)
         }
@@ -496,9 +517,17 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
 
   const ensureBrochureAvailableWithChanges = async (brochure: SavedBrochure, brochureId: string) => {
     try {
-      // Check if local file exists
-      if (!brochure.localPath || brochure.localPath === '') {
-        console.log('View: Local file missing, downloading brochure first')
+      // Check if we're already downloading this brochure
+      if (downloadingBrochures.has(brochureId || brochure.title)) {
+        console.log('View: Brochure already downloading, skipping duplicate download')
+        return
+      }
+
+      // Check if brochure data exists locally
+      const localBrochureResult = await BrochureManagementService.getBrochureData(brochureId)
+      
+      if (!localBrochureResult.success || !localBrochureResult.data) {
+        console.log('View: Brochure data missing, need to download')
         
         // Find the original brochure in available brochures
         const originalBrochure = availableBrochures.find(
@@ -506,15 +535,17 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
         )
 
         if (originalBrochure) {
-          // Download the original brochure
+          // Download the original brochure (this will create the brochure_data.json)
           await handleDownloadBrochure(originalBrochure)
-          console.log('View: Brochure downloaded successfully')
+          console.log('View: Brochure downloaded and processed')
         } else {
           console.warn('View: Original brochure not found in available brochures')
           return
         }
       } else {
-        console.log('View: Local file exists, checking for updates')
+        console.log('View: Local brochure data exists with', localBrochureResult.data.slides.length, 'slides and', localBrochureResult.data.groups.length, 'groups')
+        console.log('View: Existing slide titles:', localBrochureResult.data.slides.slice(0, 3).map(s => s.title))
+        console.log('View: Existing groups:', localBrochureResult.data.groups.map(g => g.name))
       }
 
       // Check for and apply server changes (for both newly downloaded and existing files)

@@ -8,8 +8,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AuthService } from './src/services/AuthService';
 import useActivityTracker from './src/hooks/useActivityTracker';
-import { BackgroundSyncService } from './src/services/backgroundSyncService';
 import { SmartSyncService } from './src/services/smartSyncService';
+import { SessionManagementService } from './src/services/sessionManagementService';
 import LoginScreen from './src/screens/LoginScreen';
 import AdminDashboardScreen from './src/screens/admin/AdminDashboardScreen';
 import AdminTabs from './src/screens/admin/AdminTabs';
@@ -23,6 +23,7 @@ import MRDashboardScreen from './src/screens/mr/MRDashboardScreen';
 import BrochuresScreen from './src/screens/mr/BrochuresScreen';
 import DoctorsScreen from './src/screens/mr/DoctorsScreen';
 import MeetingsScreen from './src/screens/mr/MeetingsScreen';
+import MeetingDetailsScreen from './src/screens/mr/MeetingDetailsScreen';
 // import PresentationsScreen from './src/screens/mr/PresentationsScreen';
 // import PresentationModeScreen from './src/screens/mr/PresentationModeScreen';
 import SlideManagementScreen from './src/screens/mr/SlideManagementScreen';
@@ -112,7 +113,8 @@ export default function App() {
         setIsAuthenticated(true)
         setUserRole(autoLoginResult.user.role)
         
-        // Initialize smart sync service for logged-in users
+        // Register session and initialize sync service
+        await SessionManagementService.registerSessionWithConflictCheck(autoLoginResult.user.id)
         await SmartSyncService.initialize()
         
         return
@@ -126,8 +128,9 @@ export default function App() {
           setIsAuthenticated(true)
           setUserRole(result.user.role)
           
-          // Initialize background sync for logged-in users
-          await BackgroundSyncService.initialize()
+          // Register session and initialize sync service
+          await SessionManagementService.registerSessionWithConflictCheck(result.user.id)
+          await SmartSyncService.initialize()
         } else {
           setIsAuthenticated(false)
           setUserRole(null)
@@ -251,6 +254,13 @@ export default function App() {
         <Stack.Screen 
           name="SlideManagement" 
           component={SlideManagementScreen}
+          options={{
+            headerShown: false
+          }}
+        />
+        <Stack.Screen 
+          name="MeetingDetails" 
+          component={MeetingDetailsScreen}
           options={{
             headerShown: false
           }}

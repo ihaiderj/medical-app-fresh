@@ -4,6 +4,7 @@
  */
 import { supabase } from './supabase'
 import { AuthService } from './AuthService'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 
 export interface ActiveSession {
   userId: string
@@ -21,9 +22,11 @@ export class SessionManagementService {
    * Initialize session management
    */
   static async initialize() {
-    // Generate unique device ID
-    this.currentDeviceId = await this.generateDeviceId()
-    console.log('SessionManager: Device ID:', this.currentDeviceId)
+    if (!this.currentDeviceId) {
+      // Generate unique device ID
+      this.currentDeviceId = await this.generateDeviceId()
+      console.log('SessionManager: Device ID:', this.currentDeviceId)
+    }
   }
 
   /**
@@ -154,11 +157,55 @@ export class SessionManagementService {
    */
   private static async getDeviceInfo(): Promise<string> {
     try {
-      // You can enhance this with actual device info
-      const platform = require('react-native').Platform
-      return `${platform.OS} ${platform.Version}`
+      const { Platform } = require('react-native')
+      const deviceInfo = `${Platform.OS} ${Platform.Version}`
+      return deviceInfo
     } catch (error) {
       return 'Unknown Device'
+    }
+  }
+
+  /**
+   * Register session with conflict detection
+   */
+  static async registerSessionWithConflictCheck(userId: string): Promise<{
+    success: boolean
+    hasConflict: boolean
+    conflictDevice?: string
+    error?: string
+  }> {
+    try {
+      await this.initialize()
+      
+      const deviceInfo = await this.getDeviceInfo()
+      
+      const { data, error } = await supabase.rpc('register_user_session', {
+        p_user_id: userId,
+        p_device_id: this.currentDeviceId,
+        p_device_info: deviceInfo
+      })
+
+      if (error) {
+        console.error('SessionManager: Registration error:', error)
+        return { success: false, error: error.message, hasConflict: false }
+      }
+
+      if (!data.success) {
+        return { success: false, error: data.error, hasConflict: false }
+      }
+
+      return {
+        success: true,
+        hasConflict: data.has_conflict || false,
+        conflictDevice: data.conflict_device
+      }
+    } catch (error) {
+      console.error('SessionManager: Session registration error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Session registration failed',
+        hasConflict: false
+      }
     }
   }
 }

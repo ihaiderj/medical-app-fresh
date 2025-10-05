@@ -70,18 +70,34 @@ export interface MRAssignedDoctor {
 
 export interface MRMeeting {
   meeting_id: string
+  title: string
   doctor_name: string
   doctor_specialty: string
   hospital: string
   scheduled_date: string
   duration_minutes: number
-  presentation_title: string
   status: string
-  follow_up_required: boolean
-  follow_up_date?: string
-  notes?: string
-  slides_discussed: string[]
+  purpose?: string
+  brochure_title?: string
+  notes_count: number
+  last_note_date?: string
   created_at: string
+  updated_at: string
+}
+
+export interface SlideNote {
+  note_id: string
+  slide_id: string
+  slide_title: string
+  slide_order: number
+  note_text: string
+  created_at: string
+  updated_at: string
+}
+
+export interface MeetingDetails {
+  meeting: any
+  slide_notes: SlideNote[]
 }
 
 export interface MRPresentation {
@@ -193,22 +209,6 @@ export class MRService {
     }
   }
 
-  static async getMeetings(mrId: string, filter: string = 'All'): Promise<{ success: boolean; data?: MRMeeting[]; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('get_mr_meetings', { 
-        p_mr_id: mrId, 
-        p_filter: filter 
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to fetch MR meetings' }
-    }
-  }
 
   static async getPresentations(mrId: string): Promise<{ success: boolean; data?: MRPresentation[]; error?: string }> {
     try {
@@ -310,33 +310,7 @@ export class MRService {
     }
   }
 
-  static async createMeeting(
-    mrId: string,
-    doctorId: string,
-    scheduledDate: string,
-    durationMinutes: number = 30,
-    presentationId?: string,
-    notes?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('create_mr_meeting', {
-        p_mr_id: mrId,
-        p_doctor_id: doctorId,
-        p_scheduled_date: scheduledDate,
-        p_duration_minutes: durationMinutes,
-        p_presentation_id: presentationId,
-        p_notes: notes
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to create meeting' }
-    }
-  }
+  // Old createMeeting function removed - using the new one with brochure support
 
   static async updateMeeting(
     meetingId: string,
@@ -344,24 +318,42 @@ export class MRService {
     durationMinutes: number = 30,
     presentationId?: string,
     notes?: string,
-    status: string = 'scheduled'
+    status: string = 'scheduled',
+    title?: string
   ): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
+      console.log('=== MRService.updateMeeting DEBUG ===')
+      console.log('Parameters:')
+      console.log('- meetingId:', meetingId)
+      console.log('- scheduledDate:', scheduledDate)
+      console.log('- durationMinutes:', durationMinutes)
+      console.log('- presentationId:', presentationId)
+      console.log('- notes:', notes)
+      console.log('- status:', status)
+      
       const { data, error } = await supabase.rpc('update_mr_meeting', {
         p_meeting_id: meetingId,
         p_scheduled_date: scheduledDate,
         p_duration_minutes: durationMinutes,
         p_presentation_id: presentationId,
         p_notes: notes,
-        p_status: status
+        p_status: status,
+        p_title: title
       })
 
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
       if (error) {
+        console.log('Supabase error occurred:', error.message)
         return { success: false, error: error.message }
       }
 
+      console.log('Update successful, returning success')
       return { success: true, data }
     } catch (error) {
+      console.error('Exception in updateMeeting:', error)
       return { success: false, error: 'Failed to update meeting' }
     }
   }
@@ -370,16 +362,27 @@ export class MRService {
     meetingId: string
   ): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
+      console.log('=== MRService.deleteMeeting DEBUG ===')
+      console.log('meetingId:', meetingId)
+      console.log('Calling supabase.rpc with delete_mr_meeting...')
+      
       const { data, error } = await supabase.rpc('delete_mr_meeting', {
         p_meeting_id: meetingId
       })
 
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
       if (error) {
+        console.log('Supabase error occurred:', error.message)
         return { success: false, error: error.message }
       }
 
+      console.log('Delete successful, returning success')
       return { success: true, data }
     } catch (error) {
+      console.error('Exception in deleteMeeting:', error)
       return { success: false, error: 'Failed to delete meeting' }
     }
   }
@@ -585,6 +588,193 @@ export class MRService {
       return { success: true, data }
     } catch (error) {
       return { success: false, error: 'Failed to track download' }
+    }
+  }
+
+  /**
+   * Create new meeting
+   */
+  static async createMeeting(meetingData: {
+    mr_id: string
+    doctor_id: string
+    brochure_id: string
+    brochure_title: string
+    title: string
+    purpose: string
+    scheduled_date?: string
+    duration_minutes?: number
+  }): Promise<{ success: boolean; data?: { meeting_id: string }; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('create_meeting_with_brochure', {
+        p_mr_id: meetingData.mr_id,
+        p_doctor_id: meetingData.doctor_id,
+        p_brochure_id: meetingData.brochure_id,
+        p_brochure_title: meetingData.brochure_title,
+        p_title: meetingData.title,
+        p_purpose: meetingData.purpose,
+        p_scheduled_date: meetingData.scheduled_date || new Date().toISOString(),
+        p_duration_minutes: meetingData.duration_minutes || 30
+      })
+
+      if (error) {
+        console.error('Create meeting error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (!data.success) {
+        return { success: false, error: data.error || 'Failed to create meeting' }
+      }
+
+      return { 
+        success: true, 
+        data: { meeting_id: data.meeting_id }
+      }
+    } catch (error) {
+      console.error('Create meeting error:', error)
+      return { success: false, error: 'Failed to create meeting' }
+    }
+  }
+
+  /**
+   * Add slide note to meeting
+   */
+  static async addSlideNote(noteData: {
+    meeting_id: string
+    slide_id: string
+    slide_title: string
+    slide_order: number
+    brochure_id: string
+    note_text: string
+    timestamp: string
+  }): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('add_slide_note_to_meeting', {
+        p_meeting_id: noteData.meeting_id,
+        p_slide_id: noteData.slide_id,
+        p_slide_title: noteData.slide_title,
+        p_slide_order: noteData.slide_order,
+        p_brochure_id: noteData.brochure_id,
+        p_note_text: noteData.note_text
+      })
+
+      if (error) {
+        console.error('Add slide note error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (!data.success) {
+        return { success: false, error: data.error || 'Failed to add slide note' }
+      }
+
+      return { success: true }
+    } catch (error) {
+      console.error('Add slide note error:', error)
+      return { success: false, error: 'Failed to add slide note' }
+    }
+  }
+
+  /**
+   * Get meetings for MR user
+   */
+  static async getMeetings(mrId: string, filter?: string): Promise<{ success: boolean; data?: MRMeeting[]; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_mr_meetings_with_notes', {
+        p_mr_id: mrId
+      })
+
+      if (error) {
+        console.error('Get meetings error:', error)
+        return { success: false, error: error.message }
+      }
+
+      return { success: true, data: data || [] }
+    } catch (error) {
+      console.error('Get meetings error:', error)
+      return { success: false, error: 'Failed to get meetings' }
+    }
+  }
+
+  static async getMeetingDetails(meetingId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_meeting_details_with_notes', {
+        p_meeting_id: meetingId
+      })
+
+      if (error) {
+        console.error('Get meeting details error:', error)
+        return { success: false, error: error.message }
+      }
+
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('Get meeting details error:', error)
+      return { success: false, error: error.message || 'Failed to fetch meeting details' }
+    }
+  }
+
+  /**
+   * Get meeting details with all slide notes (legacy function)
+   */
+  static async updateMeetingFollowUp(followUpData: {
+    meeting_id: string
+    follow_up_date: string
+    follow_up_time: string
+    follow_up_notes: string
+  }): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      console.log('=== MRService.updateMeetingFollowUp DEBUG ===')
+      console.log('followUpData:', followUpData)
+      console.log('Calling supabase.rpc with update_meeting_followup...')
+      
+      const { data, error } = await supabase.rpc('update_meeting_followup', {
+        p_meeting_id: followUpData.meeting_id,
+        p_follow_up_date: followUpData.follow_up_date,
+        p_follow_up_time: followUpData.follow_up_time,
+        p_follow_up_notes: followUpData.follow_up_notes
+      })
+
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
+      if (error) {
+        console.error('Update follow-up error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Follow-up update successful')
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('Exception in updateMeetingFollowUp:', error)
+      return { success: false, error: error.message || 'Failed to update follow-up' }
+    }
+  }
+
+  static async getMeetingDetailsLegacy(meetingId: string): Promise<{ success: boolean; data?: MeetingDetails; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_meeting_details_with_notes', {
+        p_meeting_id: meetingId
+      })
+
+      if (error) {
+        console.error('Get meeting details error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (!data.success) {
+        return { success: false, error: data.error || 'Failed to get meeting details' }
+      }
+
+      return { 
+        success: true, 
+        data: {
+          meeting: data.meeting,
+          slide_notes: data.slide_notes || []
+        }
+      }
+    } catch (error) {
+      console.error('Get meeting details error:', error)
+      return { success: false, error: 'Failed to get meeting details' }
     }
   }
 

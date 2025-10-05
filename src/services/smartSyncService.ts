@@ -9,6 +9,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 import { AuthService } from './AuthService'
 import { BrochureManagementService, BrochureData } from './brochureManagementService'
 import { savedBrochuresSyncService } from './savedBrochuresSyncService'
+import { MRService } from './MRService'
 
 export interface SyncOperation {
   id: string
@@ -170,6 +171,9 @@ export class SmartSyncService {
       // Then sync all brochure modifications
       await this.syncAllBrochureModifications(userResult.user.id)
       
+      // Sync meetings and notes (server-first, no local storage needed)
+      await this.syncMeetingsData(userResult.user.id)
+      
       console.log('SmartSync: Initial sync completed')
     } catch (error) {
       console.warn('SmartSync: Initial sync error:', error)
@@ -264,6 +268,12 @@ export class SmartSyncService {
           if (!brochureResult.success || !brochureResult.data) {
             continue
           }
+
+          console.log('SmartSync: About to upload brochure data:')
+          console.log('SmartSync: Local slides count:', brochureResult.data.slides.length)
+          console.log('SmartSync: Local groups count:', brochureResult.data.groups.length)
+          console.log('SmartSync: Local slide titles:', brochureResult.data.slides.slice(0, 5).map(s => s.title))
+          console.log('SmartSync: Local group names:', brochureResult.data.groups.map(g => g.name))
 
           // Upload to server
           const uploadResult = await BrochureManagementService.syncBrochureToServer(
@@ -418,6 +428,27 @@ export class SmartSyncService {
       this.syncQueue = this.syncQueue.filter(op => op.status !== 'completed')
     } catch (error) {
       console.warn('SmartSync: Process queue error:', error)
+    }
+  }
+
+  /**
+   * Sync meetings data (server-first approach)
+   */
+  private static async syncMeetingsData(userId: string) {
+    try {
+      console.log('SmartSync: Syncing meetings data')
+      
+      // Meetings are server-first, so just ensure they're accessible
+      // No local storage sync needed - meetings are always loaded from server
+      const meetingsResult = await MRService.getMeetings(userId)
+      
+      if (meetingsResult.success && meetingsResult.data) {
+        console.log(`SmartSync: Found ${meetingsResult.data.length} meetings on server`)
+      }
+      
+      console.log('SmartSync: Meetings data sync completed')
+    } catch (error) {
+      console.warn('SmartSync: Meetings sync error:', error)
     }
   }
 

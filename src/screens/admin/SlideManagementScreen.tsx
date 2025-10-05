@@ -93,6 +93,24 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [showControls, setShowControls] = useState(true)
   const [isFullScreen, setIsFullScreen] = useState(false)
   const [showSlideListInFullScreen, setShowSlideListInFullScreen] = useState(false)
+  
+  // Meeting notes state
+  const [showNotesModal, setShowNotesModal] = useState(false)
+  const [currentSlideForNotes, setCurrentSlideForNotes] = useState<BrochureSlide | null>(null)
+  const [noteText, setNoteText] = useState('')
+  const [selectedMeeting, setSelectedMeeting] = useState<any | null>(null)
+  const [availableMeetings, setAvailableMeetings] = useState<any[]>([])
+  const [showDoctorSelectionModal, setShowDoctorSelectionModal] = useState(false)
+  const [showMeetingSelectionModal, setShowMeetingSelectionModal] = useState(false)
+  const [showNewMeetingForm, setShowNewMeetingForm] = useState(false)
+  const [newMeetingForm, setNewMeetingForm] = useState({
+    doctor_id: '',
+    title: '',
+    scheduled_date: new Date().toISOString().split('T')[0],
+    duration_minutes: 30,
+    purpose: '',
+    notes: ''
+  })
 
   // Zoom functionality with reanimated
   const scale = useSharedValue(1)
@@ -116,6 +134,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
     
     return () => {
       // Trigger exit sync when leaving the screen
+      console.log('SlideManagement: Component unmounting, triggering exit sync')
       performExitSync()
       ScreenOrientation.unlockAsync()
       subscription?.remove()
@@ -132,6 +151,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         const brochureResult = await BrochureManagementService.getBrochureData(brochureId)
         if (brochureResult.success && brochureResult.data && brochureResult.data.needsSync) {
           console.log('SlideManagement: Found changes to sync, uploading to server')
+          console.log('SlideManagement: Current local slides count:', brochureResult.data.slides.length)
+          console.log('SlideManagement: Current local groups count:', brochureResult.data.groups.length)
+          console.log('SlideManagement: Current slide titles:', brochureResult.data.slides.slice(0, 5).map(s => s.title))
+          console.log('SlideManagement: Current group names:', brochureResult.data.groups.map(g => g.name))
           
           const uploadResult = await BrochureManagementService.syncBrochureToServer(
             userResult.user.id,
@@ -571,17 +594,25 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       })
 
       if (result.success) {
-        Alert.alert('Success', 'Doctor added successfully!')
+        Alert.alert('Success', 'Doctor added successfully!', [
+          {
+            text: 'OK',
+            onPress: async () => {
+              // Close add doctor modal
+              setShowAddDoctorModal(false)
+              resetDoctorForm()
 
-        // Close add doctor modal
-        setShowAddDoctorModal(false)
-        resetDoctorForm()
+              // Reload doctors
+              await loadAvailableDoctors()
 
-        // Store the new doctor info for auto-selection
-        const newDoctorName = `${doctorForm.first_name.trim()} ${doctorForm.last_name.trim()}`
-
-        // Reload doctors
-        await loadAvailableDoctors()
+              // Find the newly added doctor and auto-select it
+              const newDoctorName = `${doctorForm.first_name.trim()} ${doctorForm.last_name.trim()}`
+              
+              // Return to doctor selection modal with new doctor available
+              setShowDoctorSelectionModal(true)
+            }
+          }
+        ])
 
         // Auto-select the newly added doctor
         // We need to use a more reliable method since availableDoctors might not be updated yet
@@ -612,6 +643,136 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
     } catch (error) {
       console.error('Error adding doctor:', error)
       Alert.alert('Error', 'Failed to add doctor')
+    }
+  }
+
+  // Load available meetings for notes
+  const loadAvailableMeetings = async () => {
+    try {
+      const userResult = await AuthService.getCurrentUser()
+      if (userResult.success && userResult.user && userResult.user.role === 'mr') {
+        const meetingsResult = await MRService.getMeetings(userResult.user.id)
+        if (meetingsResult.success && meetingsResult.data) {
+          setAvailableMeetings(meetingsResult.data)
+          console.log('Loaded meetings:', meetingsResult.data.length)
+        }
+        
+        // Also load available doctors for new meeting creation
+        console.log('Loading doctors for notes modal...')
+        const userResult2 = await AuthService.getCurrentUser()
+        if (userResult2.success && userResult2.user) {
+          console.log('Loading doctors for MR:', userResult2.user.id)
+          const doctorsResult = await MRService.getAssignedDoctors(userResult2.user.id)
+          console.log('Doctors result:', doctorsResult)
+          if (doctorsResult.success && doctorsResult.data) {
+            console.log('Doctors data:', doctorsResult.data)
+            setAvailableDoctors(doctorsResult.data)
+            console.log('Set available doctors, count:', doctorsResult.data.length)
+          } else {
+            console.log('Failed to load doctors:', doctorsResult.error)
+            setAvailableDoctors([])
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error loading meetings:', error)
+    }
+  }
+
+  // Handle saving slide note
+  const handleSaveSlideNote = async () => {
+    try {
+      if (!currentSlideForNotes || !noteText.trim()) {
+        Alert.alert('Error', 'Please enter a note')
+        return
+      }
+
+      const userResult = await AuthService.getCurrentUser()
+      if (!userResult.success || !userResult.user || userResult.user.role !== 'mr') {
+        Alert.alert('Error', 'Please log in as MR user')
+        return
+      }
+
+      let meetingId = selectedMeeting?.meeting_id || selectedMeeting
+
+      // Create new meeting if needed
+      if (showNewMeetingForm) {
+        // Validate new meeting form
+        if (!selectedDoctor || !newMeetingForm.title.trim() || !newMeetingForm.purpose.trim()) {
+          Alert.alert('Error', 'Please fill in all meeting details and select a doctor')
+          return
+        }
+
+        console.log('Creating meeting with data:', {
+          ...newMeetingForm,
+          doctor_id: selectedDoctor.doctor_id,
+          mr_id: userResult.user.id,
+          brochure_id: brochureId,
+          brochure_title: brochureTitle
+        })
+
+        const newMeetingResult = await MRService.createMeeting({
+          ...newMeetingForm,
+          doctor_id: selectedDoctor.doctor_id,
+          mr_id: userResult.user.id,
+          brochure_id: brochureId,
+          brochure_title: brochureTitle
+        })
+
+        if (newMeetingResult.success && newMeetingResult.data) {
+          meetingId = newMeetingResult.data.meeting_id
+        } else {
+          console.error('Create meeting error:', newMeetingResult.error)
+          Alert.alert('Error', `Failed to create meeting: ${newMeetingResult.error || 'Unknown error'}`)
+          return
+        }
+      }
+
+      if (!meetingId) {
+        Alert.alert('Error', 'Please select or create a meeting')
+        return
+      }
+
+      // Save slide note
+      const noteResult = await MRService.addSlideNote({
+        meeting_id: meetingId,
+        slide_id: currentSlideForNotes.id,
+        slide_title: currentSlideForNotes.title,
+        slide_order: currentSlideForNotes.order,
+        note_text: noteText.trim(),
+        brochure_id: brochureId,
+        timestamp: new Date().toISOString()
+      })
+
+      if (noteResult.success) {
+        Alert.alert('Success', 'Note saved successfully!', [
+          {
+            text: 'OK',
+            onPress: () => {
+              // Reset form and return to brochure view
+              setShowNotesModal(false)
+              setNoteText('')
+              setCurrentSlideForNotes(null)
+              setSelectedMeeting(null)
+              setSelectedDoctor(null)
+              setShowNewMeetingForm(false)
+              setNewMeetingForm({
+                doctor_id: '',
+                title: '',
+                scheduled_date: new Date().toISOString().split('T')[0],
+                duration_minutes: 30,
+                purpose: '',
+                notes: ''
+              })
+            }
+          }
+        ])
+      } else {
+        Alert.alert('Error', noteResult.error || 'Failed to save note')
+      }
+    } catch (error) {
+      console.error('Error saving slide note:', error)
+      Alert.alert('Error', 'Failed to save note')
     }
   }
 
@@ -815,8 +976,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         if (addResult.success) {
           loadBrochureData()
           
-          // Sync changes to server
-          syncBrochureChanges()
+          // Sync tracking is now handled automatically in addSlideImage
           
           Alert.alert('Success', 'Slide added successfully')
         } else {
@@ -1059,31 +1219,35 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity
-            style={styles.backButton}
-            onPress={() => navigation.goBack()}
-          >
-            <Ionicons name="arrow-back" size={24} color="#1f2937" />
-          </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.backButton}
+          onPress={async () => {
+            // Trigger exit sync before navigation
+            await performExitSync()
+            navigation.goBack()
+          }}
+        >
+          <Ionicons name="arrow-back" size={24} color="#1f2937" />
+        </TouchableOpacity>
           <View style={styles.headerContent}>
             <Text style={styles.headerTitle} numberOfLines={1}>{brochureTitle}</Text>
           </View>
           <View style={styles.headerActions}>
+             {/* Manual Sync Button - Available in Both Orientations */}
+             <TouchableOpacity
+               style={styles.syncButton}
+               onPress={() => SmartSyncService.forceSyncNow()}
+             >
+               <Ionicons
+                 name="cloud-upload"
+                 size={18}
+                 color="#8b5cf6"
+               />
+             </TouchableOpacity>
+
              {/* Landscape Mode Buttons */}
              {currentOrientation === 'landscape' && (
                <>
-                 {/* Manual Sync Button */}
-                 <TouchableOpacity
-                   style={styles.syncButton}
-                   onPress={() => SmartSyncService.forceSyncNow()}
-                 >
-                   <Ionicons
-                     name="cloud-upload"
-                     size={18}
-                     color="#8b5cf6"
-                   />
-                 </TouchableOpacity>
-
                  {/* Full Screen Toggle */}
                  <TouchableOpacity
                    style={styles.fullScreenButton}
@@ -1602,19 +1766,32 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                               <Text style={[styles.navControlText, selectedSlide.order === 1 && styles.navControlTextDisabled]}>Previous</Text>
                             </TouchableOpacity>
 
-                            <TouchableOpacity
-                              style={styles.resetZoomButton}
-                              onPress={resetZoom}
-                            >
-                              <Ionicons name="contract-outline" size={20} color="#8b5cf6" />
-                              <Text style={styles.resetZoomText}>Reset</Text>
-                            </TouchableOpacity>
-
-                            {/* Slide Info Under Reset Button */}
-                            <View style={styles.slideInfoUnderReset}>
-                              <Text style={styles.compactSlideNumber}>#{selectedSlide.order}</Text>
-                              <Text style={styles.compactSlideTitle} numberOfLines={3}>{selectedSlide.title}</Text>
-                            </View>
+                      <TouchableOpacity 
+                        style={styles.resetZoomButton} 
+                        onPress={resetZoom}
+                      >
+                        <Ionicons name="contract-outline" size={20} color="#8b5cf6" />
+                        <Text style={styles.resetZoomText}>Reset</Text>
+                      </TouchableOpacity>
+                      
+                      {/* Add Notes Button */}
+                      <TouchableOpacity 
+                        style={styles.addNotesButton} 
+                        onPress={() => {
+                          setCurrentSlideForNotes(selectedSlide)
+                          setShowNotesModal(true)
+                          loadAvailableMeetings()
+                        }}
+                      >
+                        <Ionicons name="create" size={20} color="#ffffff" />
+                        <Text style={styles.addNotesText}>Add Note</Text>
+                      </TouchableOpacity>
+                      
+                      {/* Slide Info Under Reset Button */}
+                      <View style={styles.slideInfoUnderReset}>
+                        <Text style={styles.compactSlideNumber}>#{selectedSlide.order}</Text>
+                        <Text style={styles.compactSlideTitle} numberOfLines={3}>{selectedSlide.title}</Text>
+                      </View>
                           </View>
 
                           {/* Right side: Next */}
@@ -1649,27 +1826,27 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                             <Text style={[styles.navControlText, selectedSlide.order === 1 && styles.navControlTextDisabled]}>Previous</Text>
                           </TouchableOpacity>
 
-                          <TouchableOpacity
-                            style={styles.resetZoomButton}
-                            onPress={resetZoom}
-                          >
-                            <Ionicons name="contract-outline" size={20} color="#8b5cf6" />
-                            <Text style={styles.resetZoomText}>Reset</Text>
-                          </TouchableOpacity>
-
-                          <TouchableOpacity
-                            style={[styles.navControlButton, selectedSlide.order === slides.length && styles.navControlButtonDisabled]}
-                            onPress={() => {
-                              const currentIndex = slides.findIndex(s => s.id === selectedSlide.id)
-                              if (currentIndex < slides.length - 1) {
-                                setSelectedSlide(slides[currentIndex + 1])
-                              }
-                            }}
-                            disabled={selectedSlide.order === slides.length}
-                          >
-                            <Text style={[styles.navControlText, selectedSlide.order === slides.length && styles.navControlTextDisabled]}>Next</Text>
-                            <Ionicons name="chevron-forward" size={20} color={selectedSlide.order === slides.length ? "#9ca3af" : "#8b5cf6"} />
-                          </TouchableOpacity>
+                        <TouchableOpacity 
+                          style={styles.resetZoomButton} 
+                          onPress={resetZoom}
+                        >
+                          <Ionicons name="contract-outline" size={20} color="#8b5cf6" />
+                          <Text style={styles.resetZoomText}>Reset</Text>
+                        </TouchableOpacity>
+                        
+                        <TouchableOpacity 
+                          style={[styles.navControlButton, selectedSlide.order === slides.length && styles.navControlButtonDisabled]}
+                          onPress={() => {
+                            const currentIndex = slides.findIndex(s => s.id === selectedSlide.id)
+                            if (currentIndex < slides.length - 1) {
+                              setSelectedSlide(slides[currentIndex + 1])
+                            }
+                          }}
+                          disabled={selectedSlide.order === slides.length}
+                        >
+                          <Text style={[styles.navControlText, selectedSlide.order === slides.length && styles.navControlTextDisabled]}>Next</Text>
+                          <Ionicons name="chevron-forward" size={20} color={selectedSlide.order === slides.length ? "#9ca3af" : "#8b5cf6"} />
+                        </TouchableOpacity>
                         </>
                       )}
                     </View>
@@ -1678,8 +1855,22 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                   {/* Slide Info - Portrait Mode Only */}
                   {currentOrientation === 'portrait' && (
                     <View style={styles.slideInfoPortrait}>
-                      <Text style={styles.previewSlideNumber}>Slide #{selectedSlide.order}</Text>
-                      <Text style={styles.previewSlideTitle}>{selectedSlide.title}</Text>
+                      {/* Add Notes and Slide Title Row */}
+                      <View style={styles.portraitNotesRow}>
+                        <TouchableOpacity 
+                          style={styles.addNotesButton} 
+                          onPress={() => {
+                            setCurrentSlideForNotes(selectedSlide)
+                            setShowNotesModal(true)
+                            loadAvailableMeetings()
+                          }}
+                        >
+                          <Ionicons name="create" size={20} color="#ffffff" />
+                          <Text style={styles.addNotesText}>Add Notes</Text>
+                        </TouchableOpacity>
+                        
+                        <Text style={styles.previewSlideTitle}>{selectedSlide.title} ({selectedSlide.order})</Text>
+                      </View>
                     </View>
                   )}
                 </>
@@ -2062,8 +2253,402 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           </View>
         </Modal>
 
-        {/* Add Doctor Modal */}
-        <Modal visible={showAddDoctorModal} transparent animationType="slide">
+         {/* Slide Notes Modal */}
+         <Modal visible={showNotesModal} transparent animationType="slide">
+           <View style={styles.modalOverlay}>
+             <View style={styles.modalContent}>
+               <View style={styles.modalHeader}>
+                 <Text style={styles.modalTitle}>Add Slide Note</Text>
+                 <TouchableOpacity onPress={() => {
+                   setShowNotesModal(false)
+                   setNoteText('')
+                   setCurrentSlideForNotes(null)
+                   setSelectedMeeting(null)
+                   setSelectedDoctor(null)
+                   setShowNewMeetingForm(false)
+                   setShowDoctorSelectionModal(false)
+                   setShowMeetingSelectionModal(false)
+                   // Reset form
+                   setNewMeetingForm({
+                     doctor_id: '',
+                     title: '',
+                     scheduled_date: new Date().toISOString().split('T')[0],
+                     duration_minutes: 30,
+                     purpose: '',
+                     notes: ''
+                   })
+                 }}>
+                   <Ionicons name="close" size={24} color="#6b7280" />
+                 </TouchableOpacity>
+               </View>
+               
+               <ScrollView style={styles.modalBody}>
+                 {currentSlideForNotes && (
+                   <View style={styles.slideInfoSection}>
+                     <Text style={styles.inputLabel}>Slide Information</Text>
+                     <View style={styles.slideInfoCard}>
+                       <View style={styles.slideInfoContent}>
+                         <Image 
+                           source={{ uri: currentSlideForNotes.imageUri }} 
+                           style={styles.slideInfoThumbnail}
+                           resizeMode="cover"
+                         />
+                         <View style={styles.slideInfoDetails}>
+                           <Text style={styles.slideInfoTitle}>#{currentSlideForNotes.order} - {currentSlideForNotes.title}</Text>
+                           <Text style={styles.slideInfoBrochure}>From: {brochureTitle}</Text>
+                         </View>
+                       </View>
+                     </View>
+                   </View>
+                 )}
+
+                 <View style={styles.inputGroup}>
+                   <Text style={styles.inputLabel}>Note</Text>
+                   <TextInput
+                     style={[styles.input, styles.textArea]}
+                     placeholder="Enter your note about this slide..."
+                     multiline
+                     numberOfLines={4}
+                     value={noteText}
+                     onChangeText={setNoteText}
+                     placeholderTextColor="#9ca3af"
+                   />
+                 </View>
+
+                 <View style={styles.inputGroup}>
+                   <Text style={styles.inputLabel}>Meeting</Text>
+                   
+                   <TouchableOpacity
+                     style={styles.selectionButton}
+                     onPress={() => setShowMeetingSelectionModal(true)}
+                   >
+                     <View style={styles.selectionButtonContent}>
+                       <Ionicons name="calendar" size={20} color="#8b5cf6" />
+                       <View style={styles.selectionButtonText}>
+                         {selectedMeeting ? (
+                           <>
+                             <Text style={styles.selectedItemTitle}>
+                               {selectedMeeting.title || `Meeting with ${selectedMeeting.doctor_name}`}
+                             </Text>
+                             <Text style={styles.selectedItemSubtitle}>
+                               {new Date(selectedMeeting.scheduled_date).toLocaleDateString()} - {selectedMeeting.doctor_name}
+                             </Text>
+                           </>
+                         ) : (
+                           <Text style={styles.placeholderText}>Select or create a meeting</Text>
+                         )}
+                       </View>
+                       <Ionicons name="chevron-forward" size={20} color="#9ca3af" />
+                     </View>
+                   </TouchableOpacity>
+                 </View>
+               </ScrollView>
+               
+               <View style={styles.modalActions}>
+                 <TouchableOpacity
+                   style={styles.cancelButton}
+                   onPress={() => {
+                     setShowNotesModal(false)
+                     setNoteText('')
+                     setCurrentSlideForNotes(null)
+                     setSelectedMeeting(null)
+                     setSelectedDoctor(null)
+                     setShowNewMeetingForm(false)
+                     setShowDoctorSelectionModal(false)
+                     setShowMeetingSelectionModal(false)
+                     // Reset form
+                     setNewMeetingForm({
+                       doctor_id: '',
+                       title: '',
+                       scheduled_date: new Date().toISOString().split('T')[0],
+                       duration_minutes: 30,
+                       purpose: '',
+                       notes: ''
+                     })
+                   }}
+                 >
+                   <Text style={styles.cancelButtonText}>Cancel</Text>
+                 </TouchableOpacity>
+                 <TouchableOpacity
+                   style={styles.saveButton}
+                   onPress={handleSaveSlideNote}
+                 >
+                   <Text style={styles.saveButtonText}>Save Note</Text>
+                 </TouchableOpacity>
+               </View>
+             </View>
+           </View>
+         </Modal>
+
+         {/* Doctor Selection Modal */}
+         <Modal visible={showDoctorSelectionModal} transparent animationType="slide">
+           <View style={styles.modalOverlay}>
+             <View style={styles.modalContent}>
+               <View style={styles.modalHeader}>
+                 <Text style={styles.modalTitle}>Select Doctor</Text>
+                 <TouchableOpacity onPress={() => setShowDoctorSelectionModal(false)}>
+                   <Ionicons name="close" size={24} color="#6b7280" />
+                 </TouchableOpacity>
+               </View>
+
+               <ScrollView style={styles.modalBody}>
+                 {availableDoctors.length > 0 ? (
+                   availableDoctors.map(doctor => (
+                     <TouchableOpacity
+                       key={doctor.doctor_id}
+                       style={[
+                         styles.doctorSelectionCard,
+                         selectedDoctor?.doctor_id === doctor.doctor_id && styles.doctorSelectionCardSelected
+                       ]}
+                       onPress={() => {
+                         setSelectedDoctor(doctor)
+                         setNewMeetingForm({...newMeetingForm, doctor_id: doctor.doctor_id})
+                         setShowDoctorSelectionModal(false)
+                         // If we came from new meeting form, return to it
+                         if (showNewMeetingForm) {
+                           // Stay in the new meeting form with doctor selected
+                         }
+                       }}
+                     >
+                       <View style={styles.doctorInfo}>
+                         <View style={styles.doctorAvatar}>
+                           {doctor.profile_image_url ? (
+                             <Image source={{ uri: doctor.profile_image_url }} style={styles.doctorAvatarImage} />
+                           ) : (
+                             <Ionicons name="person" size={20} color="#8b5cf6" />
+                           )}
+                         </View>
+                         <View style={styles.doctorDetails}>
+                           <Text style={styles.doctorName}>{doctor.first_name} {doctor.last_name}</Text>
+                           <Text style={styles.doctorSpecialty}>{doctor.specialty}</Text>
+                           <Text style={styles.doctorHospital}>{doctor.hospital}</Text>
+                         </View>
+                       </View>
+                       <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
+                     </TouchableOpacity>
+                   ))
+                 ) : (
+                   <View style={styles.emptyState}>
+                     <Ionicons name="person-outline" size={48} color="#9ca3af" />
+                     <Text style={styles.emptyStateText}>No doctors available</Text>
+                     <Text style={styles.emptyStateSubtext}>Add doctors first to create meetings</Text>
+                   </View>
+                 )}
+               </ScrollView>
+
+               <View style={styles.modalActions}>
+                 <TouchableOpacity
+                   style={styles.addNewButton}
+                   onPress={() => {
+                     setShowDoctorSelectionModal(false)
+                     setShowAddDoctorModal(true)
+                   }}
+                 >
+                   <Ionicons name="add" size={20} color="#8b5cf6" />
+                   <Text style={styles.addNewButtonText}>Add New Doctor</Text>
+                 </TouchableOpacity>
+               </View>
+             </View>
+           </View>
+         </Modal>
+
+         {/* Meeting Selection Modal */}
+         <Modal visible={showMeetingSelectionModal} transparent animationType="slide">
+           <View style={styles.modalOverlay}>
+             <View style={styles.modalContent}>
+               <View style={styles.modalHeader}>
+                 <Text style={styles.modalTitle}>Select Meeting</Text>
+                 <TouchableOpacity onPress={() => setShowMeetingSelectionModal(false)}>
+                   <Ionicons name="close" size={24} color="#6b7280" />
+                 </TouchableOpacity>
+               </View>
+
+               <ScrollView style={styles.modalBody}>
+                 {availableMeetings.length > 0 ? (
+                   availableMeetings.map(meeting => (
+                     <TouchableOpacity
+                       key={meeting.meeting_id}
+                       style={[
+                         styles.meetingSelectionCard,
+                         selectedMeeting?.meeting_id === meeting.meeting_id && styles.meetingSelectionCardSelected
+                       ]}
+                       onPress={() => {
+                         setSelectedMeeting(meeting)
+                         setShowMeetingSelectionModal(false)
+                       }}
+                     >
+                       <View style={styles.meetingInfo}>
+                         <Text style={styles.meetingTitle}>{meeting.title || `Meeting with ${meeting.doctor_name}`}</Text>
+                         <Text style={styles.meetingDate}>{new Date(meeting.scheduled_date).toLocaleDateString()}</Text>
+                         <Text style={styles.meetingDoctor}>{meeting.doctor_name} - {meeting.hospital}</Text>
+                       </View>
+                       <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
+                     </TouchableOpacity>
+                   ))
+                 ) : (
+                   <View style={styles.emptyState}>
+                     <Ionicons name="calendar-outline" size={48} color="#9ca3af" />
+                     <Text style={styles.emptyStateText}>No meetings found</Text>
+                     <Text style={styles.emptyStateSubtext}>Create a new meeting below</Text>
+                   </View>
+                 )}
+               </ScrollView>
+
+               <View style={styles.modalActions}>
+                 <TouchableOpacity
+                   style={styles.addNewButton}
+                   onPress={() => {
+                     setShowMeetingSelectionModal(false)
+                     if (!selectedDoctor) {
+                       Alert.alert('Select Doctor First', 'Please select a doctor before creating a meeting', [
+                         { text: 'Select Doctor', onPress: () => setShowDoctorSelectionModal(true) },
+                         { text: 'Cancel', style: 'cancel' }
+                       ])
+                       return
+                     }
+                     setShowNewMeetingForm(true)
+                   }}
+                 >
+                   <Ionicons name="add" size={20} color="#8b5cf6" />
+                   <Text style={styles.addNewButtonText}>Create New Meeting</Text>
+                 </TouchableOpacity>
+               </View>
+             </View>
+           </View>
+         </Modal>
+
+         {/* New Meeting Form Modal */}
+         <Modal visible={showNewMeetingForm} transparent animationType="slide">
+           <View style={styles.modalOverlay}>
+             <View style={styles.modalContent}>
+               <View style={styles.modalHeader}>
+                 <Text style={styles.modalTitle}>Create New Meeting</Text>
+                 <TouchableOpacity onPress={() => setShowNewMeetingForm(false)}>
+                   <Ionicons name="close" size={24} color="#6b7280" />
+                 </TouchableOpacity>
+               </View>
+
+               <ScrollView style={styles.modalBody}>
+                 {selectedDoctor && (
+                   <View style={styles.selectedDoctorInfo}>
+                     <View style={styles.doctorSectionHeader}>
+                       <Text style={styles.inputLabel}>Selected Doctor</Text>
+                       <TouchableOpacity
+                         style={styles.changeDoctorButton}
+                         onPress={() => setShowDoctorSelectionModal(true)}
+                       >
+                         <Text style={styles.changeDoctorText}>Change</Text>
+                       </TouchableOpacity>
+                     </View>
+                     <View style={styles.selectedDoctorCard}>
+                       <View style={styles.doctorAvatar}>
+                         {selectedDoctor.profile_image_url ? (
+                           <Image source={{ uri: selectedDoctor.profile_image_url }} style={styles.doctorAvatarImage} />
+                         ) : (
+                           <Ionicons name="person" size={20} color="#8b5cf6" />
+                         )}
+                       </View>
+                       <View style={styles.doctorDetails}>
+                         <Text style={styles.doctorName}>{selectedDoctor.first_name} {selectedDoctor.last_name}</Text>
+                         <Text style={styles.doctorSpecialty}>{selectedDoctor.specialty} - {selectedDoctor.hospital}</Text>
+                       </View>
+                     </View>
+                   </View>
+                 )}
+
+                 <View style={styles.inputGroup}>
+                   <Text style={styles.inputLabel}>Meeting Title</Text>
+                   <TextInput
+                     style={styles.input}
+                     placeholder="Enter meeting title"
+                     value={newMeetingForm.title}
+                     onChangeText={(text) => setNewMeetingForm({...newMeetingForm, title: text})}
+                     placeholderTextColor="#9ca3af"
+                   />
+                 </View>
+
+                 <View style={styles.inputGroup}>
+                   <Text style={styles.inputLabel}>Purpose</Text>
+                   <TextInput
+                     style={[styles.input, styles.textArea]}
+                     placeholder="Meeting purpose"
+                     multiline
+                     numberOfLines={3}
+                     value={newMeetingForm.purpose}
+                     onChangeText={(text) => setNewMeetingForm({...newMeetingForm, purpose: text})}
+                     placeholderTextColor="#9ca3af"
+                   />
+                 </View>
+               </ScrollView>
+
+               <View style={styles.modalActions}>
+                 <TouchableOpacity
+                   style={styles.cancelButton}
+                   onPress={() => setShowNewMeetingForm(false)}
+                 >
+                   <Text style={styles.cancelButtonText}>Cancel</Text>
+                 </TouchableOpacity>
+                 <TouchableOpacity
+                   style={styles.saveButton}
+                   onPress={async () => {
+                     if (!selectedDoctor || !newMeetingForm.title.trim() || !newMeetingForm.purpose.trim()) {
+                       Alert.alert('Error', 'Please fill in all fields')
+                       return
+                     }
+
+                     try {
+                       const userResult = await AuthService.getCurrentUser()
+                       if (!userResult.success || !userResult.user) return
+
+                       const meetingResult = await MRService.createMeeting({
+                         ...newMeetingForm,
+                         doctor_id: selectedDoctor.doctor_id,
+                         mr_id: userResult.user.id,
+                         brochure_id: brochureId,
+                         brochure_title: brochureTitle
+                       })
+
+                       if (meetingResult.success && meetingResult.data) {
+                         const newMeeting = {
+                           meeting_id: meetingResult.data.meeting_id,
+                           title: newMeetingForm.title,
+                           doctor_name: `${selectedDoctor.first_name} ${selectedDoctor.last_name}`,
+                           hospital: selectedDoctor.hospital,
+                           scheduled_date: newMeetingForm.scheduled_date,
+                           purpose: newMeetingForm.purpose
+                         }
+                         setSelectedMeeting(newMeeting)
+                         setAvailableMeetings(prev => [newMeeting, ...prev])
+                         setShowNewMeetingForm(false)
+                         // Show success message and return to notes form
+                         Alert.alert('Success', 'Meeting created successfully! You can now add your slide notes.')
+                         // Reset form
+                         setNewMeetingForm({
+                           doctor_id: '',
+                           title: '',
+                           scheduled_date: new Date().toISOString().split('T')[0],
+                           duration_minutes: 30,
+                           purpose: '',
+                           notes: ''
+                         })
+                         Alert.alert('Success', 'Meeting created successfully')
+                       } else {
+                         Alert.alert('Error', meetingResult.error || 'Failed to create meeting')
+                       }
+                     } catch (error) {
+                       Alert.alert('Error', 'Failed to create meeting')
+                     }
+                   }}
+                 >
+                   <Text style={styles.saveButtonText}>Create Meeting</Text>
+                 </TouchableOpacity>
+               </View>
+             </View>
+           </View>
+         </Modal>
+
+         {/* Add Doctor Modal */}
+         <Modal visible={showAddDoctorModal} transparent animationType="slide">
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
@@ -2693,8 +3278,9 @@ const styles = StyleSheet.create({
     fontSize: 16, // Restored for portrait mode
     fontWeight: '600',
     color: '#1f2937',
-    textAlign: 'center',
-    marginTop: 4,
+    textAlign: 'left',
+    flex: 1,
+    marginLeft: 12,
   },
   noPreview: {
     flex: 1,
@@ -3075,8 +3661,6 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 8,
     alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(139, 92, 246, 0.2)',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.1,
@@ -3191,6 +3775,323 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     marginRight: 6,
+  },
+  // Slide notes styles
+  addNotesButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(16, 185, 129, 0.9)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    gap: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  addNotesText: {
+    fontSize: 12,
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  portraitNotesButtonContainer: {
+    marginTop: 12,
+    alignItems: 'center',
+  },
+  portraitNotesRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 8,
+    paddingHorizontal: 4,
+  },
+  slideInfoSection: {
+    marginBottom: 16,
+  },
+  slideInfoCard: {
+    backgroundColor: '#f9fafb',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  slideInfoContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  slideInfoThumbnail: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+    marginRight: 12,
+  },
+  slideInfoDetails: {
+    flex: 1,
+  },
+  slideInfoTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1f2937',
+    marginBottom: 4,
+  },
+  slideInfoBrochure: {
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  meetingOptions: {
+    flexDirection: 'row',
+    marginBottom: 16,
+    gap: 8,
+  },
+  optionButton: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#f3f4f6',
+    borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+  },
+  optionButtonActive: {
+    backgroundColor: '#8b5cf6',
+    borderColor: '#8b5cf6',
+  },
+  optionButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  optionButtonTextActive: {
+    color: '#ffffff',
+  },
+  meetingSelection: {
+    maxHeight: 200,
+  },
+  meetingCard: {
+    backgroundColor: '#ffffff',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    marginBottom: 8,
+  },
+  meetingCardSelected: {
+    backgroundColor: '#ede9fe',
+    borderColor: '#8b5cf6',
+  },
+  meetingTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1f2937',
+    marginBottom: 4,
+  },
+  meetingDate: {
+    fontSize: 12,
+    color: '#8b5cf6',
+    marginBottom: 2,
+  },
+  meetingDoctor: {
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  noMeetingsText: {
+    fontSize: 12,
+    color: '#9ca3af',
+    fontStyle: 'italic',
+    textAlign: 'center',
+    padding: 16,
+  },
+  newMeetingForm: {
+    backgroundColor: '#f9fafb',
+    padding: 16,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  doctorSelection: {
+    maxHeight: 150,
+  },
+  doctorOptionCard: {
+    backgroundColor: '#ffffff',
+    padding: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    marginBottom: 6,
+  },
+  doctorOptionCardSelected: {
+    backgroundColor: '#ede9fe',
+    borderColor: '#8b5cf6',
+  },
+  doctorOptionName: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#1f2937',
+  },
+  doctorOptionSpecialty: {
+    fontSize: 11,
+    color: '#6b7280',
+  },
+  doctorOptionHospital: {
+    fontSize: 10,
+    color: '#9ca3af',
+    marginTop: 2,
+  },
+  noDoctorsContainer: {
+    alignItems: 'center',
+    padding: 24,
+    backgroundColor: '#f9fafb',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  noDoctorsText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#6b7280',
+    marginTop: 8,
+  },
+  noDoctorsSubtext: {
+    fontSize: 12,
+    color: '#9ca3af',
+    textAlign: 'center',
+    marginTop: 4,
+  },
+  doctorSectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  addDoctorPlusButton: {
+    backgroundColor: '#f3f4f6',
+    borderRadius: 20,
+    width: 32,
+    height: 32,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  selectionButton: {
+    backgroundColor: '#f9fafb',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 16,
+    marginTop: 8,
+  },
+  selectionButtonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  selectionButtonText: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  selectedItemTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1f2937',
+  },
+  selectedItemSubtitle: {
+    fontSize: 12,
+    color: '#6b7280',
+    marginTop: 2,
+  },
+  placeholderText: {
+    fontSize: 14,
+    color: '#9ca3af',
+  },
+  doctorSelectionCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 16,
+    marginBottom: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  doctorSelectionCardSelected: {
+    borderColor: '#8b5cf6',
+    backgroundColor: '#f3f4f6',
+  },
+  meetingSelectionCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 16,
+    marginBottom: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  meetingSelectionCardSelected: {
+    borderColor: '#8b5cf6',
+    backgroundColor: '#f3f4f6',
+  },
+  meetingInfo: {
+    flex: 1,
+  },
+  emptyState: {
+    alignItems: 'center',
+    padding: 32,
+  },
+  emptyStateText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#6b7280',
+    marginTop: 16,
+  },
+  emptyStateSubtext: {
+    fontSize: 14,
+    color: '#9ca3af',
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  addNewButton: {
+    backgroundColor: '#f3f4f6',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  addNewButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#8b5cf6',
+    marginLeft: 8,
+  },
+  selectedDoctorInfo: {
+    marginBottom: 16,
+  },
+  doctorSectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  changeDoctorButton: {
+    backgroundColor: '#f3f4f6',
+    borderWidth: 1,
+    borderColor: '#8b5cf6',
+    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  changeDoctorText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#8b5cf6',
   },
 })
 

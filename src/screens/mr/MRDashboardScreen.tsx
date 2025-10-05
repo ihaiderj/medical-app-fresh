@@ -4,8 +4,8 @@ import { Ionicons } from "@expo/vector-icons"
 import { useState, useEffect } from "react"
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from "../../services/MRService"
-import { BackgroundSyncService } from "../../services/backgroundSyncService"
 import { SmartSyncService } from "../../services/smartSyncService"
+import { SessionManagementService } from "../../services/sessionManagementService"
 import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus"
 
 interface MRDashboardScreenProps {
@@ -85,8 +85,16 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
           style: "destructive",
           onPress: async () => {
             try {
+              // Get current user for session cleanup
+              const userResult = await AuthService.getCurrentUser()
+              
               // Stop sync service before logout
               SmartSyncService.stop()
+              
+              // End session if user exists
+              if (userResult.success && userResult.user) {
+                await SessionManagementService.endSession(userResult.user.id)
+              }
               
               const result = await AuthService.logout()
               if (result.success) {

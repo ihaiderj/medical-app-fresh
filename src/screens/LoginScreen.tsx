@@ -3,8 +3,9 @@ import { View, Text, TextInput, TouchableOpacity, StyleSheet, SafeAreaView, Aler
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
 import { AuthService } from "../services/AuthService"
-import { BackgroundSyncService } from "../services/backgroundSyncService"
 import { SmartSyncService } from "../services/smartSyncService"
+import { LoginSyncService, LoginSyncProgress } from "../services/loginSyncService"
+import LoginSyncScreen from "../components/LoginSyncScreen"
 
 interface LoginScreenProps {
   navigation: any
@@ -17,6 +18,12 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [rememberMe, setRememberMe] = useState(true)
+  const [showSyncScreen, setShowSyncScreen] = useState(false)
+  const [syncProgress, setSyncProgress] = useState<LoginSyncProgress>({
+    step: 'Starting',
+    message: 'Initializing sync...',
+    progress: 0
+  })
 
   // Check if user is already logged in
   useEffect(() => {
@@ -50,14 +57,43 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
       const result = await AuthService.login(email, password, rememberMe)
       
       if (result.success && result.user) {
-        // Initialize smart sync service for logged-in users
+        // Show session conflict alert if needed
+        if (result.hasSessionConflict && result.conflictDevice) {
+          Alert.alert(
+            'Device Login Detected',
+            `You were logged in on another device (${result.conflictDevice}). You have been logged out from that device for security.`,
+            [{ text: 'OK', style: 'default' }]
+          )
+        }
+
+        // Initialize smart sync service
         await SmartSyncService.initialize()
         
-        // Navigate based on user role
-        if (result.user.role === 'admin') {
-          navigation.replace("AdminTabs")
+        // Show sync screen for MR users and perform background sync
+        if (result.user.role === 'mr') {
+          setShowSyncScreen(true)
+          
+          // Perform login sync in background
+          LoginSyncService.performLoginSync(
+            result.user.id,
+            setSyncProgress
+          ).then((syncResult) => {
+            setShowSyncScreen(false)
+            if (!syncResult.success) {
+              console.warn('Login sync failed:', syncResult.error)
+            }
+          }).catch((error) => {
+            setShowSyncScreen(false)
+            console.warn('Login sync error:', error)
+          })
+          
+          // Navigate immediately (sync continues in background)
+          setTimeout(() => {
+            navigation.replace("MRTabs")
+          }, 2000) // Show sync screen for 2 seconds
         } else {
-          navigation.replace("MRTabs")
+          // Admin users navigate immediately
+          navigation.replace("AdminTabs")
         }
       } else {
         Alert.alert("Login Failed", result.error || "Invalid credentials")
@@ -78,7 +114,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
         <View style={styles.header}>
           <View style={styles.logoContainer}>
             <Image 
-              source={require('../../assets/fervid-icon.png')} 
+              source={require('../../assets/icon.png')} 
               style={styles.logo}
               resizeMode="contain"
             />
@@ -173,6 +209,17 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
         </View>
         </View>
       </SafeAreaView>
+      
+      {/* Login Sync Screen */}
+      <LoginSyncScreen
+        visible={showSyncScreen}
+        syncProgress={syncProgress}
+        onSyncComplete={() => setShowSyncScreen(false)}
+        onSyncError={(error) => {
+          setShowSyncScreen(false)
+          Alert.alert('Sync Error', error)
+        }}
+      />
     </View>
   )
 }

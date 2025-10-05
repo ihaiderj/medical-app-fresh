@@ -3,8 +3,9 @@
     "name": "Fervid",
     "slug": "medical-app-fresh",
     "version": "1.0.0",
+    "description": "Professional Medical Presentation Platform with Cross-Device Sync",
     "orientation": "portrait",
-    "icon": "./assets/fervid-icon.png",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
