@@ -319,7 +319,8 @@ export class MRService {
     presentationId?: string,
     notes?: string,
     status: string = 'scheduled',
-    title?: string
+    title?: string,
+    doctorId?: string
   ): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
       console.log('=== MRService.updateMeeting DEBUG ===')
@@ -330,6 +331,8 @@ export class MRService {
       console.log('- presentationId:', presentationId)
       console.log('- notes:', notes)
       console.log('- status:', status)
+      console.log('- title:', title)
+      console.log('- doctorId:', doctorId)
       
       const { data, error } = await supabase.rpc('update_mr_meeting', {
         p_meeting_id: meetingId,
@@ -338,7 +341,8 @@ export class MRService {
         p_presentation_id: presentationId,
         p_notes: notes,
         p_status: status,
-        p_title: title
+        p_title: title,
+        p_doctor_id: doctorId
       })
 
       console.log('Supabase RPC result:')
@@ -645,6 +649,7 @@ export class MRService {
     slide_order: number
     brochure_id: string
     note_text: string
+    slide_image_uri?: string
     timestamp: string
   }): Promise<{ success: boolean; error?: string }> {
     try {
@@ -654,7 +659,8 @@ export class MRService {
         p_slide_title: noteData.slide_title,
         p_slide_order: noteData.slide_order,
         p_brochure_id: noteData.brochure_id,
-        p_note_text: noteData.note_text
+        p_note_text: noteData.note_text,
+        p_slide_image_uri: noteData.slide_image_uri || null
       })
 
       if (error) {

@@ -527,20 +527,47 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
       const localBrochureResult = await BrochureManagementService.getBrochureData(brochureId)
       
       if (!localBrochureResult.success || !localBrochureResult.data) {
-        console.log('View: Brochure data missing, need to download')
+        console.log('View: Local brochure data missing, downloading USER\'S saved version from server')
         
-        // Find the original brochure in available brochures
-        const originalBrochure = availableBrochures.find(
-          available => (available.brochure_id || available.id) === brochureId
+        // CRITICAL FIX: Download the USER'S saved version with modifications, NOT the original
+        const downloadResult = await BrochureManagementService.downloadBrochureChanges(
+          currentUserId,
+          brochureId
         )
 
-        if (originalBrochure) {
-          // Download the original brochure (this will create the brochure_data.json)
-          await handleDownloadBrochure(originalBrochure)
-          console.log('View: Brochure downloaded and processed')
+        if (downloadResult.success && downloadResult.data) {
+          console.log('View: Downloaded USER\'S saved brochure data from server')
+          console.log('View: Server data has', downloadResult.data.slides?.length || 0, 'slides and', downloadResult.data.groups?.length || 0, 'groups')
+          
+          // Apply the downloaded data (this creates the local brochure_data.json)
+          const applyResult = await BrochureManagementService.applyBrochureChanges(
+            brochureId,
+            downloadResult.data
+          )
+
+          if (applyResult.success) {
+            console.log('View: USER\'S saved brochure data applied successfully')
+          } else {
+            console.error('View: Failed to apply USER\'S saved data:', applyResult.error)
+            Alert.alert('Error', 'Failed to load your saved brochure data')
+            return
+          }
         } else {
-          console.warn('View: Original brochure not found in available brochures')
-          return
+          console.error('View: Failed to download USER\'S saved brochure:', downloadResult.error)
+          
+          // Fallback: Try to download original as last resort
+          console.log('View: Attempting fallback to original brochure')
+          const originalBrochure = availableBrochures.find(
+            available => (available.brochure_id || available.id) === brochureId
+          )
+
+          if (originalBrochure) {
+            await handleDownloadBrochure(originalBrochure)
+            console.log('View: Original brochure downloaded as fallback')
+          } else {
+            Alert.alert('Error', 'Could not load brochure data')
+            return
+          }
         }
       } else {
         console.log('View: Local brochure data exists with', localBrochureResult.data.slides.length, 'slides and', localBrochureResult.data.groups.length, 'groups')
@@ -949,7 +976,7 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                       const zipThumbnail = brochureThumbnails[brochureId || 'default']
                       if (zipThumbnail) {
                         return (
-                          <Image
+                <Image 
                             source={{ uri: zipThumbnail }}
                             style={styles.brochureImage}
                           />
@@ -1007,14 +1034,14 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                               📥 Will download with latest changes on view
                             </Text>
                           )}
-                        </View>
+                </View>
                       )}
                       
                       {/* Background sync is handled automatically - no manual sync UI needed */}
               </View>
                   </View>
                   
-                  <View style={styles.brochureActions}>
+                <View style={styles.brochureActions}>
                     <TouchableOpacity
                       style={styles.actionButton}
                       onPress={() => handleViewBrochure(brochure)}
@@ -1031,8 +1058,8 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                               <ActivityIndicator size="small" color="#10b981" />
                               <Text style={styles.downloadProgressText}>
                                 {downloadProgress[(brochureId || brochure.title) as string]?.percentage || 0}%
-                              </Text>
-                            </View>
+                    </Text>
+                  </View>
                             <View style={styles.downloadProgressBar}>
                               <View 
                                 style={[
@@ -1050,7 +1077,7 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                             <Ionicons name="download" size={16} color="#10b981" />
                             <Text style={styles.actionButtonText}>Download</Text>
                       </TouchableOpacity>
-                        )}
+                    )}
                       </View>
                     )}
                     
@@ -1062,7 +1089,7 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                         >
                           <Ionicons name="create" size={16} color="#f59e0b" />
                           <Text style={styles.actionButtonText}>Rename</Text>
-                        </TouchableOpacity>
+                    </TouchableOpacity>
                         
                         <TouchableOpacity
                           style={styles.actionButton}
@@ -1120,7 +1147,7 @@ export default function BrochuresScreen({ navigation }: BrochuresScreenProps) {
                 <TouchableOpacity onPress={() => setShowRenameModal(false)}>
                   <Ionicons name="close" size={24} color="#6b7280" />
                 </TouchableOpacity>
-              </View>
+            </View>
 
               <View style={styles.renameSection}>
                 <Text style={styles.inputLabel}>New Title</Text>

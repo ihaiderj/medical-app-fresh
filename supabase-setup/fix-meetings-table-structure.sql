@@ -106,9 +106,18 @@ CREATE TABLE IF NOT EXISTS meeting_slide_notes (
     slide_order INTEGER NOT NULL,
     brochure_id TEXT NOT NULL,
     note_text TEXT NOT NULL,
+    slide_image_uri TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Add slide_image_uri column if it doesn't exist
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'meeting_slide_notes' AND column_name = 'slide_image_uri') THEN
+        ALTER TABLE meeting_slide_notes ADD COLUMN slide_image_uri TEXT;
+    END IF;
+END $$;
 
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_meeting_slide_notes_meeting_id ON meeting_slide_notes(meeting_id);
@@ -135,7 +144,8 @@ CREATE OR REPLACE FUNCTION add_slide_note_to_meeting(
     p_slide_title TEXT,
     p_slide_order INTEGER,
     p_brochure_id TEXT,
-    p_note_text TEXT
+    p_note_text TEXT,
+    p_slide_image_uri TEXT DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -160,6 +170,7 @@ BEGIN
         slide_order,
         brochure_id,
         note_text,
+        slide_image_uri,
         created_at,
         updated_at
     )
@@ -170,12 +181,14 @@ BEGIN
         p_slide_order,
         p_brochure_id,
         p_note_text,
+        p_slide_image_uri,
         NOW(),
         NOW()
     )
     ON CONFLICT (meeting_id, slide_id) 
     DO UPDATE SET
         note_text = EXCLUDED.note_text,
+        slide_image_uri = EXCLUDED.slide_image_uri,
         updated_at = NOW()
     RETURNING id INTO note_id;
 
@@ -214,6 +227,7 @@ BEGIN
         jsonb_build_object(
             'meeting_id', m.id,
             'title', m.title,
+            'doctor_id', m.doctor_id,
             'doctor_name', CONCAT(d.first_name, ' ', d.last_name),
             'doctor_specialty', d.specialty,
             'hospital', d.hospital,
@@ -296,6 +310,7 @@ BEGIN
             'slide_title', msn.slide_title,
             'slide_order', msn.slide_order,
             'note_text', msn.note_text,
+            'slide_image_uri', msn.slide_image_uri,
             'created_at', msn.created_at,
             'updated_at', msn.updated_at
         )
@@ -372,7 +387,8 @@ CREATE OR REPLACE FUNCTION update_mr_meeting(
     p_presentation_id TEXT DEFAULT NULL,
     p_notes TEXT DEFAULT NULL,
     p_status TEXT DEFAULT 'scheduled',
-    p_title TEXT DEFAULT NULL
+    p_title TEXT DEFAULT NULL,
+    p_doctor_id UUID DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -391,6 +407,7 @@ BEGIN
     UPDATE meetings 
     SET 
         title = COALESCE(p_title, title),
+        doctor_id = COALESCE(p_doctor_id, doctor_id),
         scheduled_date = p_scheduled_date,
         duration_minutes = p_duration_minutes,
         notes = COALESCE(p_notes, notes),
@@ -414,11 +431,11 @@ $$;
 
 -- Grant execute permissions
 GRANT EXECUTE ON FUNCTION create_meeting_with_brochure(UUID, UUID, TEXT, TEXT, TEXT, TEXT, TIMESTAMP WITH TIME ZONE, INTEGER) TO authenticated;
-GRANT EXECUTE ON FUNCTION add_slide_note_to_meeting(UUID, TEXT, TEXT, INTEGER, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION add_slide_note_to_meeting(UUID, TEXT, TEXT, INTEGER, TEXT, TEXT, TEXT) TO authenticated;
 GRANT EXECUTE ON FUNCTION get_meeting_details_with_notes(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION get_mr_meetings_with_notes(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION delete_mr_meeting(UUID) TO authenticated;
-GRANT EXECUTE ON FUNCTION update_mr_meeting(UUID, TIMESTAMP WITH TIME ZONE, INTEGER, TEXT, TEXT, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION update_mr_meeting(UUID, TIMESTAMP WITH TIME ZONE, INTEGER, TEXT, TEXT, TEXT, TEXT, UUID) TO authenticated;
 
 -- Add follow-up columns to meetings table if they don't exist
 DO $$ 

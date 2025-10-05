@@ -60,6 +60,18 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
   const [isLoading, setIsLoading] = useState(true)
   const [availableDoctors, setAvailableDoctors] = useState<any[]>([])
   
+  // Doctor form state for inline creation
+  const [doctorForm, setDoctorForm] = useState({
+    first_name: '',
+    last_name: '',
+    specialty: '',
+    hospital: '',
+    phone: '',
+    email: '',
+    location: '',
+    notes: ''
+  })
+  
   // Initialize meetings as empty array to prevent map errors
   React.useEffect(() => {
     if (!meetings) {
@@ -142,27 +154,60 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
       return []
     }
 
-    return meetings.filter((meeting) => {
+    return meetings.map((meeting) => {
+      // Auto-complete meetings if date has passed
+      const now = new Date()
+      now.setHours(0, 0, 0, 0) // Reset to start of day for comparison
+      
+      // Check if meeting should be auto-completed
+      let autoCompletedStatus = meeting.status
+      if (meeting.status !== 'completed' && meeting.status !== 'cancelled') {
+        // Priority 1: Check if follow-up date/time has passed
+        if (meeting.follow_up_date && meeting.follow_up_time) {
+          const followUpDateTime = new Date(meeting.follow_up_date)
+          const [hours, minutes] = meeting.follow_up_time.split(':')
+          followUpDateTime.setHours(parseInt(hours), parseInt(minutes))
+          
+          if (followUpDateTime < new Date()) {
+            autoCompletedStatus = 'completed'
+          }
+        }
+        // Priority 2: If no follow-up, check scheduled date/time
+        else if (meeting.scheduled_date) {
+          const meetingDateTime = new Date(meeting.scheduled_date)
+          if (meetingDateTime < new Date()) {
+            autoCompletedStatus = 'completed'
+          }
+        }
+      }
+      
+      return {
+        ...meeting,
+        status: autoCompletedStatus
+      }
+    }).filter((meeting) => {
       if (!meeting) return false
       
       const doctorName = meeting.doctor_name || `${meeting.doctor_first_name || ''} ${meeting.doctor_last_name || ''}`.trim()
       const matchesSearch = doctorName.toLowerCase().includes(searchQuery.toLowerCase()) ||
                            meeting.hospital?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                           meeting.purpose?.toLowerCase().includes(searchQuery.toLowerCase())
+                           meeting.purpose?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                           meeting.title?.toLowerCase().includes(searchQuery.toLowerCase())
 
       let matchesFilter = true
       const meetingDate = new Date(meeting.scheduled_date || meeting.meeting_date)
       
       if (selectedFilter === "This Week") {
         const now = new Date()
-        const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
-        matchesFilter = meetingDate >= now && meetingDate <= weekFromNow
+        const weekStart = new Date(now.setDate(now.getDate() - now.getDay()))
+        const weekEnd = new Date(now.setDate(now.getDate() - now.getDay() + 7))
+        matchesFilter = meetingDate >= weekStart && meetingDate <= weekEnd
       } else if (selectedFilter === "This Month") {
         const now = new Date()
-        const monthFromNow = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
-        matchesFilter = meetingDate >= now && meetingDate <= monthFromNow
+        matchesFilter = meetingDate.getMonth() === now.getMonth() && 
+                       meetingDate.getFullYear() === now.getFullYear()
       } else if (selectedFilter === "Follow-up Required") {
-        matchesFilter = meeting.follow_up_required || false
+        matchesFilter = meeting.follow_up_required === true
       } else if (selectedFilter === "Completed") {
         matchesFilter = meeting.status === "completed"
       }
@@ -242,7 +287,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         undefined, // presentationId
         meetingForm.notes,
         'scheduled', // status
-        meetingForm.purpose // title
+        meetingForm.purpose, // title
+        meetingForm.doctor_id || undefined // doctorId
       )
       
       console.log('Update meeting result:', result)
@@ -454,6 +500,73 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     })
   }
 
+  const resetDoctorForm = () => {
+    setDoctorForm({
+      first_name: '',
+      last_name: '',
+      specialty: '',
+      hospital: '',
+      phone: '',
+      email: '',
+      location: '',
+      notes: ''
+    })
+  }
+
+  const handleAddDoctor = async () => {
+    try {
+      // Validate required fields
+      if (!doctorForm.first_name.trim() || !doctorForm.last_name.trim() || 
+          !doctorForm.specialty.trim() || !doctorForm.hospital.trim()) {
+        Alert.alert('Error', 'Please fill in all required fields (Name, Specialty, Hospital)')
+        return
+      }
+
+      const userResult = await AuthService.getCurrentUser()
+      if (!userResult.success || !userResult.user) {
+        Alert.alert('Error', 'Please log in to add doctors')
+        return
+      }
+
+      const doctorData = {
+        first_name: doctorForm.first_name.trim(),
+        last_name: doctorForm.last_name.trim(),
+        specialty: doctorForm.specialty.trim(),
+        hospital: doctorForm.hospital.trim(),
+        phone: doctorForm.phone.trim(),
+        email: doctorForm.email.trim(),
+        location: doctorForm.location.trim(),
+        notes: doctorForm.notes.trim(),
+        profile_image_url: null
+      }
+
+      const result = await MRService.addDoctor(userResult.user.id, doctorData)
+      
+      if (result.success) {
+        Alert.alert('Success', 'Doctor added successfully!', [
+          {
+            text: 'OK',
+            onPress: async () => {
+              setShowAddDoctorModal(false)
+              resetDoctorForm()
+              
+              // Reload doctors
+              await loadAvailableDoctors()
+              
+              // Return to doctor selection modal
+              setShowDoctorSelectionModal(true)
+            }
+          }
+        ])
+      } else {
+        Alert.alert('Error', result.error || 'Failed to add doctor')
+      }
+    } catch (error) {
+      console.error('Error adding doctor:', error)
+      Alert.alert('Error', 'Failed to add doctor')
+    }
+  }
+
   return (
     <View style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
@@ -490,7 +603,12 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         </View>
 
         {/* Filter Chips */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterContainer}>
+        <ScrollView 
+          horizontal 
+          showsHorizontalScrollIndicator={false} 
+          style={styles.filterContainer}
+          contentContainerStyle={styles.filterContentContainer}
+        >
           {filters.map((filter) => (
             <TouchableOpacity
               key={filter}
@@ -564,10 +682,13 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
                 <Text style={styles.presentationTitle}>{meeting.purpose || 'No purpose specified'}</Text>
             </View>
 
-              {meeting.follow_up_required && (
+              {meeting.follow_up_required && meeting.follow_up_date && (
               <View style={styles.followUpInfo}>
                 <Ionicons name="calendar" size={14} color="#d97706" />
-                  <Text style={styles.followUpText}>Follow-up: {formatDate(meeting.follow_up_date)}</Text>
+                  <Text style={styles.followUpText}>
+                    Follow-up: {formatDate(meeting.follow_up_date)}
+                    {meeting.follow_up_time && ` at ${meeting.follow_up_time}`}
+                  </Text>
               </View>
             )}
 
@@ -822,14 +943,41 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
               </View>
 
               <View style={styles.inputGroup}>
-                <Text style={styles.inputLabel}>Meeting Date & Time</Text>
-                <TextInput
-                  style={styles.textInput}
-                  placeholder="YYYY-MM-DD HH:MM"
-                  placeholderTextColor="#9ca3af"
-                  value={meetingForm.scheduled_date}
-                  onChangeText={(text) => setMeetingForm({...meetingForm, scheduled_date: text})}
-                />
+                <Text style={styles.inputLabel}>Meeting Date</Text>
+                <TouchableOpacity
+                  style={styles.dateTimeButton}
+                  onPress={() => {
+                    setDatePickerMode('edit')
+                    setSelectedDate(new Date(meetingForm.scheduled_date || Date.now()))
+                    setShowDatePicker(true)
+                  }}
+                >
+                  <Ionicons name="calendar" size={20} color="#8b5cf6" />
+                  <Text style={styles.dateTimeButtonText}>
+                    {meetingForm.scheduled_date ? 
+                      new Date(meetingForm.scheduled_date).toLocaleDateString() : 
+                      'Select Date'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Meeting Time</Text>
+                <TouchableOpacity
+                  style={styles.dateTimeButton}
+                  onPress={() => {
+                    setDatePickerMode('edit')
+                    setSelectedTime(new Date(meetingForm.scheduled_date || Date.now()))
+                    setShowTimePicker(true)
+                  }}
+                >
+                  <Ionicons name="time" size={20} color="#8b5cf6" />
+                  <Text style={styles.dateTimeButtonText}>
+                    {meetingForm.scheduled_date ? 
+                      new Date(meetingForm.scheduled_date).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 
+                      'Select Time'}
+                  </Text>
+                </TouchableOpacity>
               </View>
 
               <View style={styles.inputGroup}>
@@ -1032,6 +1180,130 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         </View>
       </Modal>
 
+      {/* Add Doctor Modal */}
+      <Modal visible={showAddDoctorModal} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.largeModalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Add New Doctor</Text>
+              <TouchableOpacity onPress={() => {
+                setShowAddDoctorModal(false)
+                resetDoctorForm()
+              }}>
+                <Ionicons name="close" size={24} color="#6b7280" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.formContainer}>
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>First Name *</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="Enter doctor's first name"
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.first_name}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, first_name: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Last Name *</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="Enter doctor's last name"
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.last_name}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, last_name: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Specialty *</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="e.g., Cardiology, Neurology"
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.specialty}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, specialty: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Hospital/Clinic *</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="Enter hospital or clinic name"
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.hospital}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, hospital: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Phone Number</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="+1 (555) 123-4567"
+                  keyboardType="phone-pad"
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.phone}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, phone: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Email</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="doctor@hospital.com"
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.email}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, email: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Location</Text>
+                <TextInput 
+                  style={styles.textInput} 
+                  placeholder="City, State" 
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.location}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, location: text})}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Notes</Text>
+                <TextInput
+                  style={[styles.textInput, styles.textArea]}
+                  placeholder="Any additional notes about the doctor..."
+                  multiline
+                  numberOfLines={3}
+                  placeholderTextColor="#9ca3af"
+                  value={doctorForm.notes}
+                  onChangeText={(text) => setDoctorForm({...doctorForm, notes: text})}
+                />
+              </View>
+            </ScrollView>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={styles.cancelButton} onPress={() => {
+                setShowAddDoctorModal(false)
+                resetDoctorForm()
+              }}>
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.saveButton} onPress={handleAddDoctor}>
+                <Text style={styles.saveButtonText}>Add Doctor</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {/* Meeting Details Modal */}
       <MeetingDetailsModal
         visible={showMeetingDetails}
@@ -1135,6 +1407,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingVertical: 8,
     marginBottom: 8,
+  },
+  filterContentContainer: {
+    paddingRight: 20, // Add padding to the right so last item isn't cut off
   },
   filterChip: {
     paddingHorizontal: 16,

@@ -594,22 +594,27 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       })
 
       if (result.success) {
+        // Close add doctor modal
+        setShowAddDoctorModal(false)
+        
+        // Store the new doctor name for auto-selection
+        const newDoctorName = `${doctorForm.first_name.trim()} ${doctorForm.last_name.trim()}`
+        
+        // Reload doctors
+        await loadAvailableDoctors()
+        
+        // Reset form
+        resetDoctorForm()
+        
+        // Show success and return to doctor selection
         Alert.alert('Success', 'Doctor added successfully!', [
           {
             text: 'OK',
-            onPress: async () => {
-              // Close add doctor modal
-              setShowAddDoctorModal(false)
-              resetDoctorForm()
-
-              // Reload doctors
-              await loadAvailableDoctors()
-
-              // Find the newly added doctor and auto-select it
-              const newDoctorName = `${doctorForm.first_name.trim()} ${doctorForm.last_name.trim()}`
-              
-              // Return to doctor selection modal with new doctor available
-              setShowDoctorSelectionModal(true)
+            onPress: () => {
+              // Return to doctor selection modal
+              setTimeout(() => {
+                setShowDoctorSelectionModal(true)
+              }, 100)
             }
           }
         ])
@@ -703,7 +708,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           return
         }
 
-        console.log('Creating meeting with data:', {
+        console.log('=== CREATING NEW MEETING FROM ADD NOTES ===')
+        console.log('Meeting data to create:', {
           ...newMeetingForm,
           doctor_id: selectedDoctor.doctor_id,
           mr_id: userResult.user.id,
@@ -719,10 +725,13 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           brochure_title: brochureTitle
         })
 
+        console.log('Meeting creation result:', newMeetingResult)
+
         if (newMeetingResult.success && newMeetingResult.data) {
           meetingId = newMeetingResult.data.meeting_id
+          console.log('SUCCESS: Meeting created with ID:', meetingId)
         } else {
-          console.error('Create meeting error:', newMeetingResult.error)
+          console.error('ERROR: Create meeting failed:', newMeetingResult.error)
           Alert.alert('Error', `Failed to create meeting: ${newMeetingResult.error || 'Unknown error'}`)
           return
         }
@@ -734,6 +743,14 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       }
 
       // Save slide note
+      console.log('=== SAVING SLIDE NOTE DEBUG ===')
+      console.log('Meeting ID:', meetingId)
+      console.log('Slide ID:', currentSlideForNotes.id)
+      console.log('Slide Title:', currentSlideForNotes.title)
+      console.log('Slide Order:', currentSlideForNotes.order)
+      console.log('Note Text:', noteText.trim())
+      console.log('Brochure ID:', brochureId)
+      
       const noteResult = await MRService.addSlideNote({
         meeting_id: meetingId,
         slide_id: currentSlideForNotes.id,
@@ -741,8 +758,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         slide_order: currentSlideForNotes.order,
         note_text: noteText.trim(),
         brochure_id: brochureId,
+        slide_image_uri: currentSlideForNotes.imageUri, // Add slide image URI
         timestamp: new Date().toISOString()
       })
+
+      console.log('Note save result:', noteResult)
 
       if (noteResult.success) {
         Alert.alert('Success', 'Note saved successfully!', [
@@ -2404,10 +2424,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                          setSelectedDoctor(doctor)
                          setNewMeetingForm({...newMeetingForm, doctor_id: doctor.doctor_id})
                          setShowDoctorSelectionModal(false)
-                         // If we came from new meeting form, return to it
-                         if (showNewMeetingForm) {
-                           // Stay in the new meeting form with doctor selected
-                         }
+                         // Return to new meeting form
+                         setTimeout(() => {
+                           setShowNewMeetingForm(true)
+                         }, 100)
                        }}
                      >
                        <View style={styles.doctorInfo}>
@@ -4073,12 +4093,6 @@ const styles = StyleSheet.create({
   },
   selectedDoctorInfo: {
     marginBottom: 16,
-  },
-  doctorSectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 8,
   },
   changeDoctorButton: {
     backgroundColor: '#f3f4f6',
