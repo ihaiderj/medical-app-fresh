@@ -18,6 +18,12 @@ import Animated, {
   useAnimatedStyle,
   withTiming,
   withSpring,
+  FadeIn,
+  FadeOut,
+  SlideInRight,
+  SlideOutLeft,
+  SlideInLeft,
+  SlideOutRight,
   runOnJS,
 } from 'react-native-reanimated'
 import {
@@ -34,9 +40,13 @@ import * as ScreenOrientation from 'expo-screen-orientation'
 import { BrochureManagementService, BrochureSlide, SlideGroup } from '../../services/brochureManagementService'
 import { MRService } from '../../services/MRService'
 import { AuthService } from '../../services/AuthService'
+import { OfflineFirstService } from '../../services/offlineFirstService'
 import BrochureSyncStatus from '../../components/BrochureSyncStatus'
 import SyncStatusIndicator from '../../components/SyncStatusIndicator'
 import { SmartSyncService } from '../../services/smartSyncService'
+import { FilePathUtils } from '../../utils/filePathUtils'
+import { useModalQueue } from '../../hooks/useModalQueue'
+import { useAppData } from '../../context/AppDataContext'
 
 interface SlideManagementScreenProps {
   navigation: any
@@ -45,6 +55,12 @@ interface SlideManagementScreenProps {
 
 export default function SlideManagementScreen({ navigation, route }: SlideManagementScreenProps) {
   const { brochureId, brochureTitle } = route.params || {}
+
+  // Modal queue for iOS-safe modal transitions
+  const modalQueue = useModalQueue()
+  
+  // Global state management
+  const { notifyDoctorChange, notifyMeetingChange } = useAppData()
 
   const [slides, setSlides] = useState<BrochureSlide[]>([])
   const [groups, setGroups] = useState<SlideGroup[]>([])
@@ -63,6 +79,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null)
   const [showCheckboxes, setShowCheckboxes] = useState(false)
   const [isSlideListCollapsed, setIsSlideListCollapsed] = useState(false)
+  const [showFullscreenViewer, setShowFullscreenViewer] = useState(false)
+  const [fullscreenSlides, setFullscreenSlides] = useState<BrochureSlide[]>([])
+  const [fullscreenStartIndex, setFullscreenStartIndex] = useState(0)
 
   // Doctor selection for group creation (MR only)
   const [availableDoctors, setAvailableDoctors] = useState<any[]>([])
@@ -101,8 +120,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [selectedMeeting, setSelectedMeeting] = useState<any | null>(null)
   const [availableMeetings, setAvailableMeetings] = useState<any[]>([])
   const [showDoctorSelectionModal, setShowDoctorSelectionModal] = useState(false)
+  const [showGroupDoctorSelectionModal, setShowGroupDoctorSelectionModal] = useState(false)
   const [showMeetingSelectionModal, setShowMeetingSelectionModal] = useState(false)
   const [showNewMeetingForm, setShowNewMeetingForm] = useState(false)
+  const [doctorModalSource, setDoctorModalSource] = useState<'meeting' | 'group' | null>(null)
   const [newMeetingForm, setNewMeetingForm] = useState({
     doctor_id: '',
     title: '',
@@ -328,7 +349,34 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         setSlides(result.data.slides)
         setGroups(result.data.groups)
         if (result.data.slides.length > 0) {
-          setSelectedSlide(result.data.slides[0])
+          const firstSlide = result.data.slides[0]
+          console.log('Selected slide:', `${brochureId}_slide_${firstSlide.order}`, 'ImageURI:', firstSlide.imageUri)
+          
+          // Debug the image path
+          const debugImagePath = async (imagePath: string) => {
+            console.log('=== IMAGE LOAD ERROR ===')
+            console.log('Failed to load image:', imagePath)
+            console.log('Error details:', { error: 'Debug check initiated' })
+            console.log('Slide ID:', `${brochureId}_slide_${firstSlide.order}`)
+            console.log('Slide title:', firstSlide.title)
+            
+            // Add comprehensive path debugging
+            await FilePathUtils.debugFilePath(imagePath)
+          }
+          
+          // Check if the image file exists
+          const imageExists = await FilePathUtils.fileExists(firstSlide.imageUri)
+          if (!imageExists) {
+            console.log('=== IMAGE LOAD ERROR ===')
+            console.log('Failed to load image:', firstSlide.imageUri)
+            console.log('Error details:', { error: `${firstSlide.imageUri}: open failed: ENOENT (No such file or directory)`, target: 'debug' })
+            console.log('Slide ID:', `${brochureId}_slide_${firstSlide.order}`)
+            console.log('Slide title:', firstSlide.title)
+            
+            await debugImagePath(firstSlide.imageUri)
+          }
+          
+          setSelectedSlide(firstSlide)
         }
         
         // Generate alphabet filters from current slides
@@ -430,42 +478,79 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   }
 
   const handleCreateGroup = async () => {
+    console.log('=== HANDLE CREATE GROUP CALLED ===')
+    console.log('Creation mode:', groupCreationMode)
+    console.log('Selected doctor:', selectedDoctor)
+    console.log('New group name:', newGroupName)
+    console.log('Selected slides:', selectedSlides.length)
+    
     // Determine group name based on creation mode
     let groupName = ''
     if (groupCreationMode === 'doctor' && selectedDoctor) {
       groupName = `${selectedDoctor.first_name} ${selectedDoctor.last_name}`.trim()
+      console.log('Using doctor name for group:', groupName)
     } else {
       groupName = newGroupName.trim()
+      console.log('Using manual name for group:', groupName)
     }
 
     if (!groupName || selectedSlides.length === 0) {
+      console.log('Validation failed - group name or slides missing')
       Alert.alert('Error', 'Please enter group name (or select doctor) and select slides')
       return
     }
 
     try {
+      console.log('=== STARTING GROUP CREATION ===')
+      console.log('Group name:', groupName)
+      console.log('Slides count:', selectedSlides.length)
+      console.log('Brochure ID:', brochureId)
+      
       const result = await BrochureManagementService.createSlideGroup(
         brochureId,
         groupName,
-        selectedSlides
+        selectedSlides,
+        '#8b5cf6',
+        groupCreationMode === 'doctor' && selectedDoctor ? selectedDoctor.id : undefined
       )
 
+      console.log('=== GROUP CREATION COMPLETED ===')
+      console.log('Result success:', result.success)
+      console.log('Result error:', result.error)
+
       if (result.success) {
+        console.log('=== CLOSING MODAL AND CLEANING UP ===')
+        // Close modal first to prevent UI blocking
         setShowGroupModal(false)
         setNewGroupName('')
         setSelectedDoctor(null)
         setGroupCreationMode('manual')
         setSelectedSlides([])
-        loadBrochureData()
+        console.log('Modal state cleared')
         
-        // Mark brochure as modified for sync tracking
-        await BrochureManagementService.markBrochureAsModified(brochureId)
+        // Mark brochure as modified for sync tracking (non-blocking)
+        console.log('=== MARKING BROCHURE AS MODIFIED ===')
+        BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+          console.warn('Failed to mark brochure as modified:', err)
+        })
         
+        // Reload data after UI updates
+        console.log('=== SCHEDULING DATA RELOAD ===')
+        setTimeout(() => {
+          console.log('=== RELOADING BROCHURE DATA ===')
+          loadBrochureData()
+        }, 100)
+        
+        console.log('=== SHOWING SUCCESS ALERT ===')
         Alert.alert('Success', `Group "${groupName}" created successfully`)
+        console.log('=== HANDLE CREATE GROUP FINISHED ===')
       } else {
+        console.log('=== GROUP CREATION FAILED ===')
         Alert.alert('Error', result.error || 'Failed to create group')
       }
     } catch (error) {
+      console.error('=== GROUP CREATION ERROR ===', error)
+      console.error('Error details:', JSON.stringify(error))
       Alert.alert('Error', 'Failed to create group')
     }
   }
@@ -487,7 +572,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         return
       }
 
-      const doctorsResult = await MRService.getAssignedDoctors(userResult.user.id)
+      // Use OfflineFirstService to get doctors from local database
+      // This ensures consistency with My Doctors screen
+      const doctorsResult = await OfflineFirstService.getDoctors(userResult.user.id)
       if (doctorsResult.success && doctorsResult.data) {
         setAvailableDoctors(doctorsResult.data)
         console.log('Loaded doctors for group creation:', doctorsResult.data.length)
@@ -580,8 +667,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         return
       }
 
-      // Create doctor
-      const result = await MRService.addDoctor(userResult.user.id, {
+      // Create doctor using offline-first service
+      const result = await OfflineFirstService.createDoctor({
+        mr_id: userResult.user.id,
         first_name: doctorForm.first_name.trim(),
         last_name: doctorForm.last_name.trim(),
         specialty: doctorForm.specialty.trim(),
@@ -589,40 +677,14 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         phone: doctorForm.phone.trim(),
         email: doctorForm.email.trim(),
         location: doctorForm.location.trim(),
-        notes: doctorForm.notes.trim(),
-        profile_image_url: null, // No photo support in this flow
       })
 
       if (result.success) {
-        // Close add doctor modal
-        setShowAddDoctorModal(false)
-        
-        // Store the new doctor name for auto-selection
+        // Store the new doctor name and data for auto-selection
         const newDoctorName = `${doctorForm.first_name.trim()} ${doctorForm.last_name.trim()}`
         
-        // Reload doctors
-        await loadAvailableDoctors()
-        
-        // Reset form
-        resetDoctorForm()
-        
-        // Show success and return to doctor selection
-        Alert.alert('Success', 'Doctor added successfully!', [
-          {
-            text: 'OK',
-            onPress: () => {
-              // Return to doctor selection modal
-              setTimeout(() => {
-                setShowDoctorSelectionModal(true)
-              }, 100)
-            }
-          }
-        ])
-
-        // Auto-select the newly added doctor
-        // We need to use a more reliable method since availableDoctors might not be updated yet
         const tempDoctor = {
-          doctor_id: `temp_${Date.now()}`, // Temporary ID until real data loads
+          doctor_id: result.data?.id || `temp_${Date.now()}`,
           first_name: doctorForm.first_name.trim(),
           last_name: doctorForm.last_name.trim(),
           specialty: doctorForm.specialty.trim(),
@@ -636,11 +698,38 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         // Immediately select the new doctor and switch to doctor mode
         setSelectedDoctor(tempDoctor)
         setGroupCreationMode('doctor')
-
-        // Reload doctors in the background to get the real doctor ID
-        setTimeout(async () => {
-          await loadAvailableDoctors()
-        }, 1000)
+        
+        // Notify global state about doctor change
+        notifyDoctorChange()
+        
+        // Reset form
+        resetDoctorForm()
+        
+        // Close add doctor modal and open appropriate selection modal with proper timing
+        modalQueue.closeModal('addDoctor', () => {
+          // Show success message
+          Alert.alert('Success', 'Doctor added successfully!', [
+            {
+              text: 'OK',
+              onPress: () => {
+                // Reload doctors in background
+                loadAvailableDoctors()
+                
+                // Return to the appropriate doctor selection modal based on source
+                if (doctorModalSource === 'group') {
+                  modalQueue.openModal('groupDoctorSelection')
+                  setShowGroupDoctorSelectionModal(true)
+                } else {
+                  modalQueue.openModal('doctorSelection')
+                  setShowDoctorSelectionModal(true)
+                }
+                setDoctorModalSource(null) // Reset source
+              }
+            }
+          ])
+        })
+        
+        setShowAddDoctorModal(false)
 
       } else {
         Alert.alert('Error', result.error || 'Failed to add doctor')
@@ -656,11 +745,38 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
     try {
       const userResult = await AuthService.getCurrentUser()
       if (userResult.success && userResult.user && userResult.user.role === 'mr') {
-        const meetingsResult = await MRService.getMeetings(userResult.user.id)
-        if (meetingsResult.success && meetingsResult.data) {
-          setAvailableMeetings(meetingsResult.data)
-          console.log('Loaded meetings:', meetingsResult.data.length)
+        // Load meetings from BOTH sources to get all meetings (old and new)
+        const [localMeetingsResult, serverMeetingsResult] = await Promise.all([
+          OfflineFirstService.getMeetings(userResult.user.id),
+          MRService.getMeetings(userResult.user.id)
+        ])
+        
+        let allMeetings: any[] = []
+        
+        // Collect local meetings
+        if (localMeetingsResult.success && localMeetingsResult.data) {
+          allMeetings = Array.isArray(localMeetingsResult.data) ? localMeetingsResult.data : []
         }
+        
+        // Collect server meetings
+        if (serverMeetingsResult.success && serverMeetingsResult.data) {
+          const serverMeetings = Array.isArray(serverMeetingsResult.data) ? serverMeetingsResult.data : []
+          
+          // Merge server meetings with local, avoiding duplicates
+          serverMeetings.forEach(serverMeeting => {
+            const isDuplicate = allMeetings.some(localMeeting => 
+              (localMeeting.server_id && localMeeting.server_id === serverMeeting.meeting_id) ||
+              (localMeeting.meeting_id && localMeeting.meeting_id === serverMeeting.meeting_id)
+            )
+            
+            if (!isDuplicate) {
+              allMeetings.push(serverMeeting)
+            }
+          })
+        }
+        
+        setAvailableMeetings(allMeetings)
+        console.log('Loaded meetings (combined):', allMeetings.length)
         
         // Also load available doctors for new meeting creation
         console.log('Loading doctors for notes modal...')
@@ -730,6 +846,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         if (newMeetingResult.success && newMeetingResult.data) {
           meetingId = newMeetingResult.data.meeting_id
           console.log('SUCCESS: Meeting created with ID:', meetingId)
+          
+          // Notify global state about meeting change
+          notifyMeetingChange()
         } else {
           console.error('ERROR: Create meeting failed:', newMeetingResult.error)
           Alert.alert('Error', `Failed to create meeting: ${newMeetingResult.error || 'Unknown error'}`)
@@ -920,7 +1039,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
               brochureData.updatedAt = new Date().toISOString()
 
               // Save updated data
-              const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+              const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
               await FileSystem.writeAsStringAsync(
                 `${brochureDir}brochure_data.json`,
                 JSON.stringify(brochureData, null, 2)
@@ -952,7 +1071,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         brochureData.updatedAt = new Date().toISOString()
 
         // Save updated data
-        const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+        const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
         await FileSystem.writeAsStringAsync(
           `${brochureDir}brochure_data.json`,
           JSON.stringify(brochureData, null, 2)
@@ -1053,7 +1172,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       brochureData.updatedAt = new Date().toISOString()
 
       // Save updated data
-      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
       await FileSystem.writeAsStringAsync(
         `${brochureDir}brochure_data.json`,
         JSON.stringify(brochureData, null, 2)
@@ -1128,7 +1247,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
               brochureData.updatedAt = new Date().toISOString()
 
               // Save updated data
-              const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+              const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
               await FileSystem.writeAsStringAsync(
                 `${brochureDir}brochure_data.json`,
                 JSON.stringify(brochureData, null, 2)
@@ -1212,7 +1331,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
               brochureData.updatedAt = new Date().toISOString()
 
               // Save updated data
-              const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+              const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
               await FileSystem.writeAsStringAsync(
                 `${brochureDir}brochure_data.json`,
                 JSON.stringify(brochureData, null, 2)
@@ -1231,6 +1350,16 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   }
 
   const filteredSlides = getFilteredSlides()
+
+  // Open fullscreen viewer with current context
+  const openFullscreenViewer = (startSlide?: BrochureSlide) => {
+    const slidesToShow = getFilteredSlides()
+    const startIndex = startSlide ? slidesToShow.findIndex(s => s.id === startSlide.id) : 0
+    
+    setFullscreenSlides(slidesToShow)
+    setFullscreenStartIndex(Math.max(0, startIndex))
+    setShowFullscreenViewer(true)
+  }
 
   return (
     <GestureHandlerRootView style={styles.container}>
@@ -1348,7 +1477,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
          </View>
 
          {/* Sync Status Indicator */}
-        <SyncStatusIndicator position="top-right" />
+        <SyncStatusIndicator status="synced" />
 
          {/* Conditional Controls Based on Orientation and Visibility */}
         {currentOrientation === 'landscape' ? (
@@ -1759,8 +1888,18 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                         <Animated.Image
                           source={{ uri: selectedSlide.imageUri }}
                           style={[styles.previewImage, animatedStyle]}
-                          onError={(error) => console.log('Image load error:', error.nativeEvent)}
-                          onLoad={() => console.log('Image loaded successfully for:', selectedSlide.imageUri)}
+                          onError={(error) => {
+                            console.log('=== IMAGE LOAD ERROR ===')
+                            console.log('Failed to load image:', selectedSlide.imageUri)
+                            console.log('Error details:', error.nativeEvent)
+                            console.log('Slide ID:', selectedSlide.id)
+                            console.log('Slide title:', selectedSlide.title)
+                          }}
+                          onLoad={() => {
+                            console.log('=== IMAGE LOADED SUCCESSFULLY ===')
+                            console.log('Image URI:', selectedSlide.imageUri)
+                            console.log('Slide:', selectedSlide.title)
+                          }}
                         />
                       </Animated.View>
                     </GestureDetector>
@@ -1773,17 +1912,34 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                           {/* Left side: Previous + Reset + Slide Info */}
                           <View style={styles.leftNavControls}>
                             <TouchableOpacity
-                              style={[styles.navControlButton, selectedSlide.order === 1 && styles.navControlButtonDisabled]}
+                              style={[styles.navControlButton, (() => {
+                                const filteredSlides = getFilteredSlides()
+                                const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                                return currentIndex === 0
+                              })() && styles.navControlButtonDisabled]}
                               onPress={() => {
-                                const currentIndex = slides.findIndex(s => s.id === selectedSlide.id)
+                                const filteredSlides = getFilteredSlides()
+                                const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
                                 if (currentIndex > 0) {
-                                  setSelectedSlide(slides[currentIndex - 1])
+                                  setSelectedSlide(filteredSlides[currentIndex - 1])
                                 }
                               }}
-                              disabled={selectedSlide.order === 1}
+                              disabled={(() => {
+                                const filteredSlides = getFilteredSlides()
+                                const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                                return currentIndex === 0
+                              })()}
                             >
-                              <Ionicons name="chevron-back" size={20} color={selectedSlide.order === 1 ? "#9ca3af" : "#8b5cf6"} />
-                              <Text style={[styles.navControlText, selectedSlide.order === 1 && styles.navControlTextDisabled]}>Previous</Text>
+                              <Ionicons name="chevron-back" size={20} color={(() => {
+                                const filteredSlides = getFilteredSlides()
+                                const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                                return currentIndex === 0 ? "#9ca3af" : "#8b5cf6"
+                              })()} />
+                              <Text style={[styles.navControlText, (() => {
+                                const filteredSlides = getFilteredSlides()
+                                const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                                return currentIndex === 0
+                              })() && styles.navControlTextDisabled]}>Previous</Text>
                             </TouchableOpacity>
 
                       <TouchableOpacity 
@@ -1806,6 +1962,15 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                         <Ionicons name="create" size={20} color="#ffffff" />
                         <Text style={styles.addNotesText}>Add Note</Text>
                       </TouchableOpacity>
+
+                      {/* Fullscreen Button */}
+                      <TouchableOpacity 
+                        style={styles.fullscreenViewButton} 
+                        onPress={() => openFullscreenViewer(selectedSlide)}
+                      >
+                        <Ionicons name="expand" size={20} color="#ffffff" />
+                        <Text style={styles.fullscreenViewText}>Present</Text>
+                      </TouchableOpacity>
                       
                       {/* Slide Info Under Reset Button */}
                       <View style={styles.slideInfoUnderReset}>
@@ -1816,35 +1981,69 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
                           {/* Right side: Next */}
                           <TouchableOpacity
-                            style={[styles.navControlButton, selectedSlide.order === slides.length && styles.navControlButtonDisabled]}
+                            style={[styles.navControlButton, (() => {
+                              const filteredSlides = getFilteredSlides()
+                              const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                              return currentIndex === filteredSlides.length - 1
+                            })() && styles.navControlButtonDisabled]}
                             onPress={() => {
-                              const currentIndex = slides.findIndex(s => s.id === selectedSlide.id)
-                              if (currentIndex < slides.length - 1) {
-                                setSelectedSlide(slides[currentIndex + 1])
+                              const filteredSlides = getFilteredSlides()
+                              const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                              if (currentIndex < filteredSlides.length - 1) {
+                                setSelectedSlide(filteredSlides[currentIndex + 1])
                               }
                             }}
-                            disabled={selectedSlide.order === slides.length}
+                            disabled={(() => {
+                              const filteredSlides = getFilteredSlides()
+                              const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                              return currentIndex === filteredSlides.length - 1
+                            })()}
                           >
-                            <Text style={[styles.navControlText, selectedSlide.order === slides.length && styles.navControlTextDisabled]}>Next</Text>
-                            <Ionicons name="chevron-forward" size={20} color={selectedSlide.order === slides.length ? "#9ca3af" : "#8b5cf6"} />
+                            <Text style={[styles.navControlText, (() => {
+                              const filteredSlides = getFilteredSlides()
+                              const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                              return currentIndex === filteredSlides.length - 1
+                            })() && styles.navControlTextDisabled]}>Next</Text>
+                            <Ionicons name="chevron-forward" size={20} color={(() => {
+                              const filteredSlides = getFilteredSlides()
+                              const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                              return currentIndex === filteredSlides.length - 1 ? "#9ca3af" : "#8b5cf6"
+                            })()} />
                           </TouchableOpacity>
                         </>
                       ) : (
                         /* Portrait: Original simple layout */
                         <>
-                          <TouchableOpacity
-                            style={[styles.navControlButton, selectedSlide.order === 1 && styles.navControlButtonDisabled]}
-                            onPress={() => {
-                              const currentIndex = slides.findIndex(s => s.id === selectedSlide.id)
-                              if (currentIndex > 0) {
-                                setSelectedSlide(slides[currentIndex - 1])
-                              }
-                            }}
-                            disabled={selectedSlide.order === 1}
-                          >
-                            <Ionicons name="chevron-back" size={20} color={selectedSlide.order === 1 ? "#9ca3af" : "#8b5cf6"} />
-                            <Text style={[styles.navControlText, selectedSlide.order === 1 && styles.navControlTextDisabled]}>Previous</Text>
-                          </TouchableOpacity>
+                        <TouchableOpacity 
+                          style={[styles.navControlButton, (() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === 0
+                          })() && styles.navControlButtonDisabled]}
+                          onPress={() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            if (currentIndex > 0) {
+                              setSelectedSlide(filteredSlides[currentIndex - 1])
+                            }
+                          }}
+                          disabled={(() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === 0
+                          })()}
+                        >
+                          <Ionicons name="chevron-back" size={20} color={(() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === 0 ? "#9ca3af" : "#8b5cf6"
+                          })()} />
+                          <Text style={[styles.navControlText, (() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === 0
+                          })() && styles.navControlTextDisabled]}>Previous</Text>
+                        </TouchableOpacity>
 
                         <TouchableOpacity 
                           style={styles.resetZoomButton} 
@@ -1855,17 +2054,34 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                         </TouchableOpacity>
                         
                         <TouchableOpacity 
-                          style={[styles.navControlButton, selectedSlide.order === slides.length && styles.navControlButtonDisabled]}
+                          style={[styles.navControlButton, (() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === filteredSlides.length - 1
+                          })() && styles.navControlButtonDisabled]}
                           onPress={() => {
-                            const currentIndex = slides.findIndex(s => s.id === selectedSlide.id)
-                            if (currentIndex < slides.length - 1) {
-                              setSelectedSlide(slides[currentIndex + 1])
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            if (currentIndex < filteredSlides.length - 1) {
+                              setSelectedSlide(filteredSlides[currentIndex + 1])
                             }
                           }}
-                          disabled={selectedSlide.order === slides.length}
+                          disabled={(() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === filteredSlides.length - 1
+                          })()}
                         >
-                          <Text style={[styles.navControlText, selectedSlide.order === slides.length && styles.navControlTextDisabled]}>Next</Text>
-                          <Ionicons name="chevron-forward" size={20} color={selectedSlide.order === slides.length ? "#9ca3af" : "#8b5cf6"} />
+                          <Text style={[styles.navControlText, (() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === filteredSlides.length - 1
+                          })() && styles.navControlTextDisabled]}>Next</Text>
+                          <Ionicons name="chevron-forward" size={20} color={(() => {
+                            const filteredSlides = getFilteredSlides()
+                            const currentIndex = filteredSlides.findIndex(s => s.id === selectedSlide.id)
+                            return currentIndex === filteredSlides.length - 1 ? "#9ca3af" : "#8b5cf6"
+                          })()} />
                         </TouchableOpacity>
                         </>
                       )}
@@ -1887,6 +2103,14 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                         >
                           <Ionicons name="create" size={20} color="#ffffff" />
                           <Text style={styles.addNotesText}>Add Notes</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity 
+                          style={styles.fullscreenViewButton} 
+                          onPress={() => openFullscreenViewer(selectedSlide)}
+                        >
+                          <Ionicons name="expand" size={20} color="#ffffff" />
+                          <Text style={styles.fullscreenViewText}>Present</Text>
                         </TouchableOpacity>
                         
                         <Text style={styles.previewSlideTitle}>{selectedSlide.title} ({selectedSlide.order})</Text>
@@ -1987,15 +2211,17 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                 ) : (
                   <View>
                     <View style={styles.namingOption}>
-                      <View style={styles.optionHeader}>
-                        <TouchableOpacity
+                      <TouchableOpacity 
+                        style={styles.optionHeader}
+                        onPress={() => setGroupCreationMode('manual')}
+                      >
+                        <View
                           style={[styles.radioButton, groupCreationMode === 'manual' && styles.radioButtonSelected]}
-                          onPress={() => setGroupCreationMode('manual')}
                         >
                           <View style={[styles.radioInner, groupCreationMode === 'manual' && styles.radioInnerSelected]} />
-                        </TouchableOpacity>
+                        </View>
                         <Text style={styles.optionTitle}>Enter Custom Name</Text>
-                      </View>
+                      </TouchableOpacity>
                       <TextInput
                         style={[styles.input, groupCreationMode !== 'manual' && styles.inputDisabled]}
                         value={newGroupName}
@@ -2006,130 +2232,65 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                     </View>
 
                     <View style={styles.namingOption}>
-                      <View style={styles.optionHeader}>
-                        <TouchableOpacity
+                      <TouchableOpacity 
+                        style={styles.optionHeader}
+                        onPress={() => setGroupCreationMode('doctor')}
+                      >
+                        <View
                           style={[styles.radioButton, groupCreationMode === 'doctor' && styles.radioButtonSelected]}
-                          onPress={() => setGroupCreationMode('doctor')}
                         >
                           <View style={[styles.radioInner, groupCreationMode === 'doctor' && styles.radioInnerSelected]} />
-                        </TouchableOpacity>
+                        </View>
                         <Text style={styles.optionTitle}>Name After Doctor</Text>
-                      </View>
+                      </TouchableOpacity>
 
                       {groupCreationMode === 'doctor' && (
                         <View style={styles.doctorSelectionContainer}>
-                          {isLoadingDoctors ? (
-                            <View style={styles.groupLoadingContainer}>
-                              <ActivityIndicator size="small" color="#8b5cf6" />
-                              <Text style={styles.groupLoadingText}>Loading doctors...</Text>
-                            </View>
-                          ) : (
-                            <View>
-                              {availableDoctors.length > 0 ? (
-                                <View>
-                                  <View style={styles.searchContainer}>
-                                    <Ionicons name="search" size={16} color="#6b7280" />
-                                    <TextInput
-                                      style={styles.searchInput}
-                                      placeholder="Search doctors..."
-                                      value={doctorSearchQuery}
-                                      onChangeText={setDoctorSearchQuery}
-                                      placeholderTextColor="#9ca3af"
-                                    />
-                                  </View>
-
-                                  {selectedDoctor ? (
-                                    <View style={styles.selectedDoctorCard}>
-                                      <View style={styles.doctorInfo}>
-                                        <View style={styles.doctorAvatar}>
-                                          {selectedDoctor.profile_image_url ? (
-                                            <Image source={{ uri: selectedDoctor.profile_image_url }} style={styles.doctorAvatarImage} />
-                                          ) : (
-                                            <Ionicons name="person" size={20} color="#8b5cf6" />
-                                          )}
-                                        </View>
-                                        <View style={styles.doctorDetails}>
-                                          <Text style={styles.selectedDoctorName}>
-                                            {selectedDoctor.first_name} {selectedDoctor.last_name}
-                                          </Text>
-                                          <Text style={styles.selectedDoctorSpecialty}>{selectedDoctor.specialty}</Text>
-                                          <Text style={styles.selectedDoctorHospital}>{selectedDoctor.hospital}</Text>
-                                        </View>
-                                      </View>
-                                      <TouchableOpacity
-                                        style={styles.changeButton}
-                                        onPress={() => setSelectedDoctor(null)}
-                                      >
-                                        <Text style={styles.changeButtonText}>Change</Text>
-                                      </TouchableOpacity>
-                                    </View>
+                          {selectedDoctor ? (
+                            <View style={styles.selectedDoctorCard}>
+                              <View style={styles.doctorInfo}>
+                                <View style={styles.doctorAvatar}>
+                                  {selectedDoctor.profile_image_url ? (
+                                    <Image source={{ uri: selectedDoctor.profile_image_url }} style={styles.doctorAvatarImage} />
                                   ) : (
-                                    <View style={styles.doctorDropdown}>
-                                      {availableDoctors
-                                        .filter(doctor => {
-                                          const searchTerm = doctorSearchQuery.toLowerCase()
-                                          const doctorName = `${doctor.first_name} ${doctor.last_name}`.toLowerCase()
-                                          const specialty = doctor.specialty.toLowerCase()
-                                          const hospital = doctor.hospital.toLowerCase()
-                                          return doctorName.includes(searchTerm) ||
-                                            specialty.includes(searchTerm) ||
-                                            hospital.includes(searchTerm)
-                                        })
-                                        .slice(0, 5)
-                                        .map((doctor) => (
-                                          <TouchableOpacity
-                                            key={doctor.doctor_id}
-                                            style={styles.doctorDropdownItem}
-                                            onPress={() => handleDoctorSelection(doctor)}
-                                          >
-                                            <View style={styles.doctorInfo}>
-                                              <View style={styles.doctorAvatar}>
-                                                {doctor.profile_image_url ? (
-                                                  <Image source={{ uri: doctor.profile_image_url }} style={styles.doctorAvatarImage} />
-                                                ) : (
-                                                  <Ionicons name="person" size={16} color="#8b5cf6" />
-                                                )}
-                                              </View>
-                                              <View style={styles.doctorDetails}>
-                                                <Text style={styles.doctorName}>
-                                                  {doctor.first_name} {doctor.last_name}
-                                                </Text>
-                                                <Text style={styles.doctorSpecialty}>{doctor.specialty}</Text>
-                                                <Text style={styles.doctorHospital}>{doctor.hospital}</Text>
-                                              </View>
-                                            </View>
-                                            <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
-                                          </TouchableOpacity>
-                                        ))}
-
-                                      {doctorSearchQuery && availableDoctors.filter(doctor => {
-                                        const searchTerm = doctorSearchQuery.toLowerCase()
-                                        const doctorName = `${doctor.first_name} ${doctor.last_name}`.toLowerCase()
-                                        return doctorName.includes(searchTerm)
-                                      }).length === 0 && (
-                                          <View style={styles.noResultsContainer}>
-                                            <Text style={styles.noResultsText}>No doctors found matching "{doctorSearchQuery}"</Text>
-                                          </View>
-                                        )}
-                                    </View>
+                                    <Ionicons name="person" size={20} color="#8b5cf6" />
                                   )}
                                 </View>
-                              ) : (
-                                <View style={styles.emptyDoctors}>
-                                  <Ionicons name="person-outline" size={32} color="#9ca3af" />
-                                  <Text style={styles.emptyDoctorsText}>No doctors found</Text>
-                                  <Text style={styles.emptyDoctorsSubtext}>Add doctors to enable doctor-based group naming</Text>
+                                <View style={styles.doctorDetails}>
+                                  <Text style={styles.selectedDoctorName}>
+                                    {selectedDoctor.first_name} {selectedDoctor.last_name}
+                                  </Text>
+                                  <Text style={styles.selectedDoctorSpecialty}>{selectedDoctor.specialty}</Text>
+                                  <Text style={styles.selectedDoctorHospital}>{selectedDoctor.hospital}</Text>
                                 </View>
-                              )}
-
+                              </View>
                               <TouchableOpacity
-                                style={styles.addDoctorButton}
-                                onPress={handleAddNewDoctorFromGroup}
+                                style={styles.changeButton}
+                                onPress={() => {
+                                  modalQueue.closeModal('groupModal', () => {
+                                    modalQueue.openModal('groupDoctorSelection')
+                                    setShowGroupDoctorSelectionModal(true)
+                                  })
+                                  setShowGroupModal(false)
+                                }}
                               >
-                                <Ionicons name="person-add" size={16} color="#8b5cf6" />
-                                <Text style={styles.addDoctorButtonText}>Add New Doctor</Text>
+                                <Text style={styles.changeButtonText}>Change</Text>
                               </TouchableOpacity>
                             </View>
+                          ) : (
+                            <TouchableOpacity
+                              style={styles.selectDoctorButton}
+                              onPress={() => {
+                                modalQueue.closeModal('groupModal', () => {
+                                  modalQueue.openModal('groupDoctorSelection')
+                                  setShowGroupDoctorSelectionModal(true)
+                                })
+                                setShowGroupModal(false)
+                              }}
+                            >
+                              <Ionicons name="person-add" size={20} color="#8b5cf6" />
+                              <Text style={styles.selectDoctorButtonText}>Select Doctor</Text>
+                            </TouchableOpacity>
                           )}
                         </View>
                       )}
@@ -2340,7 +2501,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                    
                    <TouchableOpacity
                      style={styles.selectionButton}
-                     onPress={() => setShowMeetingSelectionModal(true)}
+                     onPress={() => {
+                       setShowNotesModal(false)
+                       setTimeout(() => {
+                         setShowMeetingSelectionModal(true)
+                       }, 100)
+                     }}
                    >
                      <View style={styles.selectionButtonContent}>
                        <Ionicons name="calendar" size={20} color="#8b5cf6" />
@@ -2460,8 +2626,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                  <TouchableOpacity
                    style={styles.addNewButton}
                    onPress={() => {
+                     setDoctorModalSource('meeting')
+                     modalQueue.closeModal('doctorSelection', () => {
+                       modalQueue.openModal('addDoctor')
+                       setShowAddDoctorModal(true)
+                     })
                      setShowDoctorSelectionModal(false)
-                     setShowAddDoctorModal(true)
                    }}
                  >
                    <Ionicons name="add" size={20} color="#8b5cf6" />
@@ -2472,13 +2642,97 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
            </View>
          </Modal>
 
-         {/* Meeting Selection Modal */}
+        {/* Group Doctor Selection Modal */}
+        <Modal visible={showGroupDoctorSelectionModal} transparent animationType="slide">
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+               <View style={styles.modalHeader}>
+                 <Text style={styles.modalTitle}>Select Doctor for Group</Text>
+                 <TouchableOpacity onPress={() => setShowGroupDoctorSelectionModal(false)}>
+                   <Ionicons name="close" size={24} color="#6b7280" />
+                 </TouchableOpacity>
+               </View>
+
+               <ScrollView style={styles.modalBody} contentContainerStyle={styles.modalBodyContent}>
+                 {availableDoctors.length > 0 ? (
+                   availableDoctors.map(doctor => (
+                     <TouchableOpacity
+                       key={doctor.doctor_id}
+                       style={[
+                         styles.doctorSelectionCard,
+                         selectedDoctor?.doctor_id === doctor.doctor_id && styles.doctorSelectionCardSelected
+                       ]}
+                       onPress={() => {
+                         setSelectedDoctor(doctor)
+                         setShowGroupDoctorSelectionModal(false)
+                         // Return to group modal
+                         setTimeout(() => {
+                           setShowGroupModal(true)
+                         }, 100)
+                       }}
+                     >
+                       <View style={styles.doctorInfo}>
+                         <View style={styles.doctorAvatar}>
+                           {doctor.profile_image_url ? (
+                             <Image source={{ uri: doctor.profile_image_url }} style={styles.doctorAvatarImage} />
+                           ) : (
+                             <Ionicons name="person" size={20} color="#8b5cf6" />
+                           )}
+                         </View>
+                         <View style={styles.doctorDetails}>
+                           <Text style={styles.doctorName}>
+                             {doctor.first_name} {doctor.last_name}
+                           </Text>
+                           <Text style={styles.doctorSpecialty}>{doctor.specialty}</Text>
+                           <Text style={styles.doctorHospital}>{doctor.hospital}</Text>
+                         </View>
+                       </View>
+                       {selectedDoctor?.doctor_id === doctor.doctor_id && (
+                         <Ionicons name="checkmark-circle" size={24} color="#8b5cf6" />
+                       )}
+                     </TouchableOpacity>
+                   ))
+                 ) : (
+                   <View style={styles.emptyState}>
+                     <Ionicons name="person-outline" size={48} color="#d1d5db" />
+                     <Text style={styles.emptyStateText}>No doctors available</Text>
+                     <Text style={styles.emptyStateSubtext}>Add a doctor to continue</Text>
+                   </View>
+                 )}
+               </ScrollView>
+
+               <View style={styles.modalActions}>
+                 <TouchableOpacity
+                   style={styles.addNewButton}
+                   onPress={() => {
+                     setDoctorModalSource('group')
+                     modalQueue.closeModal('groupDoctorSelection', () => {
+                       modalQueue.openModal('addDoctor')
+                       setShowAddDoctorModal(true)
+                     })
+                     setShowGroupDoctorSelectionModal(false)
+                   }}
+                 >
+                   <Ionicons name="add" size={20} color="#8b5cf6" />
+                   <Text style={styles.addNewButtonText}>Add New Doctor</Text>
+                 </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Meeting Selection Modal */}
          <Modal visible={showMeetingSelectionModal} transparent animationType="slide">
            <View style={styles.modalOverlay}>
              <View style={styles.modalContent}>
                <View style={styles.modalHeader}>
                  <Text style={styles.modalTitle}>Select Meeting</Text>
-                 <TouchableOpacity onPress={() => setShowMeetingSelectionModal(false)}>
+                 <TouchableOpacity onPress={() => {
+                   setShowMeetingSelectionModal(false)
+                   setTimeout(() => {
+                     setShowNotesModal(true)
+                   }, 100)
+                 }}>
                    <Ionicons name="close" size={24} color="#6b7280" />
                  </TouchableOpacity>
                </View>
@@ -2495,6 +2749,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                        onPress={() => {
                          setSelectedMeeting(meeting)
                          setShowMeetingSelectionModal(false)
+                         setTimeout(() => {
+                           setShowNotesModal(true)
+                         }, 100)
                        }}
                      >
                        <View style={styles.meetingInfo}>
@@ -2521,12 +2778,24 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                      setShowMeetingSelectionModal(false)
                      if (!selectedDoctor) {
                        Alert.alert('Select Doctor First', 'Please select a doctor before creating a meeting', [
-                         { text: 'Select Doctor', onPress: () => setShowDoctorSelectionModal(true) },
+                         { 
+                           text: 'Select Doctor', 
+                           onPress: () => {
+                             setShowMeetingSelectionModal(false)
+                             setDoctorModalSource('meeting')
+                             setTimeout(() => {
+                               setShowDoctorSelectionModal(true)
+                             }, 100)
+                           }
+                         },
                          { text: 'Cancel', style: 'cancel' }
                        ])
                        return
                      }
-                     setShowNewMeetingForm(true)
+                     setShowMeetingSelectionModal(false)
+                     setTimeout(() => {
+                       setShowNewMeetingForm(true)
+                     }, 100)
                    }}
                  >
                    <Ionicons name="add" size={20} color="#8b5cf6" />
@@ -2543,38 +2812,68 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
              <View style={styles.modalContent}>
                <View style={styles.modalHeader}>
                  <Text style={styles.modalTitle}>Create New Meeting</Text>
-                 <TouchableOpacity onPress={() => setShowNewMeetingForm(false)}>
+                 <TouchableOpacity onPress={() => {
+                   setShowNewMeetingForm(false)
+                   setTimeout(() => {
+                     setShowMeetingSelectionModal(true)
+                   }, 100)
+                 }}>
                    <Ionicons name="close" size={24} color="#6b7280" />
                  </TouchableOpacity>
                </View>
 
                <ScrollView style={styles.modalBody}>
-                 {selectedDoctor && (
-                   <View style={styles.selectedDoctorInfo}>
-                     <View style={styles.doctorSectionHeader}>
-                       <Text style={styles.inputLabel}>Selected Doctor</Text>
-                       <TouchableOpacity
-                         style={styles.changeDoctorButton}
-                         onPress={() => setShowDoctorSelectionModal(true)}
-                       >
-                         <Text style={styles.changeDoctorText}>Change</Text>
-                       </TouchableOpacity>
-                     </View>
-                     <View style={styles.selectedDoctorCard}>
-                       <View style={styles.doctorAvatar}>
-                         {selectedDoctor.profile_image_url ? (
-                           <Image source={{ uri: selectedDoctor.profile_image_url }} style={styles.doctorAvatarImage} />
-                         ) : (
-                           <Ionicons name="person" size={20} color="#8b5cf6" />
-                         )}
+                 <View style={styles.inputGroup}>
+                   <Text style={styles.inputLabel}>Doctor</Text>
+                   {selectedDoctor ? (
+                     <View style={styles.selectedDoctorInfo}>
+                       <View style={styles.doctorSectionHeader}>
+                         <TouchableOpacity
+                           style={styles.changeDoctorButton}
+                           onPress={() => {
+                             setShowNewMeetingForm(false)
+                             setDoctorModalSource('meeting')
+                             setTimeout(() => {
+                               setShowDoctorSelectionModal(true)
+                             }, 100)
+                           }}
+                         >
+                           <Text style={styles.changeDoctorText}>Change</Text>
+                         </TouchableOpacity>
                        </View>
-                       <View style={styles.doctorDetails}>
-                         <Text style={styles.doctorName}>{selectedDoctor.first_name} {selectedDoctor.last_name}</Text>
-                         <Text style={styles.doctorSpecialty}>{selectedDoctor.specialty} - {selectedDoctor.hospital}</Text>
+                       <View style={styles.selectedDoctorCard}>
+                         <View style={styles.doctorAvatar}>
+                           {selectedDoctor.profile_image_url ? (
+                             <Image source={{ uri: selectedDoctor.profile_image_url }} style={styles.doctorAvatarImage} />
+                           ) : (
+                             <Ionicons name="person" size={20} color="#8b5cf6" />
+                           )}
+                         </View>
+                         <View style={styles.doctorDetails}>
+                           <Text style={styles.doctorName}>{selectedDoctor.first_name} {selectedDoctor.last_name}</Text>
+                           <Text style={styles.doctorSpecialty}>{selectedDoctor.specialty} - {selectedDoctor.hospital}</Text>
+                         </View>
                        </View>
                      </View>
-                   </View>
-                 )}
+                   ) : (
+                     <TouchableOpacity
+                       style={styles.selectionButton}
+                       onPress={() => {
+                         setShowNewMeetingForm(false)
+                         setDoctorModalSource('meeting')
+                         setTimeout(() => {
+                           setShowDoctorSelectionModal(true)
+                         }, 100)
+                       }}
+                     >
+                       <View style={styles.selectionButtonContent}>
+                         <Ionicons name="person-add" size={20} color="#8b5cf6" />
+                         <Text style={styles.placeholderText}>Select a doctor</Text>
+                         <Ionicons name="chevron-forward" size={20} color="#9ca3af" />
+                       </View>
+                     </TouchableOpacity>
+                   )}
+                 </View>
 
                  <View style={styles.inputGroup}>
                    <Text style={styles.inputLabel}>Meeting Title</Text>
@@ -2604,7 +2903,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                <View style={styles.modalActions}>
                  <TouchableOpacity
                    style={styles.cancelButton}
-                   onPress={() => setShowNewMeetingForm(false)}
+                   onPress={() => {
+                     setShowNewMeetingForm(false)
+                     setTimeout(() => {
+                       setShowMeetingSelectionModal(true)
+                     }, 100)
+                   }}
                  >
                    <Text style={styles.cancelButtonText}>Cancel</Text>
                  </TouchableOpacity>
@@ -2639,9 +2943,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                          }
                          setSelectedMeeting(newMeeting)
                          setAvailableMeetings(prev => [newMeeting, ...prev])
+                         
+                         // Notify global state about meeting change
+                         notifyMeetingChange()
                          setShowNewMeetingForm(false)
-                         // Show success message and return to notes form
-                         Alert.alert('Success', 'Meeting created successfully! You can now add your slide notes.')
                          // Reset form
                          setNewMeetingForm({
                            doctor_id: '',
@@ -2651,7 +2956,17 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                            purpose: '',
                            notes: ''
                          })
-                         Alert.alert('Success', 'Meeting created successfully')
+                         // Show success message and return to notes form
+                         Alert.alert('Success', 'Meeting created successfully! You can now add your slide notes.', [
+                           {
+                             text: 'OK',
+                             onPress: () => {
+                               setTimeout(() => {
+                                 setShowNotesModal(true)
+                               }, 100)
+                             }
+                           }
+                         ])
                        } else {
                          Alert.alert('Error', meetingResult.error || 'Failed to create meeting')
                        }
@@ -2796,8 +3111,293 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
             </View>
           </View>
         </Modal>
+
+        {/* Fullscreen Viewer Modal */}
+        <Modal visible={showFullscreenViewer} transparent animationType="fade">
+          <FullscreenSlideViewer 
+            slides={fullscreenSlides}
+            startIndex={fullscreenStartIndex}
+            groupName={selectedGroup ? groups.find(g => g.id === selectedGroup)?.name : 'All Slides'}
+            onClose={() => setShowFullscreenViewer(false)}
+          />
+        </Modal>
       </SafeAreaView>
     </GestureHandlerRootView>
+  )
+}
+
+// Fullscreen Slide Viewer Component
+interface FullscreenSlideViewerProps {
+  slides: BrochureSlide[]
+  startIndex: number
+  groupName?: string
+  onClose: () => void
+}
+
+function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: FullscreenSlideViewerProps) {
+  const [currentSlideIndex, setCurrentSlideIndex] = useState(startIndex)
+  const [showControls, setShowControls] = useState(true)
+  const [showSlideList, setShowSlideList] = useState(false)
+  const [slideDirection, setSlideDirection] = useState<'left' | 'right'>('right')
+  
+  // Manual swipe detection with fallback
+  const [touchStart, setTouchStart] = useState<number | null>(null)
+  const [touchEnd, setTouchEnd] = useState<number | null>(null)
+  const [lastTouchMove, setLastTouchMove] = useState<number | null>(null)
+  
+  // Simple transition animations
+  const slideOpacity = useSharedValue(1)
+  
+  useEffect(() => {
+    // Initialize simple animations
+    slideOpacity.value = 1
+  }, [])
+  
+
+
+  const handlePreviousSlide = () => {
+    if (currentSlideIndex > 0 && slides.length > 0) {
+      setSlideDirection('right')
+      setCurrentSlideIndex(prev => Math.max(0, prev - 1))
+      
+      // Reset touch states
+      setTouchStart(null)
+      setTouchEnd(null)
+      setLastTouchMove(null)
+    }
+  }
+
+  const handleNextSlide = () => {
+    if (currentSlideIndex < slides.length - 1 && slides.length > 0) {
+      setSlideDirection('left')
+      setCurrentSlideIndex(prev => Math.min(slides.length - 1, prev + 1))
+      
+      // Reset touch states
+      setTouchStart(null)
+      setTouchEnd(null)
+      setLastTouchMove(null)
+    }
+  }
+
+  // Remove gesture handlers to prevent conflicts and crashes
+  
+  // Simple animated style for slide transitions
+  const animatedSlideStyle = useAnimatedStyle(() => {
+    return {
+      opacity: slideOpacity.value,
+    }
+  })
+  
+  const currentSlide = slides && slides.length > 0 ? slides[Math.min(currentSlideIndex, slides.length - 1)] : null
+
+
+  // Ensure we have a valid slide
+  if (!slides || slides.length === 0) {
+    return (
+      <View style={styles.fullscreenContainer}>
+        <StatusBar style="light" hidden />
+        <View style={styles.fullscreenNoSlideContainer}>
+          <Ionicons name="document-text" size={64} color="#9ca3af" />
+          <Text style={styles.fullscreenNoSlideText}>No slides available</Text>
+          <TouchableOpacity style={{marginTop: 20, padding: 12, backgroundColor: '#8b5cf6', borderRadius: 8}} onPress={onClose}>
+            <Text style={{color: '#ffffff', fontWeight: '600'}}>Close</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    )
+  }
+
+  if (!currentSlide) {
+    console.error('FullscreenViewer: No current slide!')
+    return (
+      <View style={styles.fullscreenContainer}>
+        <StatusBar style="light" hidden />
+        <View style={styles.fullscreenNoSlideContainer}>
+          <Ionicons name="image-outline" size={64} color="#9ca3af" />
+          <Text style={styles.fullscreenNoSlideText}>Slide not available</Text>
+          <TouchableOpacity style={{marginTop: 20, padding: 12, backgroundColor: '#8b5cf6', borderRadius: 8}} onPress={onClose}>
+            <Text style={{color: '#ffffff', fontWeight: '600'}}>Close</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    )
+  }
+
+  return (
+    <>
+    <View style={styles.fullscreenContainer}>
+      <StatusBar style="light" hidden />
+      
+      {/* Header Overlay - Animated */}
+      {showControls && (
+        <Animated.View entering={FadeIn.duration(300)} exiting={FadeOut.duration(300)} style={styles.fullscreenHeaderOverlay}>
+          <TouchableOpacity style={styles.fullscreenCloseButton} onPress={onClose}>
+            <Ionicons name="close" size={28} color="#ffffff" />
+          </TouchableOpacity>
+          
+          <View style={styles.fullscreenHeaderInfo}>
+            <Text style={styles.fullscreenTitleText}>{groupName || 'Slides'}</Text>
+            <Text style={styles.fullscreenSubtitleText}>Swipe to navigate</Text>
+          </View>
+
+        </Animated.View>
+      )}
+
+      {/* Floating Toggle Button - Always Visible */}
+      <TouchableOpacity 
+        style={styles.fullscreenFloatingToggle} 
+        onPress={() => setShowControls(prev => !prev)}
+      >
+        <Ionicons name={showControls ? "eye-off" : "eye"} size={24} color="#ffffff" />
+      </TouchableOpacity>
+
+      {/* Floating Counter - Always Visible */}
+      <TouchableOpacity 
+        style={styles.fullscreenFloatingCounter} 
+        onPress={() => setShowSlideList(true)}
+      >
+        <Ionicons name="list" size={16} color="#ffffff" style={{ marginRight: 6 }} />
+        <Text style={styles.fullscreenFloatingCounterText}>
+          {currentSlideIndex + 1} / {slides.length}
+        </Text>
+      </TouchableOpacity>
+
+
+      {/* Fullscreen Slide Display with Manual Swipe Detection */}
+      <View 
+        style={styles.fullscreenSlideContainer}
+        onTouchStart={(event) => {
+          const touchX = event.nativeEvent.touches[0]?.pageX
+          setTouchStart(touchX)
+        }}
+        onTouchMove={(event) => {
+          const touchX = event.nativeEvent.touches[0]?.pageX
+          setLastTouchMove(touchX)
+        }}
+        onTouchEnd={(event) => {
+          const touchX = event.nativeEvent.changedTouches[0]?.pageX
+          setTouchEnd(touchX)
+          
+          // Ultra-sensitive swipe detection with fallback
+          const endX = touchX || lastTouchMove
+          if (touchStart !== null && endX !== null) {
+            const swipeDistance = endX - touchStart
+            
+            if (swipeDistance > 10) {
+              handleNextSlide()
+            } else if (swipeDistance < -10) {
+              handlePreviousSlide()
+            }
+          }
+        }}
+      >
+          {currentSlide && slides.length > 0 ? (
+            <>
+              {/* Slide Image - With smooth transitions */}
+              <Animated.Image
+                source={{ uri: currentSlide.imageUri }}
+                style={[styles.fullscreenSlideImage, animatedSlideStyle]}
+                resizeMode="contain"
+                onError={(error) => {
+                  // Handle image load error silently
+                }}
+                onLoad={() => {
+                  // Image loaded successfully
+                }}
+              />
+              
+              {/* Bottom Controls - Animated (only slide title) */}
+              {showControls && currentSlide.title && (
+                <Animated.View entering={FadeIn.duration(300)} exiting={FadeOut.duration(300)} style={styles.fullscreenBottomControls}>
+                  <View style={styles.fullscreenSlideTitleOverlay}>
+                    <Text style={styles.fullscreenSlideTitleText} numberOfLines={2}>{currentSlide.title}</Text>
+                  </View>
+                </Animated.View>
+              )}
+            </>
+          ) : (
+            <View style={styles.fullscreenNoSlideContainer}>
+              <Ionicons name="document-text" size={64} color="#9ca3af" />
+              <Text style={styles.fullscreenNoSlideText}>No slides available</Text>
+            </View>
+          )}
+      </View>
+
+      {/* Navigation hints */}
+      {slides.length > 1 && showControls && (
+        <>
+          {currentSlideIndex > 0 && (
+            <Animated.View entering={FadeIn} exiting={FadeOut} style={styles.fullscreenNavHintLeft}>
+              <Ionicons name="chevron-back" size={32} color="rgba(255, 255, 255, 0.3)" />
+            </Animated.View>
+          )}
+          {currentSlideIndex < slides.length - 1 && (
+            <Animated.View entering={FadeIn} exiting={FadeOut} style={styles.fullscreenNavHintRight}>
+              <Ionicons name="chevron-forward" size={32} color="rgba(255, 255, 255, 0.3)" />
+            </Animated.View>
+          )}
+        </>
+      )}
+
+      {/* Boundary indicators */}
+      {currentSlideIndex === 0 && (
+        <Animated.View style={styles.boundaryIndicator}>
+          <Text style={styles.boundaryText}>First slide</Text>
+        </Animated.View>
+      )}
+      {currentSlideIndex === slides.length - 1 && (
+        <Animated.View style={styles.boundaryIndicator}>
+          <Text style={styles.boundaryText}>Last slide</Text>
+        </Animated.View>
+      )}
+    </View>
+
+    {/* Slide List Modal */}
+    <Modal visible={showSlideList} transparent animationType="slide">
+        <View style={styles.slideListModalOverlay}>
+          <View style={styles.slideListModalContent}>
+            <View style={styles.slideListHeader}>
+              <Text style={styles.slideListTitle}>All Slides ({slides.length})</Text>
+              <TouchableOpacity onPress={() => setShowSlideList(false)}>
+                <Ionicons name="close" size={24} color="#1f2937" />
+              </TouchableOpacity>
+            </View>
+            
+            <FlatList
+              data={slides}
+              keyExtractor={(item, index) => `${item.id}-${index}`}
+              renderItem={({ item, index }) => (
+                <TouchableOpacity
+                  style={[
+                    styles.slideListItem,
+                    currentSlideIndex === index && styles.slideListItemActive
+                  ]}
+                  onPress={() => {
+                    setCurrentSlideIndex(index)
+                    setShowSlideList(false)
+                  }}
+                >
+                  <Image 
+                    source={{ uri: item.imageUri }} 
+                    style={styles.slideListThumbnail}
+                    resizeMode="cover"
+                  />
+                  <View style={styles.slideListItemInfo}>
+                    <Text style={styles.slideListItemTitle} numberOfLines={2}>
+                      {item.title}
+                    </Text>
+                    <Text style={styles.slideListItemOrder}>Slide #{index + 1}</Text>
+                  </View>
+                  {currentSlideIndex === index && (
+                    <Ionicons name="checkmark-circle" size={24} color="#8b5cf6" />
+                  )}
+                </TouchableOpacity>
+              )}
+            />
+          </View>
+        </View>
+      </Modal>
+    </>
   )
 }
 
@@ -3351,6 +3951,9 @@ const styles = StyleSheet.create({
   modalBody: {
     padding: 20,
   },
+  modalBodyContent: {
+    paddingBottom: 20,
+  },
   inputLabel: {
     fontSize: 14,
     fontWeight: '600',
@@ -3515,6 +4118,24 @@ const styles = StyleSheet.create({
   },
   changeButtonText: {
     fontSize: 12,
+    fontWeight: '600',
+    color: '#8b5cf6',
+  },
+  selectDoctorButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    padding: 16,
+    backgroundColor: '#f9fafb',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderStyle: 'dashed',
+    marginTop: 8,
+  },
+  selectDoctorButtonText: {
+    fontSize: 14,
     fontWeight: '600',
     color: '#8b5cf6',
   },
@@ -4106,6 +4727,263 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     color: '#8b5cf6',
+  },
+  fullscreenViewButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(139, 92, 246, 0.9)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    gap: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  fullscreenViewText: {
+    fontSize: 12,
+    color: '#ffffff',
+    fontWeight: '600',
+  },
+  // Fullscreen viewer styles
+  fullscreenContainer: {
+    flex: 1,
+    backgroundColor: '#000000',
+  },
+  fullscreenHeaderOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    paddingTop: 50,
+    zIndex: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  fullscreenCloseButton: {
+    padding: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+    borderRadius: 20,
+  },
+  // Floating Action Buttons for Fullscreen - Always Visible
+  fullscreenFloatingToggle: {
+    position: 'absolute',
+    top: 60,
+    right: 20,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: 'rgba(139, 92, 246, 0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  fullscreenFloatingCounter: {
+    position: 'absolute',
+    bottom: 30,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 24,
+    backgroundColor: 'rgba(139, 92, 246, 0.7)',
+    zIndex: 1000,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  fullscreenFloatingCounterText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  fullscreenHeaderInfo: {
+    flex: 1,
+    marginLeft: 16,
+  },
+  fullscreenTitleText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  fullscreenSubtitleText: {
+    fontSize: 12,
+    color: '#9ca3af',
+    marginTop: 2,
+  },
+  fullscreenSlideContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  debugNavigationButtons: {
+    position: 'absolute',
+    top: 100,
+    right: 20,
+    flexDirection: 'row',
+    gap: 10,
+    zIndex: 1000,
+  },
+  debugButton: {
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
+  },
+  debugButtonDisabled: {
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+  },
+  debugButtonText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  boundaryIndicator: {
+    position: 'absolute',
+    bottom: 100,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  boundaryText: {
+    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: 14,
+    fontWeight: '500',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  fullscreenSlideImage: {
+    width: '100%',
+    height: '100%',
+  },
+  fullscreenBottomControls: {
+    position: 'absolute',
+    bottom: 30,
+    left: 20,
+    right: 100,  // Leave space for floating counter on the right
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    borderRadius: 12,
+  },
+  fullscreenSlideCounterOverlay: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(139, 92, 246, 0.9)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  fullscreenSlideCounterText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  fullscreenSlideTitleOverlay: {
+    flex: 1,
+  },
+  fullscreenSlideTitleText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#ffffff',
+  },
+  fullscreenNoSlideContainer: {
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullscreenNoSlideText: {
+    fontSize: 16,
+    color: '#9ca3af',
+    marginTop: 12,
+  },
+  fullscreenNavHintLeft: {
+    position: 'absolute',
+    left: 20,
+    top: '50%',
+    marginTop: -16,
+  },
+  fullscreenNavHintRight: {
+    position: 'absolute',
+    right: 20,
+    top: '50%',
+    marginTop: -16,
+  },
+  // Slide list modal styles
+  slideListModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    justifyContent: 'flex-end',
+  },
+  slideListModalContent: {
+    backgroundColor: '#ffffff',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    maxHeight: '70%',
+    paddingBottom: 30,
+  },
+  slideListHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  slideListTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1f2937',
+  },
+  slideListItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+  },
+  slideListItemActive: {
+    backgroundColor: '#f0f9ff',
+  },
+  slideListThumbnail: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+    backgroundColor: '#f3f4f6',
+    marginRight: 12,
+  },
+  slideListItemInfo: {
+    flex: 1,
+  },
+  slideListItemTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1f2937',
+    marginBottom: 4,
+  },
+  slideListItemOrder: {
+    fontSize: 12,
+    color: '#8b5cf6',
+    fontWeight: '500',
   },
 })
 
