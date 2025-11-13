@@ -14,11 +14,14 @@ import {
   TextInput,
   ActivityIndicator,
 } from "react-native"
-import { PinchGestureHandler, State } from 'react-native-gesture-handler'
+import { PinchGestureHandler, State, GestureHandlerRootView } from 'react-native-gesture-handler'
+import { Gesture, GestureDetector } from 'react-native-gesture-handler'
+import { runOnJS } from 'react-native-reanimated'
 import { Ionicons } from "@expo/vector-icons"
 import { StatusBar } from "expo-status-bar"
 import * as ScreenOrientation from 'expo-screen-orientation'
 import { PDFConversionService, PresentationData } from "../../services/pdfConversionService"
+import { getModalWidth, getModalMaxHeight, getModalBorderRadius } from "../../utils/responsive"
 
 interface BrochureViewerScreenProps {
   navigation: any
@@ -35,13 +38,16 @@ interface Slide {
 const { width: screenWidth, height: screenHeight } = Dimensions.get('window')
 
 export default function BrochureViewerScreen({ navigation, route }: BrochureViewerScreenProps) {
-  const { brochureId, brochureTitle, brochureFile } = route.params || {}
+  const { brochureId, brochureTitle, brochureFile, groupId } = route.params || {}
   
   const [slides, setSlides] = useState<Slide[]>([])
   const [selectedSlideIndex, setSelectedSlideIndex] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
   const [convertedPresentation, setConvertedPresentation] = useState<PresentationData | null>(null)
-  
+  const [currentOrientation, setCurrentOrientation] = useState<'portrait' | 'landscape'>('landscape')
+  const [dimensions, setDimensions] = useState(Dimensions.get('window'))
+  const [showNotesModal, setShowNotesModal] = useState(false)
+  const [noteText, setNoteText] = useState('')
   
   // Zoom functionality
   const scale = useRef(new Animated.Value(1)).current
@@ -128,7 +134,9 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
         }))
         
         setSlides(convertedSlides)
+        setSelectedSlideIndex(0) // Ensure first slide is selected
         console.log('Loaded slides:', convertedSlides.length)
+        console.log('First slide:', convertedSlides[0])
       } else {
         console.log('No converted presentation found, creating fallback slides')
         createFallbackSlides()
@@ -183,6 +191,7 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
     ]
     
     setSlides(fallbackSlides)
+    setSelectedSlideIndex(0) // Ensure first slide is selected
   }
 
   const handlePreviousSlide = () => {
@@ -201,6 +210,56 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
     setSelectedSlideIndex(index)
     console.log('Selected slide:', slides[index]?.id, 'ImageURI:', slides[index]?.image)
   }
+
+  // Simple tap gesture test
+  const tapGesture = Gesture.Tap()
+    .onStart(() => {
+      console.log('=== TAP GESTURE DETECTED ===')
+    })
+
+  // Swipe gesture handler - with debugging
+  const swipeGesture = Gesture.Pan()
+    .activeOffsetX([-10, 10])
+    .failOffsetY([-20, 20])
+    .onStart(() => {
+      console.log('=== SWIPE GESTURE STARTED ===')
+    })
+    .onUpdate((event) => {
+      console.log('=== SWIPE GESTURE UPDATE ===', {
+        translationX: event.translationX,
+        translationY: event.translationY,
+        velocityX: event.velocityX,
+        velocityY: event.velocityY
+      })
+    })
+    .onEnd((event) => {
+      'worklet'
+      const SWIPE_THRESHOLD = 50
+      
+      console.log('=== SWIPE GESTURE ENDED ===', {
+        translationX: event.translationX,
+        translationY: event.translationY,
+        velocityX: event.velocityX,
+        velocityY: event.velocityY,
+        threshold: SWIPE_THRESHOLD
+      })
+      
+      if (event.translationX < -SWIPE_THRESHOLD) {
+        console.log('✅ SWIPE LEFT DETECTED - Moving to next slide')
+        runOnJS(handleNextSlide)()
+      } else if (event.translationX > SWIPE_THRESHOLD) {
+        console.log('✅ SWIPE RIGHT DETECTED - Moving to previous slide')
+        runOnJS(handlePreviousSlide)()
+      } else {
+        console.log('❌ SWIPE NOT STRONG ENOUGH - No action taken')
+      }
+    })
+
+  // Combine tap and swipe gestures
+  const combinedGesture = Gesture.Simultaneous(tapGesture, swipeGesture)
+  
+  // Debug: Log gesture detector rendering
+  console.log('=== RENDERING GESTURE DETECTOR ===')
 
   // Add keyboard navigation support (for accessibility)
   useEffect(() => {
@@ -244,8 +303,19 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
 
 
   const currentSlide = slides[selectedSlideIndex]
+  
+  // Debug: Log current slide info
+  useEffect(() => {
+    console.log('BrochureViewer: Current state:', {
+      slidesCount: slides.length,
+      selectedIndex: selectedSlideIndex,
+      currentSlide: currentSlide ? { id: currentSlide.id, title: currentSlide.title, hasImage: !!currentSlide.image } : null,
+      isLoading
+    })
+  }, [slides, selectedSlideIndex, currentSlide, isLoading])
 
   return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
     <View style={styles.container}>
       <StatusBar style="light" />
       <SafeAreaView style={styles.safeArea}>
@@ -336,65 +406,109 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
           </ScrollView>
         </View>
 
-        {/* Main Slide Display - Responsive Size */}
-        <View style={[
-          styles.mainSlideContainer,
-          currentOrientation === 'portrait' ? styles.mainSlideContainerPortrait : styles.mainSlideContainerLandscape
-        ]}>
-          {isLoading ? (
-            <View style={styles.loadingContainer}>
-              <Text style={styles.loadingText}>Loading PDF Images...</Text>
-            </View>
-          ) : currentSlide ? (
-            <Image 
-              source={getImageSource(currentSlide.image)} 
-              style={[
-                styles.mainSlideImage,
-                currentOrientation === 'portrait' ? styles.mainSlideImagePortrait : styles.mainSlideImageLandscape
-              ]}
-              resizeMode="contain"
-              onError={(error) => console.log('Image load error:', error)}
-              onLoad={() => console.log('Image loaded successfully for:', currentSlide.image)}
-            />
-          ) : (
-            <View style={styles.noSlideContainer}>
-              <Ionicons name="document-text" size={60} color="#6b7280" />
-              <Text style={styles.noSlideText}>No slides available</Text>
-            </View>
-          )}
-        </View>
-      </View>
+        {/* Main Slide Display - Responsive Size with Swipe Gesture */}
+        <GestureDetector gesture={combinedGesture}>
+          <View style={[
+            styles.mainSlideContainer,
+            currentOrientation === 'portrait' ? styles.mainSlideContainerPortrait : styles.mainSlideContainerLandscape
+          ]}>
+            {isLoading ? (
+              <View style={styles.loadingContainer}>
+                <Text style={styles.loadingText}>Loading PDF Images...</Text>
+              </View>
+            ) : currentSlide ? (
+              <>
+                <Image 
+                  source={getImageSource(currentSlide.image)} 
+                  style={[
+                    styles.mainSlideImage,
+                    currentOrientation === 'portrait' ? styles.mainSlideImagePortrait : styles.mainSlideImageLandscape
+                  ]}
+                  resizeMode="contain"
+                  onError={(error) => console.log('Image load error:', error)}
+                  onLoad={() => console.log('Image loaded successfully for:', currentSlide.image)}
+                />
+                {/* Slide counter overlay */}
+                <View style={styles.slideCounterOverlay}>
+                  <Text style={styles.slideCounterText}>
+                    {selectedSlideIndex + 1} / {slides.length}
+                  </Text>
+                </View>
+                
+                {/* Notes button */}
+                <TouchableOpacity 
+                  style={styles.notesButton}
+                  onPress={() => setShowNotesModal(true)}
+                >
+                  <Ionicons name="create-outline" size={24} color="#ffffff" />
+                  <Text style={styles.notesButtonText}>Notes</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <View style={styles.noSlideContainer}>
+                <Ionicons name="document-text" size={60} color="#6b7280" />
+                <Text style={styles.noSlideText}>No slides available</Text>
+              </View>
+            )}
+          </View>
+        </GestureDetector>
 
-      {/* Bottom Navigation */}
-      <View style={styles.bottomNavigation}>
-        <TouchableOpacity 
-          style={[styles.navButton, selectedSlideIndex === 0 && styles.navButtonDisabled]} 
-          onPress={handlePreviousSlide}
-          disabled={selectedSlideIndex === 0}
+        {/* Notes Modal */}
+        <Modal
+          visible={showNotesModal}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setShowNotesModal(false)}
         >
-          <Ionicons name="chevron-back" size={20} color={selectedSlideIndex === 0 ? "#6b7280" : "#ffffff"} />
-          <Text style={[styles.navButtonText, selectedSlideIndex === 0 && styles.navButtonTextDisabled]}>
-            Previous
-          </Text>
-        </TouchableOpacity>
-
-        <Text style={styles.pageCounter}>
-          {selectedSlideIndex + 1} / {slides.length}
-        </Text>
-
-        <TouchableOpacity 
-          style={[styles.navButton, selectedSlideIndex === slides.length - 1 && styles.navButtonDisabled]} 
-          onPress={handleNextSlide}
-          disabled={selectedSlideIndex === slides.length - 1}
-        >
-          <Text style={[styles.navButtonText, selectedSlideIndex === slides.length - 1 && styles.navButtonTextDisabled]}>
-            Next
-          </Text>
-          <Ionicons name="chevron-forward" size={20} color={selectedSlideIndex === slides.length - 1 ? "#6b7280" : "#ffffff"} />
-        </TouchableOpacity>
+          <View style={styles.modalOverlay}>
+            <View style={styles.notesModalContainer}>
+              <View style={styles.notesModalHeader}>
+                <Text style={styles.notesModalTitle}>Add Notes</Text>
+                <TouchableOpacity onPress={() => setShowNotesModal(false)}>
+                  <Ionicons name="close" size={24} color="#6b7280" />
+                </TouchableOpacity>
+              </View>
+              
+              <Text style={styles.notesModalSubtitle}>
+                Slide {selectedSlideIndex + 1}: {currentSlide?.title || 'Untitled'}
+              </Text>
+              
+              <TextInput
+                style={styles.notesInput}
+                placeholder="Add your notes here..."
+                value={noteText}
+                onChangeText={setNoteText}
+                multiline
+                numberOfLines={6}
+                textAlignVertical="top"
+              />
+              
+              <View style={styles.notesModalActions}>
+                <TouchableOpacity 
+                  style={styles.notesCancelButton}
+                  onPress={() => setShowNotesModal(false)}
+                >
+                  <Text style={styles.notesCancelText}>Cancel</Text>
+                </TouchableOpacity>
+                
+                <TouchableOpacity 
+                  style={styles.notesSaveButton}
+                  onPress={() => {
+                    // Save notes logic here
+                    setShowNotesModal(false)
+                    setNoteText('')
+                  }}
+                >
+                  <Text style={styles.notesSaveText}>Save Notes</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </View>
       </SafeAreaView>
     </View>
+    </GestureHandlerRootView>
   )
 }
 
@@ -625,6 +739,20 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#ffffff",
   },
+  slideCounterOverlay: {
+    position: "absolute",
+    bottom: 20,
+    right: 20,
+    backgroundColor: "rgba(0, 0, 0, 0.7)",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+  },
+  slideCounterText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#ffffff",
+  },
   // Group creation modal styles
   modalOverlay: {
     flex: 1,
@@ -830,13 +958,79 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#ffffff",
   },
-  loadingContainer: {
-    alignItems: "center",
-    padding: 24,
+  // Notes functionality styles
+  notesButton: {
+    position: 'absolute',
+    top: 20,
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    gap: 6,
   },
-  loadingText: {
+  notesButtonText: {
+    color: '#ffffff',
     fontSize: 14,
-    color: "#6b7280",
-    marginTop: 8,
+    fontWeight: '600',
+  },
+  notesModalContainer: {
+    backgroundColor: '#ffffff',
+    borderRadius: getModalBorderRadius(),
+    width: getModalWidth(90),
+    maxHeight: getModalMaxHeight(80),
+  },
+  notesModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  notesModalTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#1f2937',
+  },
+  notesModalSubtitle: {
+    fontSize: 14,
+    color: '#6b7280',
+    paddingHorizontal: 20,
+    paddingBottom: 16,
+  },
+  notesModalActions: {
+    flexDirection: 'row',
+    padding: 20,
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+    gap: 12,
+  },
+  notesCancelButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    alignItems: 'center',
+  },
+  notesCancelText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  notesSaveButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    backgroundColor: '#8b5cf6',
+    alignItems: 'center',
+  },
+  notesSaveText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#ffffff',
   },
 })

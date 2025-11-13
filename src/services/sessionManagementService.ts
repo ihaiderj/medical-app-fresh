@@ -5,6 +5,7 @@
 import { supabase } from './supabase'
 import { AuthService } from './AuthService'
 import AsyncStorage from '@react-native-async-storage/async-storage'
+import { LocalDatabaseService } from './localDatabaseService'
 
 export interface ActiveSession {
   userId: string
@@ -165,9 +166,21 @@ export class SessionManagementService {
     }
   }
 
-  /**
-   * Register session with conflict detection
-   */
+  static async recordLocalSession(userId: string, isActive: boolean = true) {
+    await this.initialize();
+    const now = new Date().toISOString();
+    await LocalDatabaseService.upsertSession({
+      id: `${userId}_${this.currentDeviceId}`,
+      user_id: userId,
+      device_id: this.currentDeviceId,
+      is_active: isActive,
+      last_seen_at: now,
+      created_at: now,
+      updated_at: now,
+      sync_status: 'pending',
+    });
+  }
+
   static async registerSessionWithConflictCheck(userId: string): Promise<{
     success: boolean
     hasConflict: boolean
@@ -176,9 +189,8 @@ export class SessionManagementService {
   }> {
     try {
       await this.initialize()
-      
       const deviceInfo = await this.getDeviceInfo()
-      
+
       const { data, error } = await supabase.rpc('register_user_session', {
         p_user_id: userId,
         p_device_id: this.currentDeviceId,
@@ -187,12 +199,26 @@ export class SessionManagementService {
 
       if (error) {
         console.error('SessionManager: Registration error:', error)
+        await this.recordLocalSession(userId)
         return { success: false, error: error.message, hasConflict: false }
       }
 
       if (!data.success) {
+        await this.recordLocalSession(userId)
         return { success: false, error: data.error, hasConflict: false }
       }
+
+      await LocalDatabaseService.upsertSession({
+        id: data.session_id || `${userId}_${this.currentDeviceId}`,
+        user_id: userId,
+        device_id: this.currentDeviceId,
+        is_active: true,
+        last_seen_at: new Date().toISOString(),
+        created_at: data.created_at || new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        sync_status: 'synced',
+        local_changes: null,
+      })
 
       return {
         success: true,
@@ -201,6 +227,7 @@ export class SessionManagementService {
       }
     } catch (error) {
       console.error('SessionManager: Session registration error:', error)
+      await this.recordLocalSession(userId)
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Session registration failed',

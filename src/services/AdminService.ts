@@ -265,40 +265,6 @@ export class AdminService {
   }
 
   /**
-   * Create new brochure
-   */
-  static async createBrochure(
-    title: string,
-    category: string,
-    fileUrl: string,
-    description?: string,
-    thumbnailUrl?: string,
-    pages?: number,
-    fileSize?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('create_brochure', {
-        p_title: title,
-        p_category: category,
-        p_description: description,
-        p_file_url: fileUrl,
-        p_thumbnail_url: thumbnailUrl,
-        p_pages: pages,
-        p_file_size: fileSize,
-        p_assigned_by: null, // Will be set by the function
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to create brochure' }
-    }
-  }
-
-  /**
    * Get all doctors
    */
   static async getAllDoctors(): Promise<{ success: boolean; data?: DoctorData[]; error?: string }> {

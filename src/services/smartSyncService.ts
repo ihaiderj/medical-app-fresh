@@ -10,6 +10,7 @@ import { AuthService } from './AuthService'
 import { BrochureManagementService, BrochureData } from './brochureManagementService'
 import { savedBrochuresSyncService } from './savedBrochuresSyncService'
 import { MRService } from './MRService'
+import { appEvents, DATA_CHANGED_EVENT } from "./eventService";
 
 export interface SyncOperation {
   id: string
@@ -81,8 +82,8 @@ export class SmartSyncService {
         result.data.needsSync = true
         result.data.localLastModified = new Date().toISOString()
         
-        // Save updated metadata
-        const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+        // Save updated metadata using cross-platform path
+        const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
         await FileSystem.writeAsStringAsync(
           `${brochureDir}brochure_data.json`,
           JSON.stringify(result.data, null, 2)
@@ -175,6 +176,7 @@ export class SmartSyncService {
       await this.syncMeetingsData(userResult.user.id)
       
       console.log('SmartSync: Initial sync completed')
+      appEvents.emit(DATA_CHANGED_EVENT, { source: 'initialSync' });
     } catch (error) {
       console.warn('SmartSync: Initial sync error:', error)
     }
@@ -185,14 +187,18 @@ export class SmartSyncService {
    */
   private static async performIdleSync() {
     if (!this.isOnline || this.isSyncing) {
+      console.log('🔵 BROCHURE_SYNC: Skipping idle sync - offline or already syncing')
       return
     }
 
     try {
-      console.log('SmartSync: Starting idle sync')
+      console.log('🔵 BROCHURE_SYNC: Starting idle sync (automatic)')
+      console.log('🔵 BROCHURE_SYNC: Idle sync triggered after user inactivity')
       await this.syncModifiedBrochures()
+      console.log('🔵 BROCHURE_SYNC: Idle sync completed')
+      appEvents.emit(DATA_CHANGED_EVENT, { source: 'idleSync' });
     } catch (error) {
-      console.warn('SmartSync: Idle sync error:', error)
+      console.error('🔵 BROCHURE_SYNC: Idle sync error:', error)
     }
   }
 
@@ -201,15 +207,17 @@ export class SmartSyncService {
    */
   private static async performExitSync() {
     if (!this.isOnline) {
-      console.log('SmartSync: Offline - queuing exit sync for later')
+      console.log('🔵 BROCHURE_SYNC: Skipping exit sync - offline, will sync when online')
       return
     }
 
     try {
-      console.log('SmartSync: Starting exit sync')
+      console.log('🔵 BROCHURE_SYNC: Starting exit sync (automatic)')
+      console.log('🔵 BROCHURE_SYNC: Exit sync triggered when leaving view mode')
       await this.syncModifiedBrochures()
+      console.log('🔵 BROCHURE_SYNC: Exit sync completed')
     } catch (error) {
-      console.warn('SmartSync: Exit sync error:', error)
+      console.error('🔵 BROCHURE_SYNC: Exit sync error:', error)
     }
   }
 
@@ -239,7 +247,7 @@ export class SmartSyncService {
   private static async syncModifiedBrochures() {
     try {
       if (!this.isOnline || this.isSyncing) {
-        console.log('SmartSync: Skipping sync (offline or already syncing)')
+        console.log('🔵 BROCHURE_SYNC: Skipping sync (offline or already syncing)')
         return
       }
 
@@ -248,32 +256,38 @@ export class SmartSyncService {
 
       const userResult = await AuthService.getCurrentUser()
       if (!userResult.success || !userResult.user) {
+        console.log('🔵 BROCHURE_SYNC: Skipping sync - no authenticated user')
         return
       }
 
+      console.log('🔵 BROCHURE_SYNC: Checking for modified brochures')
       // Get all modified brochures
       const modifiedResult = await BrochureManagementService.getModifiedBrochures()
       if (!modifiedResult.success || !modifiedResult.data) {
+        console.log('🔵 BROCHURE_SYNC: No modified brochures found or error getting list')
         return
       }
 
-      console.log(`SmartSync: Found ${modifiedResult.data.length} modified brochures`)
+      console.log(`🔵 BROCHURE_SYNC: Found ${modifiedResult.data.length} modified brochure(s) to sync`)
+      console.log('🔵 BROCHURE_SYNC: Modified brochure IDs:', modifiedResult.data)
 
       // Upload changes for each modified brochure
       for (const brochureId of modifiedResult.data) {
         try {
-          console.log('SmartSync: Uploading changes for brochure:', brochureId)
+          console.log('🔵 BROCHURE_SYNC: Processing brochure:', brochureId)
           
           const brochureResult = await BrochureManagementService.getBrochureData(brochureId)
           if (!brochureResult.success || !brochureResult.data) {
+            console.warn('🔵 BROCHURE_SYNC: Skipping brochure - failed to load data:', brochureId)
             continue
           }
 
-          console.log('SmartSync: About to upload brochure data:')
-          console.log('SmartSync: Local slides count:', brochureResult.data.slides.length)
-          console.log('SmartSync: Local groups count:', brochureResult.data.groups.length)
-          console.log('SmartSync: Local slide titles:', brochureResult.data.slides.slice(0, 5).map(s => s.title))
-          console.log('SmartSync: Local group names:', brochureResult.data.groups.map(g => g.name))
+          console.log('🔵 BROCHURE_SYNC: Brochure data loaded for sync:')
+          console.log('🔵 BROCHURE_SYNC: - Title:', brochureResult.data.title)
+          console.log('🔵 BROCHURE_SYNC: - Slides count:', brochureResult.data.slides.length)
+          console.log('🔵 BROCHURE_SYNC: - Groups count:', brochureResult.data.groups.length)
+          console.log('🔵 BROCHURE_SYNC: - needsSync:', brochureResult.data.needsSync)
+          console.log('🔵 BROCHURE_SYNC: - isModified:', brochureResult.data.isModified)
 
           // Upload to server
           const uploadResult = await BrochureManagementService.syncBrochureToServer(
@@ -286,19 +300,25 @@ export class SmartSyncService {
 
           if (uploadResult.success) {
             // Mark as synced
-            await BrochureManagementService.markBrochureAsSynced(brochureId)
-            console.log('SmartSync: Successfully uploaded changes for:', brochureResult.data.title)
+            console.log('🔵 BROCHURE_SYNC: Upload successful, marking brochure as synced')
+            const markResult = await BrochureManagementService.markBrochureAsSynced(brochureId)
+            if (markResult.success) {
+              console.log('🔵 BROCHURE_SYNC: Successfully synced brochure:', brochureResult.data.title)
+            } else {
+              console.error('🔵 BROCHURE_SYNC: Failed to mark brochure as synced:', markResult.error)
+            }
           } else {
-            console.warn('SmartSync: Failed to upload changes for:', brochureResult.data.title, uploadResult.error)
+            console.error('🔵 BROCHURE_SYNC: Failed to upload changes for:', brochureResult.data.title)
+            console.error('🔵 BROCHURE_SYNC: Upload error:', uploadResult.error)
           }
         } catch (error) {
-          console.warn('SmartSync: Error uploading brochure:', brochureId, error)
+          console.error('🔵 BROCHURE_SYNC: Error uploading brochure:', brochureId, error)
         }
       }
 
-      console.log('SmartSync: Modified brochures sync completed')
+      console.log('🔵 BROCHURE_SYNC: Modified brochures sync process completed')
     } catch (error) {
-      console.warn('SmartSync: Sync modified brochures error:', error)
+      console.error('🔵 BROCHURE_SYNC: Sync modified brochures error:', error)
     } finally {
       this.isSyncing = false
       this.notifyStatusListeners()
@@ -485,8 +505,10 @@ export class SmartSyncService {
    * Manual sync trigger
    */
   static async forceSyncNow() {
-    console.log('SmartSync: Manual sync requested')
+    console.log('🔵 BROCHURE_SYNC: Manual sync requested by user')
+    console.log('🔵 BROCHURE_SYNC: Force sync triggered via UI button')
     await this.syncModifiedBrochures()
+    console.log('🔵 BROCHURE_SYNC: Manual sync completed')
   }
 
   /**

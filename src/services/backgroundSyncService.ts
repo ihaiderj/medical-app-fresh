@@ -2,11 +2,14 @@
  * Background Sync Service
  * Handles automatic synchronization of all user data across devices
  */
-import { AppState, AppStateStatus } from 'react-native'
-import AsyncStorage from '@react-native-async-storage/async-storage'
+import { UnifiedSyncService } from './unifiedSyncService'
+import { AdvancedSyncService } from './advancedSyncService'
+import { LocalDatabaseService } from './localDatabaseService'
+import { NetworkService } from './networkService'
 import { AuthService } from './AuthService'
 import { savedBrochuresSyncService } from './savedBrochuresSyncService'
 import { BrochureManagementService } from './brochureManagementService'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 
 interface SyncConfig {
   intervalMinutes: number
@@ -100,10 +103,14 @@ export class BackgroundSyncService {
    */
   static async performFullSync() {
     try {
-      // Prevent concurrent syncs and debounce
       const now = Date.now()
-      if (this.isSyncing || (now - this.lastSyncTime < 30000)) { // 30 second minimum between syncs
+      if (this.isSyncing || (now - this.lastSyncTime < 30000)) {
         console.log('BackgroundSync: Skipping sync (already syncing or too recent)')
+        return
+      }
+
+      if (!(await NetworkService.isOnline())) {
+        console.log('BackgroundSync: Skipping sync (offline)')
         return
       }
 
@@ -112,17 +119,23 @@ export class BackgroundSyncService {
 
       const userResult = await AuthService.getCurrentUser()
       if (!userResult.success || !userResult.user) {
-        return // No user logged in
+        return
       }
 
-      const userId = userResult.user.id
-      console.log('BackgroundSync: Starting full sync for user:', userId)
+      console.log('BackgroundSync: Starting full sync for user:', userResult.user.id)
 
-      // Sync saved brochures
-      await this.syncSavedBrochures(userId)
-      
-      // Sync brochure changes for all saved brochures
-      await this.syncAllBrochureChanges(userId)
+      const pendingOps = await LocalDatabaseService.getPendingSyncOperations()
+      if (pendingOps.length > 0) {
+        console.log(`BackgroundSync: Uploading ${pendingOps.length} pending operations`)
+      }
+
+      const result = await AdvancedSyncService.performIncrementalSync()
+      if (!result.success) {
+        console.warn('BackgroundSync: Incremental sync reported errors:', result.errors)
+      }
+
+      await UnifiedSyncService.getSyncStatus()
+      await this.syncBrochureCaches(userResult.user.id)
 
       console.log('BackgroundSync: Full sync completed')
     } catch (error) {
@@ -260,6 +273,11 @@ export class BackgroundSyncService {
     } catch (error) {
       console.warn('BackgroundSync: Brochure changes sync error:', error)
     }
+  }
+
+  private static async syncBrochureCaches(userId: string) {
+    await this.syncSavedBrochures(userId)
+    await this.syncAllBrochureChanges(userId)
   }
 
   /**

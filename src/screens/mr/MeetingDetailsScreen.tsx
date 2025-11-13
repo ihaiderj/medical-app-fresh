@@ -15,6 +15,9 @@ import {
 import { Ionicons } from '@expo/vector-icons'
 import { useNavigation, useRoute } from '@react-navigation/native'
 import { MRService } from '../../services/MRService'
+import { OfflineFirstService } from '../../services/offlineFirstService'
+import { LocalDatabaseService } from '../../services/localDatabaseService'
+import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius, isTablet } from '../../utils/responsive'
 
 interface MeetingDetails {
   meeting_id: string
@@ -72,14 +75,68 @@ const MeetingDetailsScreen = () => {
       console.log('=== LOADING MEETING DETAILS ===')
       console.log('Meeting ID:', meetingId)
       
+      // Try to load from local database first (for offline-first meetings)
+      try {
+        const localMeeting = await LocalDatabaseService.getMeetingById(meetingId)
+        
+        if (localMeeting) {
+          console.log('MeetingDetailsScreen: Loading local meeting')
+          
+          // Load doctor details
+          const doctor = await LocalDatabaseService.getDoctorById(localMeeting.doctor_id)
+          
+          // Load meeting notes
+          const notes = await LocalDatabaseService.getMeetingNotes(meetingId)
+          
+          // Format to match MeetingDetails interface
+          const formattedDetails: MeetingDetails = {
+            meeting_id: localMeeting.id,
+            title: localMeeting.title,
+            doctor_name: doctor ? `${doctor.first_name} ${doctor.last_name}` : 'Unknown Doctor',
+            doctor_specialty: doctor?.specialty || 'N/A',
+            hospital: doctor?.hospital || 'N/A',
+            scheduled_date: localMeeting.scheduled_date,
+            duration_minutes: localMeeting.duration_minutes,
+            status: localMeeting.status,
+            purpose: localMeeting.purpose || '',
+            brochure_info: {
+              brochure_id: '',
+              brochure_title: ''
+            },
+            created_at: localMeeting.created_at,
+            updated_at: localMeeting.updated_at,
+          }
+          
+          const formattedNotes: SlideNote[] = notes.map(note => ({
+            note_id: note.id,
+            slide_id: note.slide_id || '',
+            slide_title: note.slide_title || '',
+            slide_order: note.slide_order,
+            note_text: note.note_text,
+            slide_image_uri: note.slide_image_uri,
+            created_at: note.created_at,
+            updated_at: note.updated_at || note.created_at
+          }))
+          
+          console.log('Meeting data (local):', formattedDetails)
+          console.log('Slide notes count (local):', formattedNotes.length)
+          
+          setMeetingDetails(formattedDetails)
+          setSlideNotes(formattedNotes)
+          return
+        }
+      } catch (localError) {
+        console.log('MeetingDetailsScreen: Not a local meeting, trying server...', localError)
+      }
+      
+      // Fallback to server (for synced meetings)
       const result = await MRService.getMeetingDetails(meetingId)
       
-      console.log('Meeting details result:', result)
+      console.log('Meeting details result (server):', result)
       
       if (result.success && result.data) {
-        console.log('Meeting data:', result.data.meeting)
-        console.log('Slide notes count:', result.data.slide_notes?.length || 0)
-        console.log('Slide notes:', result.data.slide_notes)
+        console.log('Meeting data (server):', result.data.meeting)
+        console.log('Slide notes count (server):', result.data.slide_notes?.length || 0)
         
         setMeetingDetails(result.data.meeting)
         setSlideNotes(result.data.slide_notes || [])
@@ -114,16 +171,41 @@ const MeetingDetailsScreen = () => {
   const handleDeleteNote = (slideNote: SlideNote) => {
     Alert.alert(
       'Delete Note',
-      'Are you sure you want to delete this slide note?',
+      `Are you sure you want to delete the note for "${slideNote.slide_title}"?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Delete',
           style: 'destructive',
           onPress: async () => {
-            // TODO: Implement delete note API call
-            Alert.alert('Success', 'Note deleted successfully')
-            loadMeetingDetails()
+            try {
+              console.log('MeetingDetailsScreen: Attempting to delete note from local DB first')
+              console.log('MeetingDetailsScreen: Note ID:', slideNote.note_id)
+
+              // Try to delete as local note first
+              try {
+                await LocalDatabaseService.deleteMeetingNote(slideNote.note_id)
+                console.log('MeetingDetailsScreen: Note deleted successfully from local DB')
+                Alert.alert('Success', 'Note deleted successfully')
+                loadMeetingDetails()
+                return
+              } catch (localError) {
+                console.log('MeetingDetailsScreen: Note not found in local DB, falling back to server')
+              }
+              
+              // Fallback to server note deletion
+              const result = await MRService.deleteSlideNote(slideNote.note_id)
+              
+              if (result.success) {
+                Alert.alert('Success', 'Note deleted successfully')
+                loadMeetingDetails()
+              } else {
+                Alert.alert('Error', result.error || 'Failed to delete note')
+              }
+            } catch (error) {
+              console.error('MeetingDetailsScreen: Error deleting note:', error)
+              Alert.alert('Error', 'Failed to delete note')
+            }
           }
         }
       ]
@@ -131,18 +213,90 @@ const MeetingDetailsScreen = () => {
   }
 
   const handleSaveEditNote = async () => {
-    // TODO: Implement update note API call
-    Alert.alert('Success', 'Note updated successfully')
-    setShowEditNoteModal(false)
-    loadMeetingDetails()
+    try {
+      if (!editingNote || !newNoteText.trim()) {
+        Alert.alert('Error', 'Please enter a note')
+        return
+      }
+
+      console.log('MeetingDetailsScreen: Attempting to update note in local DB first')
+      console.log('MeetingDetailsScreen: Note ID:', editingNote.note_id)
+
+      // Try to update as local note first
+      try {
+        await LocalDatabaseService.updateMeetingNote(editingNote.note_id, {
+          note_text: newNoteText.trim()
+        })
+        console.log('MeetingDetailsScreen: Note updated successfully in local DB')
+        Alert.alert('Success', 'Note updated successfully')
+        setShowEditNoteModal(false)
+        setNewNoteText('')
+        setEditingNote(null)
+        loadMeetingDetails()
+        return
+      } catch (localError) {
+        console.log('MeetingDetailsScreen: Note not found in local DB, falling back to server')
+      }
+
+      // Fallback to server note update
+      const result = await MRService.updateSlideNote(editingNote.note_id, newNoteText.trim())
+      
+      if (result.success) {
+        Alert.alert('Success', 'Note updated successfully')
+        setShowEditNoteModal(false)
+        setNewNoteText('')
+        setEditingNote(null)
+        loadMeetingDetails()
+      } else {
+        Alert.alert('Error', result.error || 'Failed to update note')
+      }
+    } catch (error) {
+      console.error('MeetingDetailsScreen: Error updating note:', error)
+      Alert.alert('Error', 'Failed to update note')
+    }
   }
 
   const handleAddNote = async () => {
-    // TODO: Implement add note API call
-    Alert.alert('Success', 'Note added successfully')
-    setShowAddNoteModal(false)
-    setNewNoteText('')
-    loadMeetingDetails()
+    try {
+      if (!newNoteText.trim()) {
+        Alert.alert('Error', 'Please enter a note')
+        return
+      }
+
+      console.log('MeetingDetailsScreen: Attempting to add general meeting note (offline-first)')
+      console.log('MeetingDetailsScreen: Meeting ID:', meetingId)
+
+      // Get meeting to check if it has server_id
+      const localMeeting = await LocalDatabaseService.getMeetingById(meetingId)
+      const meetingServerId = localMeeting?.server_id
+
+      // Add a generic meeting note (not tied to a specific slide) using offline-first approach
+      // We'll use slide_order 0 to indicate it's a general meeting note
+      const result = await OfflineFirstService.createMeetingNote({
+        meeting_id: meetingId,
+        meeting_server_id: meetingServerId,
+        slide_id: `meeting_note_${Date.now()}`, // Generate unique ID for general note
+        slide_title: 'General Meeting Note',
+        slide_order: 0, // 0 indicates general note, not slide-specific
+        brochure_id: meetingDetails?.brochure_info?.brochure_id || '',
+        note_text: newNoteText.trim(),
+        slide_image_uri: undefined
+      })
+      
+      if (result.success) {
+        console.log('MeetingDetailsScreen: Note added successfully to local DB')
+        Alert.alert('Success', 'Note added successfully')
+        setShowAddNoteModal(false)
+        setNewNoteText('')
+        loadMeetingDetails()
+      } else {
+        console.error('MeetingDetailsScreen: Failed to add note:', result.error)
+        Alert.alert('Error', result.error || 'Failed to add note')
+      }
+    } catch (error) {
+      console.error('MeetingDetailsScreen: Error adding note:', error)
+      Alert.alert('Error', 'Failed to add note')
+    }
   }
 
   const formatDate = (dateString: string) => {
@@ -190,7 +344,12 @@ const MeetingDetailsScreen = () => {
           <Ionicons name="arrow-back" size={24} color="#374151" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Meeting Details</Text>
-        <View style={styles.placeholder} />
+        <TouchableOpacity
+          style={styles.headerAddButton}
+          onPress={() => setShowAddNoteModal(true)}
+        >
+          <Ionicons name="add" size={24} color="#8b5cf6" />
+        </TouchableOpacity>
       </View>
 
       <ScrollView style={styles.scrollContainer}>
@@ -245,17 +404,8 @@ const MeetingDetailsScreen = () => {
         {/* Slide Notes */}
         <View style={styles.card}>
           <View style={styles.cardHeader}>
-            <View style={styles.cardHeaderLeft}>
-              <Ionicons name="document-text" size={24} color="#8b5cf6" />
-              <Text style={styles.cardTitle}>Slide Notes ({slideNotes.length})</Text>
-            </View>
-            <TouchableOpacity
-              style={styles.addNoteButton}
-              onPress={() => setShowAddNoteModal(true)}
-            >
-              <Ionicons name="add" size={20} color="#ffffff" />
-              <Text style={styles.addNoteButtonText}>Add Note</Text>
-            </TouchableOpacity>
+            <Ionicons name="document-text" size={24} color="#8b5cf6" />
+            <Text style={styles.cardTitle}>Slide Notes ({slideNotes.length})</Text>
           </View>
           
           {slideNotes.length > 0 ? (
@@ -322,7 +472,7 @@ const MeetingDetailsScreen = () => {
               <Ionicons name="document-outline" size={48} color="#9ca3af" />
               <Text style={styles.emptyStateText}>No slide notes found</Text>
               <Text style={styles.emptyStateSubtext}>
-                Click "Add Note" to add notes to this meeting
+                Click &quot;Add Note&quot; to add notes to this meeting
               </Text>
             </View>
           )}
@@ -468,7 +618,7 @@ const MeetingDetailsScreen = () => {
         </View>
       </Modal>
 
-      {/* Add Note Modal */}
+      {/* Add Notes Modal */}
       <Modal
         visible={showAddNoteModal}
         transparent
@@ -478,7 +628,7 @@ const MeetingDetailsScreen = () => {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Add Slide Note</Text>
+              <Text style={styles.modalTitle}>Add Notes</Text>
               <TouchableOpacity onPress={() => setShowAddNoteModal(false)}>
                 <Ionicons name="close" size={24} color="#6b7280" />
               </TouchableOpacity>
@@ -486,20 +636,10 @@ const MeetingDetailsScreen = () => {
             
             <View style={styles.modalBody}>
               <View style={styles.inputGroup}>
-                <Text style={styles.inputLabel}>Slide Number:</Text>
-                <TextInput
-                  style={styles.textInput}
-                  placeholder="Enter slide number"
-                  placeholderTextColor="#9ca3af"
-                  keyboardType="numeric"
-                />
-              </View>
-              
-              <View style={styles.inputGroup}>
                 <Text style={styles.inputLabel}>Note:</Text>
                 <TextInput
                   style={[styles.textInput, styles.textArea]}
-                  placeholder="Enter your note..."
+                  placeholder="Enter your meeting notes..."
                   placeholderTextColor="#9ca3af"
                   value={newNoteText}
                   onChangeText={setNewNoteText}
@@ -591,6 +731,9 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '600',
     color: '#374151',
+  },
+  headerAddButton: {
+    padding: 8,
   },
   placeholder: {
     width: 40,
@@ -690,16 +833,16 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: '#ffffff',
-    borderRadius: 12,
-    width: '90%',
-    maxHeight: '80%',
+    borderRadius: getModalBorderRadius(),
+    width: getModalWidth(90),
+    maxHeight: getModalMaxHeight(80),
     padding: 0,
   },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    padding: 16,
+    padding: getModalPadding(),
     borderBottomWidth: 1,
     borderBottomColor: '#e5e7eb',
   },
@@ -709,7 +852,7 @@ const styles = StyleSheet.create({
     color: '#374151',
   },
   modalBody: {
-    padding: 16,
+    padding: getModalPadding(),
   },
   slideDetailInfo: {
     marginBottom: 16,
@@ -822,20 +965,20 @@ const styles = StyleSheet.create({
   },
   closeFullImageButton: {
     position: 'absolute',
-    top: 50,
-    right: 20,
+    top: isTablet() ? 40 : 50,
+    right: isTablet() ? 24 : 20,
     zIndex: 10,
   },
   fullImageContainer: {
-    width: '90%',
-    maxHeight: '80%',
+    width: getModalWidth(90),
+    maxHeight: getModalMaxHeight(80),
   },
   fullSlideImage: {
     width: '100%',
-    height: 400,
+    height: isTablet() ? 600 : 400, // Larger height on tablets
     backgroundColor: '#ffffff',
-    borderRadius: 12,
-    marginBottom: 20,
+    borderRadius: getModalBorderRadius(),
+    marginBottom: isTablet() ? 24 : 20,
   },
   fullImagePlaceholder: {
     backgroundColor: '#ffffff',

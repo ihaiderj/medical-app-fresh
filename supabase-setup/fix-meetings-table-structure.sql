@@ -501,6 +501,81 @@ EXCEPTION
 END;
 $$;
 
+-- Function to update slide note
+CREATE OR REPLACE FUNCTION update_slide_note(
+    p_note_id UUID,
+    p_note_text TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Check if note exists
+    IF NOT EXISTS (SELECT 1 FROM meeting_slide_notes WHERE id = p_note_id) THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Note not found'
+        );
+    END IF;
+
+    -- Update the note
+    UPDATE meeting_slide_notes 
+    SET 
+        note_text = p_note_text,
+        updated_at = NOW()
+    WHERE id = p_note_id;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'message', 'Note updated successfully'
+    );
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', SQLERRM
+        );
+END;
+$$;
+
+-- Function to delete slide note
+CREATE OR REPLACE FUNCTION delete_slide_note(
+    p_note_id UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Check if note exists
+    IF NOT EXISTS (SELECT 1 FROM meeting_slide_notes WHERE id = p_note_id) THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Note not found'
+        );
+    END IF;
+
+    -- Delete the note
+    DELETE FROM meeting_slide_notes WHERE id = p_note_id;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'message', 'Note deleted successfully'
+    );
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', SQLERRM
+        );
+END;
+$$;
+
 -- Grant table permissions
 GRANT SELECT, INSERT, UPDATE, DELETE ON meeting_slide_notes TO authenticated;
 GRANT EXECUTE ON FUNCTION update_meeting_followup(UUID, TIMESTAMP WITH TIME ZONE, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION update_slide_note(UUID, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION delete_slide_note(UUID) TO authenticated;

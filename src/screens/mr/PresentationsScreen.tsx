@@ -15,6 +15,7 @@ import { Ionicons } from "@expo/vector-icons"
 import { PDFConversionService, PresentationData } from "../../services/pdfConversionService"
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRPresentation } from "../../services/MRService"
+import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius } from "../../utils/responsive"
 
 interface PresentationsScreenProps {
   navigation: any
@@ -39,7 +40,7 @@ export default function PresentationsScreen({ navigation }: PresentationsScreenP
     try {
       // Get current user
       const userResult = await AuthService.getCurrentUser()
-      if (userResult.success) {
+      if (userResult.success && userResult.user) {
         // Get presentations for this MR
         const presentationsResult = await MRService.getPresentations(userResult.user.id)
         if (presentationsResult.success && presentationsResult.data) {
@@ -83,16 +84,16 @@ export default function PresentationsScreen({ navigation }: PresentationsScreenP
     
     // Convert real presentations from database
     const realPresentations = presentations.map(presentation => ({
-      id: presentation.id,
-      title: presentation.brochure_title || 'Untitled Presentation',
-      description: `Presentation with ${presentation.slides_used || 0} slides`,
-      slides: presentation.slides_used || 0,
+      id: presentation.presentation_id,
+      title: presentation.title || 'Untitled Presentation',
+      description: `Presentation with ${presentation.total_slides || 0} slides`,
+      slides: presentation.total_slides || 0,
       lastModified: formatDate(presentation.created_at),
-      status: presentation.status || 'ready',
-      category: presentation.brochure_category || 'General',
+      status: 'ready',
+      category: presentation.category || 'General',
       isConverted: false,
-      meetingId: presentation.meeting_id,
-      doctorName: presentation.doctor_name,
+      meetingId: undefined,
+      doctorName: undefined,
     }))
     
     return [...convertedDisplayPresentations, ...realPresentations]
@@ -227,7 +228,7 @@ export default function PresentationsScreen({ navigation }: PresentationsScreenP
             <Ionicons name="document-outline" size={64} color="#d1d5db" />
             <Text style={styles.emptyTitle}>No Presentations Found</Text>
             <Text style={styles.emptyMessage}>
-              You don't have any presentations yet. Create one by converting brochures or start a new presentation.
+              You don&apos;t have any presentations yet. Create one by converting brochures or start a new presentation.
             </Text>
             <TouchableOpacity 
               style={styles.emptyActionButton} 
@@ -510,9 +511,10 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: "#ffffff",
-    borderRadius: 16,
-    padding: 20,
-    maxHeight: "80%",
+    borderRadius: getModalBorderRadius(),
+    padding: getModalPadding(),
+    width: getModalWidth(90),
+    maxHeight: getModalMaxHeight(80),
   },
   modalHeader: {
     flexDirection: "row",

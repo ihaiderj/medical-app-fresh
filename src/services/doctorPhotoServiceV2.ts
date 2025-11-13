@@ -28,7 +28,7 @@ export class DoctorPhotoServiceV2 {
     onProgress?: (progress: PhotoUploadProgress) => void
   ): Promise<PhotoUploadResult> {
     try {
-      console.log('Starting server-side doctor photo upload:', fileName)
+      console.log('Starting doctor photo upload (offline-first):', fileName)
 
       // Read file info and validate
       const fileInfo = await FileSystem.getInfoAsync(localFilePath)
@@ -41,16 +41,30 @@ export class DoctorPhotoServiceV2 {
         return { success: false, error: 'Photo size must be less than 5MB' }
       }
 
-      console.log('Reading photo for upload, size:', fileInfo.size, `(${fileSizeMB.toFixed(1)}MB)`)
+      console.log('Reading photo for local storage, size:', fileInfo.size, `(${fileSizeMB.toFixed(1)}MB)`)
 
       // Simulate progress for UI feedback
       if (onProgress) {
         onProgress({ loaded: 0, total: fileInfo.size || 0, percentage: 0 })
       }
 
-      // Read file as base64
-      const photoData = await FileSystem.readAsStringAsync(localFilePath, {
-        encoding: FileSystem.EncodingType.Base64,
+      // ALWAYS save to local storage first (offline-first principle)
+      const photoDir = FileSystem.documentDirectory + `doctor_photos/${userId}/`
+      const dirInfo = await FileSystem.getInfoAsync(photoDir)
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(photoDir, { intermediates: true })
+      }
+
+      // Generate local file path
+      const timestamp = Date.now()
+      const extension = fileName.toLowerCase().split('.').pop() || 'jpg'
+      const localFileName = `photo_${timestamp}.${extension}`
+      const localPhotoPath = photoDir + localFileName
+
+      // Copy file to local storage
+      await FileSystem.copyAsync({
+        from: localFilePath,
+        to: localPhotoPath
       })
 
       if (onProgress) {
@@ -59,37 +73,47 @@ export class DoctorPhotoServiceV2 {
 
       // Determine MIME type
       let mimeType = 'image/jpeg'
-      const extension = fileName.toLowerCase().split('.').pop()
       if (extension === 'png') {
         mimeType = 'image/png'
       }
 
-      // Upload using server-side function
-      const { data, error } = await supabase.rpc('upload_doctor_photo', {
-        p_user_id: userId,
-        p_photo_data: photoData,
-        p_file_name: fileName,
-        p_mime_type: mimeType
+      // Store photo in local DB with sync_status: 'pending'
+      const { LocalDatabaseService } = await import('./localDatabaseService')
+      const { generateUUID } = await import('../utils/uuid')
+      
+      await LocalDatabaseService.upsertDoctorPhoto({
+        id: generateUUID(),
+        user_id: userId,
+        file_name: fileName,
+        file_path: localPhotoPath,
+        mime_type: mimeType,
+        created_at: new Date().toISOString(),
+        sync_status: 'pending',
+        local_changes: null
       })
 
       if (onProgress) {
         onProgress({ loaded: fileInfo.size || 0, total: fileInfo.size || 0, percentage: 100 })
       }
 
-      if (error) {
-        console.error('Server-side photo upload error:', error)
-        return { success: false, error: error.message }
+      console.log('Photo saved locally:', localPhotoPath)
+
+      // If online, queue server upload for background sync (when user inactive or manual sync)
+      const { NetworkService } = await import('./networkService')
+      const isOnline = await NetworkService.isOnline()
+      
+      if (isOnline) {
+        // Queue server upload for background sync
+        // This will be handled by the sync service when user is inactive or manually syncs
+        console.log('Photo queued for background server upload')
+      } else {
+        console.log('Device is offline, photo saved locally only')
       }
 
-      if (!data || !data.success) {
-        console.error('Photo upload failed:', data)
-        return { success: false, error: data?.error || 'Upload failed' }
-      }
-
-      console.log('Photo uploaded successfully via server function:', data.photo_url)
+      // Return success with local file path (not server URL)
       return { 
         success: true, 
-        photoUrl: data.photo_url 
+        photoUrl: localPhotoPath // Return local path, not server URL
       }
 
     } catch (error) {

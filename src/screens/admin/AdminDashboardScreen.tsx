@@ -7,6 +7,7 @@ import { AdminService, DashboardStats, RecentActivity, MRPerformance, BrochureAn
 import { AuthService } from "../../services/AuthService"
 import { SmartSyncService } from "../../services/smartSyncService"
 import { SessionManagementService } from "../../services/sessionManagementService"
+import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius } from "../../utils/responsive"
 
 interface AdminDashboardScreenProps {
   navigation: any
@@ -397,7 +398,7 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
               <View style={styles.actionItem}>
                 <Ionicons name="calendar" size={24} color="#8b5cf6" />
                 <View style={styles.actionContent}>
-                  <Text style={styles.actionTitle}>Today's Meetings</Text>
+                  <Text style={styles.actionTitle}>Today&apos;s Meetings</Text>
                   <Text style={styles.actionSubtitle}>View all meetings scheduled for today</Text>
                 </View>
                 <TouchableOpacity style={styles.actionButton}>
@@ -618,10 +619,10 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: "#ffffff",
-    borderRadius: 16,
-    width: "90%",
-    maxHeight: "80%",
-    padding: 20,
+    borderRadius: getModalBorderRadius(),
+    width: getModalWidth(90),
+    maxHeight: getModalMaxHeight(80),
+    padding: getModalPadding(),
   },
   modalHeader: {
     flexDirection: "row",

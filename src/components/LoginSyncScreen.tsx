@@ -21,6 +21,8 @@ interface LoginSyncScreenProps {
     step: string
     message: string
     progress: number
+    currentItem?: number
+    totalItems?: number
   }
 }
 
@@ -83,6 +85,11 @@ export default function LoginSyncScreen({
 
             <Text style={styles.statusMessage}>
               {syncProgress.message}
+              {syncProgress.currentItem && syncProgress.totalItems && (
+                <Text style={styles.progressDetails}>
+                  {' '}({syncProgress.currentItem}/{syncProgress.totalItems})
+                </Text>
+              )}
             </Text>
           </View>
 
@@ -180,6 +187,11 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#6b7280',
     fontStyle: 'italic',
+  },
+  progressDetails: {
+    fontSize: 12,
+    color: '#8b5cf6',
+    fontWeight: '600',
   },
   detailsSection: {
     backgroundColor: '#f9fafb',

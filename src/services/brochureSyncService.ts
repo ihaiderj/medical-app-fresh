@@ -34,14 +34,23 @@ class BrochureSyncService {
     brochureData: BrochureSyncData
   ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
     try {
-      console.log('BrochureSync: Calling save_brochure_changes RPC function')
-      console.log('BrochureSync: Parameters:', { mrId, brochureId, brochureTitle })
-      console.log('BrochureSync: Data being uploaded:', {
-        slides: brochureData.slides.length,
-        groups: brochureData.groups.length,
-        slideNames: brochureData.slides.slice(0, 3).map(s => s.title),
-        groupNames: brochureData.groups.map(g => g.name)
-      })
+      console.log('🔵 BROCHURE_SYNC: Calling save_brochure_changes RPC function')
+      console.log('🔵 BROCHURE_SYNC: RPC Parameters:', { mrId, brochureId, brochureTitle })
+      console.log('🔵 BROCHURE_SYNC: Data being uploaded to server:')
+      console.log('🔵 BROCHURE_SYNC: - Total slides:', brochureData.slides.length)
+      console.log('🔵 BROCHURE_SYNC: - Total groups:', brochureData.groups.length)
+      console.log('🔵 BROCHURE_SYNC: - All slide titles:', brochureData.slides.map(s => s.title))
+      console.log('🔵 BROCHURE_SYNC: - All slide IDs:', brochureData.slides.map(s => s.id))
+      console.log('🔵 BROCHURE_SYNC: - All group names:', brochureData.groups.map(g => g.name))
+      console.log('🔵 BROCHURE_SYNC: - All group IDs:', brochureData.groups.map(g => g.id))
+      console.log('🔵 BROCHURE_SYNC: - Group details:', brochureData.groups.map(g => ({
+        id: g.id,
+        name: g.name,
+        color: g.color,
+        slideIds: g.slideIds,
+        slideCount: g.slideIds.length
+      })))
+      console.log('🔵 BROCHURE_SYNC: - Last modified:', brochureData.lastModified)
       
       const { data, error } = await supabase.rpc('save_brochure_changes', {
         p_mr_id: mrId,
@@ -51,22 +60,24 @@ class BrochureSyncService {
       })
 
       if (error) {
-        console.error('BrochureSync: RPC Error saving brochure changes:', error)
+        console.error('🔵 BROCHURE_SYNC: RPC Error saving brochure changes:', error)
+        console.error('🔵 BROCHURE_SYNC: Error details:', JSON.stringify(error))
         return { success: false, error: error.message }
       }
 
       if (!data?.success) {
-        console.error('BrochureSync: Server returned error:', data?.error)
+        console.error('🔵 BROCHURE_SYNC: Server returned error:', data?.error)
         return { success: false, error: data?.error || 'Failed to save brochure changes' }
       }
 
-      console.log('BrochureSync: RPC call successful, data saved to server')
+      console.log('🔵 BROCHURE_SYNC: RPC call successful, data saved to server')
+      console.log('🔵 BROCHURE_SYNC: Server response - lastModified:', data.last_modified)
       return { 
         success: true, 
         lastModified: data.last_modified 
       }
     } catch (error) {
-      console.error('BrochureSync: Exception during save:', error)
+      console.error('🔵 BROCHURE_SYNC: Exception during save:', error)
       return { 
         success: false, 
         error: error instanceof Error ? error.message : 'Unknown error occurred' 
@@ -236,6 +247,7 @@ class BrochureSyncService {
     slides: BrochureSlide[],
     groups: SlideGroup[]
   ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
+    console.log('🔵 BROCHURE_SYNC: Preparing brochure data for sync')
     const brochureData: BrochureSyncData = {
       slides,
       groups,
@@ -243,6 +255,11 @@ class BrochureSyncService {
       lastModified: new Date().toISOString(),
       brochureTitle
     }
+    
+    console.log('🔵 BROCHURE_SYNC: Brochure data prepared:')
+    console.log('🔵 BROCHURE_SYNC: - Total slides:', brochureData.totalSlides)
+    console.log('🔵 BROCHURE_SYNC: - Groups count:', brochureData.groups.length)
+    console.log('🔵 BROCHURE_SYNC: - Last modified:', brochureData.lastModified)
 
     return this.saveBrochureChanges(mrId, brochureId, brochureTitle, brochureData)
   }

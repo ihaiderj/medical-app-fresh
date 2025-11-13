@@ -90,7 +90,6 @@ export default function BrochureSyncStatus({
           console.warn('Background sync: Status check error:', error)
         }
       }, 2000) // 2 second delay
-    }
     } catch (error) {
       console.error('Error checking sync status:', error)
     } finally {

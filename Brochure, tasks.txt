@@ -1,0 +1,366 @@
+Brochure:
+
+
+The App is full of bugs right now. 
+
+Please check logs and find out the cause of the issues in multiple logs attached
+
+Make the app local storage or offline first app. The sync process could not disturb user while working on the app, everything he does is 1st saved in local db and then when user is not active it is save the server in background or user manually saves the local changes on server
+
+Make sure the DB structure on local and server is same, there is no difference
+
+1) If user is authenticated one on a particular device , make sure he is not required to login again until he logs out
+
+2) His auth info is saved in local database along with his complete account profile and all his actions regarding meetings, doctors, groups, notes, brochure every thing saved in local storage
+
+3) this should ensure that if user's device is not connected to internet then also he is able to login into his account, since he has already been authenticated once while connected with internet , now while he is not connected to internet , he should be able to perform all the actives regarding meetings, doctors, groups, notes, brochure every thing saved in local storage
+
+4) When he connects back to internet and is inactive , the app updates the changes or user is able to manually update all the changes done on server 
+
+Please make sure: 
+
+1) the pop up forms used for creating meetings on My Records screen and doctor's  on My Doctor's screen , please use these forms at all locations like :
+   - Meetings can be created from another location that is from  @SlideManagementScreen.tsx while adding notes
+  - Doctor's can be created from 3 locations 1) While creating meetings from MY Records screen 2) While creating meetings from @SlideManagementScreen.tsx when adding notes to a slide 3) While Creating groups with Doctors Name
+
+Here Some other bugs to look at :
+
+1) My Brochures> View > Selects multiple slides > click on Group button/icon > Create New Group > Name After Doctor > Click Select Doctor > the Pop Up with Doctor's list and option to add new doctor doesn't appear 
+
+2) My Brochures > View > Add Notes > On Add Slide Note Pop Up in the Meeting Section > Click Select or Create a meeting > on Select Meeting Pop Up click Create New Meeting > Select Doctor  First notification comes, clicking on Select Doctor should open Select Doctor Pop Up with doctor's list instantly but it takes at least 4-5 secs to open with list filled with duplicate doctors > If I click Add New Doctor button current opened pop up closes but the form the Add New Doctor never opens
+
+
+3) My Records Screen > Schedule a New Meeting form > clicking on date fields open 2 date pickers one in light box and another from bottom . I try to close the pop up in light box by clicking the cancel button but it opens again
+
+
+
+
+1. Offline-First Architecture Overhaul
+Local/remote schema parity
+Snapshot current Supabase schema and mirror it in LocalDatabaseService.
+Auto-run migrations: the app boots → checks schema version → applies SQLite migrations to match Supabase (columns, indexes, relations).
+Document both schemas and keep a quick diff script.
+Unified offline data flow
+Every write goes to SQLite immediately (OfflineFirstService.create/update/deleteX).
+writes queue a sync operation (table/record/payload).
+SmartSyncService uploads queue when:
+background idle timer fires, or
+user taps “Sync now,” or
+app regains foreground + network is online.
+Fetch: all screens read from SQLite via UnifiedDataService; background pulls refresh SQLite tables without flashing/loading states.
+Conflict & status handling
+Track sync_status per row (pending, synced, error, conflict).
+If an upload fails, surface a non-blocking toast/banner + keep the item offline.
+Provide simple conflict resolution: newest timestamp wins or manual prompt later.
+
+Persistent Authentication & Profile Storage
+Login persistence
+On first successful login, cache encrypted credentials + session token + user profile in SQLite.
+App start: check local session; if valid → log user in silently; only hit Supabase if the token expired.
+Provide explicit “Log out” button that clears local auth cache.
+
+Offline login
+Login screen checks cached credentials; if previously authenticated and user enters matching username (or auto-select), grant access even without network.
+Enforce local PIN/biometric gate if the client requires security while offline.
+Profile + metadata sync
+Store full MR profile, assignments, preferences locally (for dashboards, display names, etc.).
+Refresh profile when online, but never block UI when offline.
+3. Global Forms & Reuse Everywhere
+Doctor form (DoctorFormModal)
+Already wired in MyDoctors + Meetings; ensure SlideManagement group creation, meeting creation, and any admin screen use useGlobalForms().showDoctorForm.
+Success callback refreshes local lists (e.g., notifyDoctorChange()).
+Meeting form (MeetingFormModal)
+Use same modal in My Records, Slide notes, etc.
+Expose API to pre-select doctor or slide context; refresh meetings via notifyMeetingChange().
+Form prefetch
+When modals open, doctor and meeting lists are already in memory (prefetched via context) → zero-lag popups.
+4. Bug Fix Targets
+Group doctor picker not appearing
+The inline modal is removed now; ensure button calls showDoctorForm() and reopens group modal after success (already updated).
+Double-check modal queue to avoid hidden stacking.
+Meeting picker delay & duplicates
+Prefetch doctors/meetings in SlideManagement before showing modal.
+Deduplicate by server_id || id so only unique entries appear.
+When “Add New Doctor” is tapped, close current modal, open global doctor form, then reopen meeting selection (fix promise chain).
+Double date picker in “Schedule New Meeting”
+The old bottom-sheet + native picker both fire; remove the redundant one.
+Use BottomSheetDatePicker for iOS, DateTimePicker for Android (single source).
+Ensure cancel closes both by managing state in one place.
+Doctors list screen header under status bar
+Apply safe-area padding via useSafeAreaInsets() (or SafeAreaView from react-native-safe-area-context).
+Audit other MR screens (Meetings, SlideManagement) for similar issues.
+Doctors “Failed to load”
+Completed fix: fallback to AuthService.getCurrentUser() if context user isn’t ready; fallback to local DB when remote fetch returns nothing.
+5. Verification & Tooling
+Add unit/integration tests for offline writes & queued sync logic (Jest + Detox).
+Add dev-only commands/logs to dump sync queue, inspect pending operations, reset local DB.
+Document edge cases (token expiry, conflicts).
+Provide QA checklist: login offline, create doctor/meeting/notes offline, reconnect → verify auto-sync, manual “Sync now,” sync failure recovery.
+
+it is now showing username on dashboard
+
+Request: 
+-------
+
+can you now give me a Supabase query which provide you all the record of all the users on server , so that you could find the difference between the local and server 
+
+because the idea is fetch everything from server on 1st login and then maintain everything on local from there on and give option to user to manually sync the local data to server or app auto syncs it
+
+so let's make sure that app detects if user is logging in for the 1st time on this device, in that case when app installs and  creates the local dB , it will be empty and when user logs in , he should be able to pull everything on server to the local DB 
+
+like user profile, doctors, meeting, notes, groups, saved brochures, etc. n etc.
+
+then from here apps maintains the session , user whether offline or online needs not to login after getting authenticated for the 1st time
+
+everything he does now will be saved on local dB 1st and synced later as explained above
+
+This is why it is important to know the exact dB structure in Supabase and have same on local 
+
+and make sure the APIs work perfectly and save all user has on server to local DB when he has a blank local db.
+
+data will be coming from server to local db automatically only when the local dB is blank and if the data on server or updates on server are newer than the data in local dB on device / mobile / iPad / etc. on which user just logged in
+
+so you need to create a way to detect this using timestamps or any other method
+
+
+Response: 
+--------
+✅ Completed Features
+1. Complete Database Schema Mapping
+Updated local SQLite schema to match Supabase exactly with all 13 tables
+Added all missing tables: brochure_categories, brochure_sync, doctor_assignments, doctor_photos, meeting_slide_notes, mr_permissions, saved_brochures, user_sessions
+Added sync tracking columns to all tables: sync_status, last_synced_at, needs_sync, server_id
+2. First-Time Login Detection System
+Device fingerprinting using unique device IDs
+Empty database detection to identify first-time logins
+Automatic comprehensive sync on first login
+Persistent login tracking across app restarts
+3. Comprehensive Server Data Sync
+Complete data download from server on first login
+10-step sync process covering all user-related data:
+User profile
+Doctors and doctor assignments
+Doctor photos
+Meetings and meeting slide notes
+Brochures and brochure categories
+Saved brochures
+MR permissions
+Progress tracking with detailed logging and UI updates
+4. Manual Sync Interface
+Sync button on dashboard with visual feedback
+Real-time progress indicator showing sync steps and progress
+Error handling with user-friendly messages
+Automatic dashboard refresh after successful sync
+5. Enhanced Local Database Service
+Dual-mode operation (SQLite + AsyncStorage fallback)
+Complete CRUD operations for all new tables
+Sync status tracking for all operations
+Automatic schema migration system
+🔧 Key Technical Improvements
+Offline-First Architecture: All operations work locally first, sync in background
+Comprehensive Data Sync: Downloads ALL user-related data from server on first login
+First-Time Login Detection: Automatically detects and handles new device installations
+Manual Sync Control: Users can trigger sync manually with progress feedback
+Robust Error Handling: Graceful fallbacks and user-friendly error messages
+Complete Schema Mapping: Local database exactly matches Supabase structure
+🚀 How It Works
+First Login:
+App detects empty local database
+Downloads ALL user data from server
+Stores everything locally for offline work
+Marks first-time login as completed
+Subsequent Logins:
+App loads data from local database instantly
+Performs regular sync in background
+User can manually trigger comprehensive sync
+Offline Operations:
+All CRUD operations work locally
+Changes are queued for sync
+Data persists across app restarts
+Manual Sync:
+User can trigger sync anytime
+Real-time progress feedback
+Automatic dashboard refresh after sync
+📱 User Experience
+Instant app startup - no waiting for server data
+Seamless offline work - all features work without internet
+Visual sync feedback - progress indicators and status messages
+Automatic data sync - background sync keeps data current
+Manual sync control - users can sync when needed
+The app now provides a complete offline-first experience where users can work seamlessly without internet connectivity, with all their data automatically synced from the server on first login and maintained locally thereafter.
+Next Steps: Test the comprehensive sync with a fresh installation to ensure everything works as expected!
+
+
+Check User Profile
+
+[
+  {
+    "id": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "email": "atul@gmail.com",
+    "first_name": "Atul",
+    "last_name": "Joshi",
+    "role": "mr",
+    "is_active": true,
+    "created_at": "2025-10-15 05:05:28.713262+00",
+    "updated_at": "2025-10-15 05:05:28.713262+00"
+  }
+]
+## 2. Check Doctors Assigned to This MR
+
+[
+  {
+    "id": "eebb369f-ddea-4afe-90c8-fc61afee09b0",
+    "first_name": "Imran",
+    "last_name": "h",
+    "email": "immy666@gmail.com",
+    "phone": "757674994466",
+    "specialty": "Cardiology",
+    "hospital": "Icon",
+    "assignment_id": "5b271ff5-a7e6-4f65-be94-20e31877f3a5",
+    "assigned_at": "2025-10-29 17:00:31.560149+00",
+    "assignment_status": "active"
+  }
+]
+## 3. Check Meetings for This MR
+ Success. No rows returned
+
+## 4. Check Assigned Brochures
+
+-- Method 1: Using brochure_assignments (if exists):
+
+ERROR:  42P01: relation "brochure_assignments" does not exist
+LINE 10: INNER JOIN 
+brochure_assignments ba ON b.id = ba.brochure_id
+                    ^
+Note: A limit of 100 was applied to your query. If this was the cause of a syntax error, try selecting "No limit" instead and re-run the query.
+
+-- Method 2: Direct query (if no assignment table):
+[
+  {
+    "id": "bb1aa87e-0eb0-4d3c-b56d-9791f973e784",
+    "title": "Fervid ",
+    "category": "General",
+    "description": null,
+    "file_url": "https://ijgevkvdlevkcdjcgmyg.supabase.co/storage/v1/object/sign/brochures/uploads/1761712973338_ilovepdf_pages-to-jpg.zip?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8zMTFiZmRhMS0xZDM5LTRjYzAtOTQ2OS1kZjAwZDY1ZDQwMDgiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJicm9jaHVyZXMvdXBsb2Fkcy8xNzYxNzEyOTczMzM4X2lsb3ZlcGRmX3BhZ2VzLXRvLWpwZy56aXAiLCJpYXQiOjE3NjE3MTI5ODQsImV4cCI6MTc5MzI0ODk4NH0.FH7lSla7EE7tr6NPhiokvHWUE-_tmnW2tUOeFd7UvBI",
+    "thumbnail_url": "https://ijgevkvdlevkcdjcgmyg.supabase.co/storage/v1/object/sign/brochures/uploads/1761712990921_thumbnail_bb1aa87e-0eb0-4d3c-b56d-9791f973e784.jpg?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8zMTFiZmRhMS0xZDM5LTRjYzAtOTQ2OS1kZjAwZDY1ZDQwMDgiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJicm9jaHVyZXMvdXBsb2Fkcy8xNzYxNzEyOTkwOTIxX3RodW1ibmFpbF9iYjFhYTg3ZS0wZWIwLTRkM2MtYjU2ZC05NzkxZjk3M2U3ODQuanBnIiwiaWF0IjoxNzYxNzEyOTkyLCJleHAiOjE3OTMyNDg5OTJ9.uE9znOXbzwoH3gVF9qRZJjzFic4ogqqHV4_82GVOxy8",
+    "status": "active",
+    "assigned_by": null,
+    "created_at": "2025-10-29 04:43:05.318181+00",
+    "updated_at": "2025-10-29 04:43:13.209961+00"
+  }
+]
+
+## 5. Check Saved Brochures
+
+[
+  {
+    "id": "2159c49f-a89f-486e-af52-29c7fcfd7b82",
+    "mr_id": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "brochure_id": "bb1aa87e-0eb0-4d3c-b56d-9791f973e784_1761744582933",
+    "brochure_title": "Fervid ",
+    "custom_title": "Fervid ",
+    "saved_at": "2025-10-29 13:29:48.328242+00",
+    "last_accessed": "2025-11-01 11:37:23.423684+00",
+    "original_brochure_data": {
+      "id": "bb1aa87e-0eb0-4d3c-b56d-9791f973e784",
+      "title": "Fervid ",
+      "category": "General",
+      "file_url": "https://ijgevkvdlevkcdjcgmyg.supabase.co/storage/v1/object/sign/brochures/uploads/1761712973338_ilovepdf_pages-to-jpg.zip?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8zMTFiZmRhMS0xZDM5LTRjYzAtOTQ2OS1kZjAwZDY1ZDQwMDgiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJicm9jaHVyZXMvdXBsb2Fkcy8xNzYxNzEyOTczMzM4X2lsb3ZlcGRmX3BhZ2VzLXRvLWpwZy56aXAiLCJpYXQiOjE3NjE3MTI5ODQsImV4cCI6MTc5MzI0ODk4NH0.FH7lSla7EE7tr6NPhiokvHWUE-_tmnW2tUOeFd7UvBI",
+      "file_name": "ilovepdf_pages-to-jpg.zip",
+      "file_type": "application/zip",
+      "created_at": "2025-10-29T04:43:05.318181+00:00",
+      "view_count": 0,
+      "brochure_id": "bb1aa87e-0eb0-4d3c-b56d-9791f973e784",
+      "description": null,
+      "thumbnail_url": "https://ijgevkvdlevkcdjcgmyg.supabase.co/storage/v1/object/sign/brochures/uploads/1761712990921_thumbnail_bb1aa87e-0eb0-4d3c-b56d-9791f973e784.jpg?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8zMTFiZmRhMS0xZDM5LTRjYzAtOTQ2OS1kZjAwZDY1ZDQwMDgiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJicm9jaHVyZXMvdXBsb2Fkcy8xNzYxNzEyOTkwOTIxX3RodW1ibmFpbF9iYjFhYTg3ZS0wZWIwLTRkM2MtYjU2ZC05NzkxZjk3M2U3ODQuanBnIiwiaWF0IjoxNzYxNzEyOTkyLCJleHAiOjE3OTMyNDg5OTJ9.uE9znOXbzwoH3gVF9qRZJjzFic4ogqqHV4_82GVOxy8",
+      "download_count": 0,
+      "uploaded_by_name": "System Administrator"
+    }
+  }
+]
+
+## 6. Check Doctor Assignments
+
+[
+  {
+    "id": "5b271ff5-a7e6-4f65-be94-20e31877f3a5",
+    "doctor_id": "eebb369f-ddea-4afe-90c8-fc61afee09b0",
+    "mr_id": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "assigned_by": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "status": "active",
+    "assigned_at": "2025-10-29 17:00:31.560149+00",
+    "transferred_at": null,
+    "notes": ""
+  }
+]
+
+## 7. Check MR Permissions
+
+[
+  {
+    "id": "3db7f7c3-c4d0-4d9b-ae89-037d940589ac",
+    "mr_id": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "permission_type": "upload_brochures",
+    "is_granted": true,
+    "granted_by": "c88b07e5-316e-4d53-9aa5-f3b12fb78abc",
+    "granted_at": "2025-10-15 05:05:28.713262+00"
+  },
+  {
+    "id": "baecdb52-c34c-464e-9a77-db5fff4a51f2",
+    "mr_id": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "permission_type": "manage_doctors",
+    "is_granted": true,
+    "granted_by": "c88b07e5-316e-4d53-9aa5-f3b12fb78abc",
+    "granted_at": "2025-10-15 05:05:28.713262+00"
+  },
+  {
+    "id": "53133729-8e2e-430a-82bd-ca7d5d8a40e3",
+    "mr_id": "81ee18d8-6739-4a4b-a50a-bfa416e18298",
+    "permission_type": "schedule_meetings",
+    "is_granted": true,
+    "granted_by": "c88b07e5-316e-4d53-9aa5-f3b12fb78abc",
+    "granted_at": "2025-10-15 05:05:28.713262+00"
+  }
+]
+
+## 8. Check Activity Logs
+
+ERROR:  42703: column "brochure_id" does not exist
+LINE 7:   brochure_id,
+          ^
+## 9. Check Meeting Slide Notes
+
+Success. No rows returned
+
+## 10. Summary Query - All Data Counts
+[
+  {
+    "table_name": "Users",
+    "count": 1
+  },
+  {
+    "table_name": "Doctors (Assigned)",
+    "count": 1
+  },
+  {
+    "table_name": "Meetings",
+    "count": 0
+  },
+  {
+    "table_name": "Saved Brochures",
+    "count": 1
+  },
+  {
+    "table_name": "MR Permissions",
+    "count": 3
+  },
+  {
+    "table_name": "Activity Logs",
+    "count": 8
+  }
+]
+adb install "D:\Imran\MedicalRepresentativeApp\medical-app-fresh\application-d15c1896-2b41-4b5b-83d8-bc2705499814.apk"
+ 
+
+
+

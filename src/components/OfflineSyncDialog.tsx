@@ -12,6 +12,7 @@ import {
   Alert,
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
+import { isTablet } from '../utils/responsive'
 
 interface OfflineSyncDialogProps {
   visible: boolean
@@ -132,7 +133,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 24,
     margin: 20,
-    maxWidth: 360,
+    maxWidth: isTablet() ? 600 : 360,
     width: '100%',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },

@@ -109,13 +109,18 @@ BEGIN
         );
     END IF;
 
-    -- Delete the saved brochure
+    -- CRITICAL FIX: Delete brochure modifications/changes first
+    -- This removes all slide renaming, groups, and other modifications
+    DELETE FROM brochure_sync 
+    WHERE mr_id = p_mr_id AND brochure_id = p_brochure_id;
+
+    -- Delete the saved brochure record
     DELETE FROM saved_brochures 
     WHERE mr_id = p_mr_id AND brochure_id = p_brochure_id;
 
     RETURN jsonb_build_object(
         'success', true,
-        'message', 'Saved brochure removed successfully'
+        'message', 'Saved brochure and all modifications removed successfully'
     );
 END;
 $$;

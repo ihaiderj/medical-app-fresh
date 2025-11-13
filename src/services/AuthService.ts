@@ -1,6 +1,9 @@
 import { supabase } from './supabase'
 import { PersistentAuthService } from './persistentAuthService'
 import { SessionManagementService } from './sessionManagementService'
+import { NetworkService } from './networkService'
+import { LocalDatabaseService, LocalUser } from './localDatabaseService'
+import bcrypt from 'bcryptjs'
 
 export interface UserProfile {
   id: string
@@ -17,6 +20,7 @@ export interface AuthResult {
   success: boolean
   user?: UserProfile
   error?: string
+  isOfflineAuthenticated?: boolean
 }
 
 export class AuthService {
@@ -51,164 +55,33 @@ export class AuthService {
     hasSessionConflict?: boolean
     conflictDevice?: string
   }> {
-    const result = await this.signIn(email, password)
-    
-    if (result.success && result.user) {
-      // Register session and check for conflicts
-      const sessionResult = await SessionManagementService.registerSessionWithConflictCheck(result.user.id)
-      
-      if (sessionResult.success) {
-        // Save session for persistent authentication
-        await PersistentAuthService.saveSession(
-          result.user.id,
-          result.user.email,
-          result.user.role,
-          password,
-          rememberMe
-        )
-
-        return {
-          ...result,
-          hasSessionConflict: sessionResult.hasConflict,
-          conflictDevice: sessionResult.conflictDevice
-        }
-      } else {
-        console.warn('SessionManager: Failed to register session:', sessionResult.error)
-        // Continue with login even if session registration fails
-        await PersistentAuthService.saveSession(
-          result.user.id,
-          result.user.email,
-          result.user.role,
-          password,
-          rememberMe
-        )
-      }
-    }
-    
+    const result = await this.signIn(email, password, rememberMe)
     return result
   }
 
   /**
    * Sign in with email and password (original method)
    */
-  static async signIn(email: string, password: string): Promise<AuthResult> {
+  static async signIn(email: string, password: string, rememberMe: boolean = true): Promise<AuthResult & {
+    hasSessionConflict?: boolean;
+    conflictDevice?: string;
+  }> {
     try {
-      console.log('AuthService: Attempting login for email:', email)
-      
-      // First try Supabase Auth (for admin users)
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      })
+      const isOnline = await NetworkService.isOnline();
 
-      console.log('Supabase Auth result:', { data: !!data, error: error?.message })
-
-      // Check if Supabase Auth was successful (no error AND has user)
-      if (!error && data && data.user) {
-        console.log('Supabase Auth successful, fetching profile...')
-        // Get user profile from our users table
-        const { data: profile, error: profileError } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', data.user.id)
-          .single()
-
-        if (profileError) {
-          console.log('Profile fetch error:', profileError)
-          return { success: false, error: 'Failed to fetch user profile' }
-        }
-
-        console.log('Admin login successful:', profile.email)
-        const userProfile = {
-          id: profile.id,
-          email: profile.email,
-          role: profile.role,
-          first_name: profile.first_name,
-          last_name: profile.last_name,
-          phone: profile.phone,
-          profile_image_url: profile.profile_image_url,
-          is_active: profile.is_active,
-        }
-        this.setCurrentUser(userProfile)
-        
-        // Log login activity
-        try {
-          console.log('Attempting to log login activity for user:', profile.id)
-          const result = await supabase.rpc('log_activity', {
-            p_user_id: profile.id,
-            p_activity_type: 'login',
-            p_description: `Logged in as ${profile.role}`
-          })
-          console.log('Login activity logged successfully:', result)
-        } catch (error) {
-          console.error('Failed to log login activity:', error)
-        }
-        
-        return {
-          success: true,
-          user: userProfile,
-        }
+      if (!isOnline) {
+        return this.handleOfflineLogin(email, password, rememberMe);
       }
 
-      console.log('Supabase Auth failed, trying custom users table...')
-      // If Supabase Auth fails, try custom users table (for MR users)
-      const { data: customUsers, error: customError } = await supabase
-        .from('users')
-        .select('*')
-        .eq('email', email)
-        .eq('is_active', true)
+    const onlineResult = await this.trySupabaseLogin(email, password, rememberMe);
+    if (onlineResult.success) {
+      return onlineResult;
+    }
 
-      console.log('Custom user query result:', { customUsers: customUsers?.length, customError: customError?.message })
-
-      if (customError) {
-        console.log('Custom user query error:', customError)
-        return { success: false, error: 'Invalid email or password' }
-      }
-
-      if (!customUsers || customUsers.length === 0) {
-        console.log('No custom user found for email:', email)
-        return { success: false, error: 'Invalid email or password' }
-      }
-
-      const customUser = customUsers[0]
-
-      console.log('MR login successful:', customUser.email)
-      // For now, we'll skip password verification for MR users
-      // In a production app, you should implement proper password hashing/verification
-      // For demo purposes, we'll accept any password for MR users
-      
-      const userProfile = {
-        id: customUser.id,
-        email: customUser.email,
-        role: customUser.role,
-        first_name: customUser.first_name,
-        last_name: customUser.last_name,
-        phone: customUser.phone,
-        profile_image_url: customUser.profile_image_url,
-        is_active: customUser.is_active,
-      }
-      this.setCurrentUser(userProfile)
-      
-      // Log login activity
-      try {
-        console.log('Attempting to log MR login activity for user:', customUser.id)
-        const result = await supabase.rpc('log_activity', {
-          p_user_id: customUser.id,
-          p_activity_type: 'login',
-          p_description: `Logged in as ${customUser.role}`
-        })
-        console.log('MR login activity logged successfully:', result)
-      } catch (error) {
-        console.error('Failed to log MR login activity:', error)
-      }
-      
-      return {
-        success: true,
-        user: userProfile,
-      }
+    return this.handleOfflineLogin(email, password, rememberMe);
     } catch (error) {
-      console.log('AuthService error:', error)
-      return { success: false, error: 'An unexpected error occurred' }
+      console.log('AuthService error:', error);
+      return { success: false, error: 'An unexpected error occurred' };
     }
   }
 
@@ -225,15 +98,6 @@ export class AuthService {
     } catch (error) {
       return { success: false, error: 'An unexpected error occurred' }
     }
-  }
-
-  /**
-   * Logout the current user (alias for signOut)
-   */
-  static async logout(): Promise<{ success: boolean; error?: string }> {
-    // Clear stored user
-    this.clearCurrentUser()
-    return this.signOut()
   }
 
   /**
@@ -333,6 +197,177 @@ export class AuthService {
         callback(null)
       }
     })
+  }
+
+  private static async trySupabaseLogin(email: string, password: string, rememberMe: boolean) {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (!error && data && data.user) {
+      const { data: profile, error: profileError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', data.user.id)
+        .single();
+
+      if (profileError) {
+        return { success: false, error: 'Failed to fetch user profile' };
+      }
+
+      return this.finalizeOnlineLogin(profile, email, password, rememberMe);
+    }
+
+    const customResult = await this.tryCustomUserLogin(email, password, rememberMe);
+    if (customResult.success) {
+      return customResult;
+    }
+
+    return { success: false, error: customResult.error || 'Invalid email or password' } as AuthResult;
+  }
+
+  private static async tryCustomUserLogin(email: string, password: string, rememberMe: boolean) {
+    const { data: customUsers, error: customError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .eq('is_active', true);
+
+    if (customError || !customUsers || customUsers.length === 0) {
+      return { success: false, error: 'Invalid email or password' } as AuthResult;
+    }
+
+    return this.finalizeOnlineLogin(customUsers[0], email, password, rememberMe);
+  }
+
+  private static async handleOfflineLogin(email: string, password: string, rememberMe: boolean) {
+    const localCreds = await LocalDatabaseService.getUserCredentialsByEmail(email);
+    if (!localCreds) {
+      return { success: false, error: 'No saved credentials for offline login' } as AuthResult;
+    }
+
+    const passwordMatches = await bcrypt.compare(password, localCreds.password_hash);
+    if (!passwordMatches) {
+      return { success: false, error: 'Invalid email or password' } as AuthResult;
+    }
+
+    const localUser = await LocalDatabaseService.getUserById(localCreds.user_id);
+    if (!localUser) {
+      return { success: false, error: 'Offline profile not found' } as AuthResult;
+    }
+
+    console.log('🔍 AUTH DEBUG: Local user data for offline login:', localUser);
+    
+    const userProfile: UserProfile = {
+      id: localUser.id,
+      email: localUser.email,
+      role: localUser.role,
+      first_name: localUser.first_name || '',
+      last_name: localUser.last_name || '',
+      phone: localUser.phone || undefined,
+      profile_image_url: localUser.profile_image_url || undefined,
+      is_active: localUser.is_active,
+    };
+    
+    console.log('🔍 AUTH DEBUG: Mapped offline user profile:', userProfile);
+
+    this.setCurrentUser(userProfile);
+
+    await SessionManagementService.recordLocalSession(userProfile.id);
+
+    if (rememberMe) {
+      await PersistentAuthService.saveSession(
+        userProfile.id,
+        userProfile.email,
+        userProfile.role,
+        localCreds.password_hash,
+        rememberMe,
+        true,
+      );
+    }
+
+    return { success: true, user: userProfile, isOfflineAuthenticated: true } as AuthResult;
+  }
+
+  private static async finalizeOnlineLogin(profile: any, email: string, password: string, rememberMe: boolean) {
+    console.log('🔍 AUTH DEBUG: Server profile data received:', profile);
+    console.log('🔍 AUTH DEBUG: Profile first_name:', profile.first_name);
+    console.log('🔍 AUTH DEBUG: Profile last_name:', profile.last_name);
+    
+    const userProfile: UserProfile = {
+      id: profile.id,
+      email: profile.email,
+      role: profile.role,
+      first_name: profile.first_name || '',
+      last_name: profile.last_name || '',
+      phone: profile.phone,
+      profile_image_url: profile.profile_image_url,
+      is_active: profile.is_active,
+    };
+    
+    console.log('🔍 AUTH DEBUG: Mapped user profile:', userProfile);
+
+    this.setCurrentUser(userProfile);
+
+    const now = new Date().toISOString();
+    await LocalDatabaseService.upsertUser({
+      ...userProfile,
+      created_at: profile.created_at || now,
+      updated_at: profile.updated_at || now,
+      sync_status: 'synced',
+    });
+
+    const salt = bcrypt.genSaltSync(10);
+    const hashedPassword = bcrypt.hashSync(password, salt);
+    await LocalDatabaseService.saveUserCredentials(userProfile.id, email, hashedPassword);
+
+    const permissionsRes = await supabase
+      .from('mr_permissions')
+      .select('*')
+      .eq('user_id', userProfile.id);
+
+    if (!permissionsRes.error && permissionsRes.data) {
+      for (const perm of permissionsRes.data) {
+        await LocalDatabaseService.upsertPermission({
+          id: perm.id,
+          user_id: perm.user_id,
+          permission_key: perm.permission_key,
+          value: perm.value,
+          created_at: perm.created_at,
+          updated_at: perm.updated_at,
+          sync_status: 'synced',
+        });
+      }
+    }
+
+    const sessionResult = await SessionManagementService.registerSessionWithConflictCheck(userProfile.id);
+
+    if (sessionResult.success) {
+      await PersistentAuthService.saveSession(
+        userProfile.id,
+        userProfile.email,
+        userProfile.role,
+        hashedPassword,
+        rememberMe,
+        true,
+      );
+
+      return {
+        success: true,
+        user: userProfile,
+        hasSessionConflict: sessionResult.hasConflict,
+        conflictDevice: sessionResult.conflictDevice,
+      } as AuthResult & { hasSessionConflict?: boolean; conflictDevice?: string };
+    }
+
+    console.warn('SessionManager: Failed to register session:', sessionResult.error);
+    await PersistentAuthService.saveSession(
+      userProfile.id,
+      userProfile.email,
+      userProfile.role,
+      hashedPassword,
+      rememberMe,
+      true,
+    );
+
+    return { success: true, user: userProfile } as AuthResult;
   }
 
   /**

@@ -4,6 +4,8 @@
  */
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as SecureStore from 'expo-secure-store'
+import { LocalDatabaseService } from './localDatabaseService'
+import { SessionManagementService } from './sessionManagementService'
 
 interface PersistentSession {
   userId: string
@@ -17,7 +19,7 @@ interface PersistentSession {
 export class PersistentAuthService {
   private static readonly SESSION_KEY = 'medical_app_session'
   private static readonly CREDENTIALS_KEY = 'medical_app_credentials'
-  private static readonly SESSION_DURATION = 30 * 24 * 60 * 60 * 1000 // 30 days in milliseconds
+  private static readonly SESSION_DURATION = 365 * 24 * 60 * 60 * 1000 // 1 year in milliseconds (effectively indefinite)
   private static readonly ACTIVITY_CHECK_INTERVAL = 5 * 60 * 1000 // 5 minutes
 
   /**
@@ -28,7 +30,8 @@ export class PersistentAuthService {
     email: string, 
     role: 'admin' | 'mr',
     password?: string,
-    rememberMe: boolean = true
+    rememberMe: boolean = true,
+    passwordIsHashed: boolean = false
   ): Promise<{ success: boolean; error?: string }> {
     try {
       const now = Date.now()
@@ -46,7 +49,7 @@ export class PersistentAuthService {
       
       // Save credentials securely if rememberMe is true and password provided
       if (rememberMe && password) {
-        const credentials = { email, password }
+        const credentials = { email, password, isHashed: passwordIsHashed }
         await SecureStore.setItemAsync(this.CREDENTIALS_KEY, JSON.stringify(credentials))
       }
 
@@ -130,6 +133,38 @@ export class PersistentAuthService {
 
       const credentials = JSON.parse(credentialsData)
       
+      if (credentials.isHashed) {
+        const localResult = await LocalDatabaseService.getUserCredentialsByEmail(credentials.email)
+        if (!localResult || localResult.password_hash !== credentials.password) {
+          await this.clearSession()
+          return { success: false, error: 'Stored credentials mismatch' }
+        }
+
+        const localUser = await LocalDatabaseService.getUserById(localResult.user_id)
+        if (!localUser) {
+          await this.clearSession()
+          return { success: false, error: 'Offline profile not found' }
+        }
+
+        const userProfile = {
+          id: localUser.id,
+          email: localUser.email,
+          role: localUser.role,
+          first_name: localUser.first_name,
+          last_name: localUser.last_name,
+          phone: localUser.phone,
+          profile_image_url: localUser.profile_image_url,
+          is_active: localUser.is_active,
+        }
+
+        await SessionManagementService.recordLocalSession(userProfile.id)
+        const { AuthService } = await import('./AuthService')
+        AuthService.setCurrentUser(userProfile)
+
+        console.log('Auto-login succeeded using local credentials')
+        return { success: true, user: userProfile }
+      }
+
       // Attempt login with saved credentials
       console.log('Attempting auto-login for:', credentials.email)
       // Import AuthService here to avoid circular dependency

@@ -2,6 +2,8 @@ import * as FileSystem from 'expo-file-system'
 import { Platform } from 'react-native'
 import { supabase } from './supabase'
 import { brochureSyncService, BrochureSyncData } from './brochureSyncService'
+import { FilePathUtils } from '../utils/filePathUtils'
+import { FileStorageService } from './fileStorageService'
 
 // Conditionally import react-native-zip-archive only for native platforms
 let unzip: any = null
@@ -34,6 +36,7 @@ export interface SlideGroup {
   order: number
   createdAt: string
   updatedAt: string
+  doctorId?: string  // Optional doctor ID for doctor-based groups
 }
 
 export interface BrochureData {
@@ -68,6 +71,52 @@ export class BrochureManagementService {
       }
     } catch (error) {
       console.error('Failed to initialize storage:', error)
+    }
+  }
+
+  /**
+   * Fix slide image paths for current platform
+   */
+  private static async fixSlideImagePaths(brochureId: string, slides: BrochureSlide[]): Promise<BrochureSlide[]> {
+    try {
+      const slidesDir = FilePathUtils.getSlidesDirectory(brochureId)
+      
+      // Check if slides directory exists
+      const dirExists = await FilePathUtils.fileExists(slidesDir)
+      if (!dirExists) {
+        console.log('BrochureManager: Slides directory does not exist:', slidesDir)
+        return slides
+      }
+
+      // Get actual files in the directory
+      const actualFiles = await FileSystem.readDirectoryAsync(slidesDir)
+      console.log('BrochureManager: Actual files in slides directory:', actualFiles.length)
+
+      // Fix each slide's imageUri
+      const fixedSlides = slides.map(slide => {
+        // Extract filename from current imageUri
+        const currentPath = slide.imageUri
+        const fileName = slide.fileName || currentPath.split('/').pop() || ''
+        
+        // Construct new path using current platform's file system
+        const newImageUri = FilePathUtils.getSlideImagePath(brochureId, fileName)
+        
+        if (currentPath !== newImageUri) {
+          console.log(`BrochureManager: Fixed path for ${slide.title}:`)
+          console.log(`  Old: ${currentPath}`)
+          console.log(`  New: ${newImageUri}`)
+        }
+
+        return {
+          ...slide,
+          imageUri: newImageUri
+        }
+      })
+
+      return fixedSlides
+    } catch (error) {
+      console.error('BrochureManager: Error fixing slide paths:', error)
+      return slides // Return original slides if fixing fails
     }
   }
 
@@ -158,8 +207,28 @@ export class BrochureManagementService {
         if (!unzip) {
           throw new Error('ZIP extraction not supported on this platform')
         }
-        await unzip(localZipPath, slidesDir)
-        console.log('ZIP extracted to:', slidesDir)
+        
+        // Verify the downloaded file is a valid ZIP before extraction
+        const zipFileInfo = await FileSystem.getInfoAsync(localZipPath)
+        if (!zipFileInfo.exists || zipFileInfo.size === 0) {
+          throw new Error('Downloaded ZIP file is empty or does not exist')
+        }
+        
+        console.log('ZIP file size:', zipFileInfo.size, 'bytes')
+        
+        try {
+          await unzip(localZipPath, slidesDir)
+          console.log('ZIP extracted to:', slidesDir)
+        } catch (zipError) {
+          console.error('ZIP extraction failed:', zipError)
+          // Check if the file is actually a ZIP by reading its header
+          const fileData = await FileSystem.readAsStringAsync(localZipPath, { 
+            encoding: FileSystem.EncodingType.Base64,
+            length: 4 
+          })
+          console.log('File header (base64):', fileData)
+          throw new Error(`ZIP extraction failed: ${zipError.message}. File may be corrupted or not a valid ZIP file.`)
+        }
         
         // Read extracted files
         const extractedFiles = await FileSystem.readDirectoryAsync(slidesDir)
@@ -254,6 +323,83 @@ export class BrochureManagementService {
   }
 
   /**
+   * Download brochure file (ZIP/PDF) from server
+   */
+  static async downloadBrochureFile(
+    brochureId: string,
+    fileUrl: string,
+    userId: string,
+    brochureTitle: string,
+    onProgress?: (progress: { percentage: number; loaded: number; total: number }) => void
+  ): Promise<{ success: boolean; localPath?: string; error?: string }> {
+    try {
+      console.log('BrochureManager: Downloading brochure file:', brochureTitle);
+      console.log('BrochureManager: File URL:', fileUrl);
+      
+      if (!fileUrl) {
+        return { success: false, error: 'No file URL provided' };
+      }
+
+      // Create download directory
+      const downloadDir = FileSystem.documentDirectory + `mr_downloads/${userId}/`;
+      const dirInfo = await FileSystem.getInfoAsync(downloadDir);
+      if (!dirInfo.exists) {
+        await FileSystem.makeDirectoryAsync(downloadDir, { intermediates: true });
+      }
+
+      // Generate filename
+      const timestamp = Date.now();
+      const extension = fileUrl.includes('.zip') ? 'zip' : 'pdf';
+      const fileName = `${brochureTitle.replace(/[^a-zA-Z0-9]/g, '_')}_${timestamp}.${extension}`;
+      const localPath = downloadDir + fileName;
+
+      console.log('BrochureManager: Downloading to:', localPath);
+
+      // Download file
+      if (fileUrl.startsWith('file://')) {
+        // Local file copy
+        await FileSystem.copyAsync({
+          from: fileUrl,
+          to: localPath
+        });
+      } else {
+        // Download from Supabase Storage
+        const downloadResult = await FileStorageService.downloadFile(
+          fileUrl,
+          localPath,
+          onProgress
+        );
+
+        if (!downloadResult.success) {
+          throw new Error(downloadResult.error || 'Download failed');
+        }
+      }
+
+      console.log('BrochureManager: File downloaded successfully to:', localPath);
+
+      // Process ZIP file if needed
+      if (fileUrl.includes('.zip') || extension === 'zip') {
+        console.log('BrochureManager: Processing ZIP file for brochure:', brochureId);
+        try {
+          await this.processZipFile(brochureId, localPath, brochureTitle);
+          console.log('BrochureManager: ZIP file processed successfully');
+        } catch (error) {
+          console.warn('BrochureManager: ZIP processing failed, will process on first view:', error);
+          // Don't fail the download if ZIP processing fails
+        }
+      }
+
+      return { success: true, localPath };
+    } catch (error) {
+      console.error('BrochureManager: Failed to download brochure file:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to download brochure file'
+      };
+    }
+  }
+
+  /**
    * Get brochure data
    */
   static async getBrochureData(brochureId: string): Promise<{ success: boolean; data?: BrochureData; error?: string }> {
@@ -273,6 +419,9 @@ export class BrochureManagementService {
       console.log('BrochureManager: Raw data slides count:', brochureData.slides.length)
       console.log('BrochureManager: Raw data groups count:', brochureData.groups.length)
       console.log('BrochureManager: Raw slide titles:', brochureData.slides.slice(0, 5).map(s => s.title))
+      
+      // Fix image paths for current platform
+      brochureData.slides = await this.fixSlideImagePaths(brochureId, brochureData.slides)
       
       // Migrate data to include new sync metadata and missing fields
       let needsSave = false
@@ -501,7 +650,8 @@ export class BrochureManagementService {
     brochureId: string,
     groupName: string,
     slideIds: string[],
-    color: string = '#8b5cf6'
+    color: string = '#8b5cf6',
+    doctorId?: string
   ): Promise<{ success: boolean; groupId?: string; error?: string }> {
     try {
       const { data: brochureData } = await this.getBrochureData(brochureId)
@@ -517,7 +667,8 @@ export class BrochureManagementService {
         slideIds: slideIds,
         order: brochureData.groups.length + 1,
         createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString(),
+        doctorId: doctorId  // Store doctor ID if provided
       }
       
       brochureData.groups.push(newGroup)
@@ -720,6 +871,27 @@ export class BrochureManagementService {
   }
 
   /**
+   * Clear old thumbnail and regenerate with correct paths
+   */
+  static async regenerateThumbnail(brochureId: string): Promise<{ success: boolean; thumbnailUri?: string; error?: string }> {
+    try {
+      // Remove old thumbnail if it exists
+      const oldThumbnailPath = `${this.STORAGE_DIR}${brochureId}/thumbnail.jpg`
+      const oldThumbnailExists = await FilePathUtils.fileExists(oldThumbnailPath)
+      if (oldThumbnailExists) {
+        await FileSystem.deleteAsync(oldThumbnailPath, { idempotent: true })
+        console.log('RegenerateThumbnail: Removed old thumbnail')
+      }
+      
+      // Generate new thumbnail
+      return await this.generateThumbnail(brochureId)
+    } catch (error) {
+      console.error('Regenerate thumbnail error:', error)
+      return { success: false, error: 'Failed to regenerate thumbnail' }
+    }
+  }
+
+  /**
    * Generate thumbnail from first slide
    */
   static async generateThumbnail(brochureId: string): Promise<{ success: boolean; thumbnailUri?: string; error?: string }> {
@@ -730,15 +902,27 @@ export class BrochureManagementService {
       }
       
       const firstSlide = brochureData.slides[0]
-      const thumbnailPath = `${this.STORAGE_DIR}${brochureId}/thumbnail.jpg`
+      const thumbnailPath = FilePathUtils.getThumbnailPath(brochureId)
+      
+      console.log('GenerateThumbnail: Source image:', firstSlide.imageUri)
+      console.log('GenerateThumbnail: Target thumbnail:', thumbnailPath)
       
       // For local files, use them directly as thumbnail
       if (firstSlide.imageUri.startsWith('file://') || firstSlide.imageUri.startsWith('/')) {
+        // Check if source file exists
+        const sourceExists = await FilePathUtils.fileExists(firstSlide.imageUri)
+        if (!sourceExists) {
+          console.log('GenerateThumbnail: Source image does not exist:', firstSlide.imageUri)
+          return { success: false, error: 'Source image file not found' }
+        }
+        
         // Copy first slide as thumbnail
         await FileSystem.copyAsync({
           from: firstSlide.imageUri,
           to: thumbnailPath
         })
+        
+        console.log('GenerateThumbnail: Thumbnail created successfully')
         
         // Update brochure data
         brochureData.thumbnailUri = thumbnailPath
@@ -794,26 +978,38 @@ export class BrochureManagementService {
     try {
       const result = await this.getBrochureData(brochureId)
       if (!result.success || !result.data) {
+        console.error('🔵 BROCHURE_SYNC: Cannot mark as modified - brochure not found:', brochureId)
         return { success: false, error: 'Brochure not found' }
       }
 
       const now = new Date().toISOString()
+      const wasModified = result.data.isModified
+      const wasNeedsSync = result.data.needsSync
+      
       result.data.isModified = true
       result.data.needsSync = true
       result.data.localLastModified = now
       result.data.updatedAt = now
 
-      // Save updated metadata
-      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      console.log('🔵 BROCHURE_SYNC: Marking brochure as modified')
+      console.log('🔵 BROCHURE_SYNC: - Brochure ID:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: - Was modified:', wasModified, '→ Now: true')
+      console.log('🔵 BROCHURE_SYNC: - Was needsSync:', wasNeedsSync, '→ Now: true')
+      console.log('🔵 BROCHURE_SYNC: - Local lastModified:', now)
+      console.log('🔵 BROCHURE_SYNC: - Slides count:', result.data.slides.length)
+      console.log('🔵 BROCHURE_SYNC: - Groups count:', result.data.groups.length)
+
+      // Save updated metadata using cross-platform path
+      const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
       await FileSystem.writeAsStringAsync(
         `${brochureDir}brochure_data.json`,
         JSON.stringify(result.data, null, 2)
       )
 
-      console.log('BrochureManager: Marked as modified:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: Brochure marked as modified successfully')
       return { success: true }
     } catch (error) {
-      console.error('Mark brochure modified error:', error)
+      console.error('🔵 BROCHURE_SYNC: Error marking brochure as modified:', error)
       return { success: false, error: 'Failed to mark brochure as modified' }
     }
   }
@@ -825,24 +1021,37 @@ export class BrochureManagementService {
     try {
       const result = await this.getBrochureData(brochureId)
       if (!result.success || !result.data) {
+        console.error('🔵 BROCHURE_SYNC: Cannot mark as synced - brochure not found:', brochureId)
         return { success: false, error: 'Brochure not found' }
       }
 
+      const wasNeedsSync = result.data.needsSync
+      const wasModified = result.data.isModified
+      const syncTime = new Date().toISOString()
+      
       result.data.needsSync = false
       result.data.isModified = false
-      result.data.lastSyncedAt = new Date().toISOString()
+      result.data.lastSyncedAt = syncTime
 
-      // Save updated metadata
-      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      console.log('🔵 BROCHURE_SYNC: Marking brochure as synced')
+      console.log('🔵 BROCHURE_SYNC: - Brochure ID:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: - Was needsSync:', wasNeedsSync, '→ Now: false')
+      console.log('🔵 BROCHURE_SYNC: - Was isModified:', wasModified, '→ Now: false')
+      console.log('🔵 BROCHURE_SYNC: - Last synced at:', syncTime)
+      console.log('🔵 BROCHURE_SYNC: - Slides count:', result.data.slides.length)
+      console.log('🔵 BROCHURE_SYNC: - Groups count:', result.data.groups.length)
+
+      // Save updated metadata using cross-platform path
+      const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
       await FileSystem.writeAsStringAsync(
         `${brochureDir}brochure_data.json`,
         JSON.stringify(result.data, null, 2)
       )
 
-      console.log('BrochureManager: Marked as synced:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: Brochure marked as synced successfully')
       return { success: true }
     } catch (error) {
-      console.error('Mark brochure synced error:', error)
+      console.error('🔵 BROCHURE_SYNC: Error marking brochure as synced:', error)
       return { success: false, error: 'Failed to mark brochure as synced' }
     }
   }
@@ -895,11 +1104,23 @@ export class BrochureManagementService {
     groups: SlideGroup[]
   ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
     try {
-      console.log('BrochureSync: Uploading brochure data to server')
-      console.log('BrochureSync: Slides count:', slides.length)
-      console.log('BrochureSync: Groups count:', groups.length)
-      console.log('BrochureSync: Sample slide titles:', slides.slice(0, 3).map(s => s.title))
-      console.log('BrochureSync: Group names:', groups.map(g => g.name))
+      console.log('🔵 BROCHURE_SYNC: Starting sync to server')
+      console.log('🔵 BROCHURE_SYNC: MR ID:', mrId)
+      console.log('🔵 BROCHURE_SYNC: Brochure ID:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: Brochure Title:', brochureTitle)
+      console.log('🔵 BROCHURE_SYNC: Slides count:', slides.length)
+      console.log('🔵 BROCHURE_SYNC: Groups count:', groups.length)
+      console.log('🔵 BROCHURE_SYNC: All slide titles:', slides.map(s => s.title))
+      console.log('🔵 BROCHURE_SYNC: All slide IDs:', slides.map(s => s.id))
+      console.log('🔵 BROCHURE_SYNC: All group names:', groups.map(g => g.name))
+      console.log('🔵 BROCHURE_SYNC: All group IDs:', groups.map(g => g.id))
+      console.log('🔵 BROCHURE_SYNC: Group details:', groups.map(g => ({
+        id: g.id,
+        name: g.name,
+        color: g.color,
+        slideIds: g.slideIds,
+        slideCount: g.slideIds.length
+      })))
       
       const result = await brochureSyncService.syncBrochureToServer(
         mrId,
@@ -910,14 +1131,17 @@ export class BrochureManagementService {
       )
       
       if (result.success) {
-        console.log('BrochureSync: Successfully uploaded brochure data with', slides.length, 'slides and', groups.length, 'groups')
+        console.log('🔵 BROCHURE_SYNC: Successfully uploaded brochure data')
+        console.log('🔵 BROCHURE_SYNC: - Slides uploaded:', slides.length)
+        console.log('🔵 BROCHURE_SYNC: - Groups uploaded:', groups.length)
+        console.log('🔵 BROCHURE_SYNC: - Server lastModified:', result.lastModified)
       } else {
-        console.error('BrochureSync: Failed to upload brochure data:', result.error)
+        console.error('🔵 BROCHURE_SYNC: Failed to upload brochure data:', result.error)
       }
       
       return result
     } catch (error) {
-      console.error('Brochure sync error:', error)
+      console.error('🔵 BROCHURE_SYNC: Exception during sync:', error)
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to sync brochure'
@@ -993,7 +1217,7 @@ export class BrochureManagementService {
       console.log('BrochureSync: Downloaded slide titles:', syncData.slides.slice(0, 3).map(s => s.title))
       console.log('BrochureSync: Downloaded group names:', syncData.groups.map(g => g.name))
       
-      const brochureDir = `file:///data/user/0/com.ihaiderj.medicalapp.dev/files/brochures/${brochureId}/`
+      const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
       const now = new Date().toISOString()
       
       // Check if local brochure data exists and has local modifications

@@ -5,11 +5,19 @@ import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AuthService } from './src/services/AuthService';
 import useActivityTracker from './src/hooks/useActivityTracker';
 import { SmartSyncService } from './src/services/smartSyncService';
 import { SessionManagementService } from './src/services/sessionManagementService';
+import { LocalDatabaseService } from './src/services/localDatabaseService';
+import { NetworkService } from './src/services/networkService';
+import { AdvancedSyncService } from './src/services/advancedSyncService';
+import { UnifiedSyncService } from './src/services/unifiedSyncService';
+import { InitialSyncService } from './src/services/initialSyncService';
+import { AppDataProvider, useAppData } from './src/context/AppDataContext';
+import { GlobalFormProvider } from './src/context/GlobalFormContext';
+import UnifiedSyncIndicator from './src/components/UnifiedSyncIndicator';
 import LoginScreen from './src/screens/LoginScreen';
 import AdminDashboardScreen from './src/screens/admin/AdminDashboardScreen';
 import AdminTabs from './src/screens/admin/AdminTabs';
@@ -18,17 +26,16 @@ import ViewAllMRsScreen from './src/screens/admin/ViewAllMRsScreen';
 import AddBrochureScreen from './src/screens/admin/AddBrochureScreen';
 import ViewAllBrochuresScreen from './src/screens/admin/ViewAllBrochuresScreen';
 import DocumentViewerScreen from './src/screens/admin/DocumentViewerScreen';
-import AdminSlideManagementScreen from './src/screens/admin/SlideManagementScreen';
+import SlideManagementScreen from './src/screens/admin/SlideManagementScreen';
 import MRDashboardScreen from './src/screens/mr/MRDashboardScreen';
 import BrochuresScreen from './src/screens/mr/BrochuresScreen';
 import DoctorsScreen from './src/screens/mr/DoctorsScreen';
 import MeetingsScreen from './src/screens/mr/MeetingsScreen';
 import MeetingDetailsScreen from './src/screens/mr/MeetingDetailsScreen';
-// import PresentationsScreen from './src/screens/mr/PresentationsScreen';
-// import PresentationModeScreen from './src/screens/mr/PresentationModeScreen';
-import SlideManagementScreen from './src/screens/mr/SlideManagementScreen';
 import PDFConversionScreen from './src/screens/mr/PDFConversionScreen';
 import BrochureViewerScreen from './src/screens/mr/BrochureViewerScreen';
+import DoctorBrochuresScreen from './src/screens/mr/DoctorBrochuresScreen';
+import DoctorGroupViewerScreen from './src/screens/mr/DoctorGroupViewerScreen';
 
 const Stack = createStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -57,6 +64,8 @@ function WelcomeScreen({ navigation }: { navigation: any }) {
 }
 
 function MRTabs() {
+  const insets = useSafeAreaInsets();
+  
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -80,15 +89,91 @@ function MRTabs() {
         tabBarActiveTintColor: '#8b5cf6',
         tabBarInactiveTintColor: 'gray',
         headerShown: false,
+        tabBarStyle: {
+          backgroundColor: '#ffffff',
+          borderTopWidth: 1,
+          borderTopColor: '#e5e7eb',
+          paddingBottom: Math.max(insets.bottom, 8),
+          paddingTop: 8,
+          height: 60 + Math.max(insets.bottom, 8),
+        },
+        tabBarLabelStyle: {
+          fontSize: 12,
+          fontWeight: '600',
+          marginTop: 4,
+        },
       })}
     >
-      <Tab.Screen name="MRDashboard" component={MRDashboardScreen} options={{ title: 'Dashboard' }} />
-      <Tab.Screen name="Brochures" component={BrochuresScreen} options={{ title: 'Brochures' }} />
-      <Tab.Screen name="Doctors" component={DoctorsScreen} options={{ title: 'Doctors' }} />
-      <Tab.Screen name="Meetings" component={MeetingsScreen} options={{ title: 'Meetings' }} />
+      <Tab.Screen 
+        name="MRDashboard" 
+        component={MRDashboardScreen} 
+        options={{ 
+          tabBarLabel: 'Dashboard',
+          title: 'Dashboard'
+        }} 
+      />
+      <Tab.Screen 
+        name="Brochures" 
+        component={BrochuresScreen} 
+        options={{ 
+          tabBarLabel: 'Brochures',
+          title: 'Brochures'
+        }} 
+      />
+      <Tab.Screen 
+        name="Doctors" 
+        component={DoctorsScreen} 
+        options={{ 
+          tabBarLabel: 'Doctors',
+          title: 'Doctors'
+        }} 
+      />
+      <Tab.Screen 
+        name="Meetings" 
+        component={MeetingsScreen} 
+        options={{ 
+          tabBarLabel: 'Meetings',
+          title: 'Meetings'
+        }} 
+      />
     </Tab.Navigator>
   );
 }
+
+function AppNavigator() {
+  const { user, isDataInitialized } = useAppData();
+  
+  if (!isDataInitialized) {
+    // Show a loading screen while the app initializes
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" />
+      </View>
+    );
+  }
+
+  return (
+    <NavigationContainer>
+      <Stack.Navigator>
+        {user ? (
+          // User is logged in
+          <>
+            <Stack.Screen name="MRTabs" component={MRTabs} options={{ headerShown: false }} />
+            <Stack.Screen name="SlideManagement" component={SlideManagementScreen} />
+            <Stack.Screen name="BrochureViewer" component={BrochureViewerScreen} />
+            <Stack.Screen name="DoctorBrochures" component={DoctorBrochuresScreen} />
+            <Stack.Screen name="DoctorGroupViewer" component={DoctorGroupViewerScreen} />
+            <Stack.Screen name="MeetingDetails" component={MeetingDetailsScreen} />
+          </>
+        ) : (
+          // No user is logged in
+          <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
+        )}
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
@@ -96,7 +181,7 @@ export default function App() {
   const [userRole, setUserRole] = useState<'admin' | 'mr' | null>(null);
 
   // Track user activity for persistent sessions
-  useActivityTracker();
+  // useActivityTracker(); // DISABLED - causing sync issues
 
   useEffect(() => {
     checkAuthState();
@@ -106,6 +191,16 @@ export default function App() {
     try {
       console.log('Checking authentication state...')
       
+      // Initialize offline-first services
+      console.log('Initializing offline-first services...')
+      try {
+        await LocalDatabaseService.initialize()
+      } catch (dbError) {
+        console.warn('SQLite initialization failed, offline features will be limited:', dbError)
+        // Continue without SQLite - app will work online-only
+      }
+      await NetworkService.initialize()
+      
       // First try auto-login with persistent session
       const autoLoginResult = await AuthService.attemptAutoLogin()
       if (autoLoginResult.success && autoLoginResult.user) {
@@ -113,9 +208,70 @@ export default function App() {
         setIsAuthenticated(true)
         setUserRole(autoLoginResult.user.role)
         
-        // Register session and initialize sync service
+        // Register session and initialize sync services
         await SessionManagementService.registerSessionWithConflictCheck(autoLoginResult.user.id)
-        await SmartSyncService.initialize()
+        // await AdvancedSyncService.initialize() // DISABLED - causing infinite doctor creation
+        // await UnifiedSyncService.initialize() // Temporarily disabled to fix sync issues
+        
+        // Perform comprehensive sync only if local DB is empty or outdated
+        // This ensures offline-first: data should already be in local DB
+        try {
+          const { shouldPerformComprehensiveSync } = await import('./src/services/loginSyncHelper');
+          const { NetworkService } = await import('./src/services/networkService');
+          
+          // Check if device is online (sync only works when online)
+          const isOnline = await NetworkService.isOnline();
+          
+          if (!isOnline) {
+            console.log('⏭️ AUTO-LOGIN DEBUG: Device is offline, skipping sync check (offline-first mode)');
+            // Work with local data only when offline
+            return;
+          }
+          
+          // Determine if comprehensive sync should be performed
+          const syncDecision = await shouldPerformComprehensiveSync(autoLoginResult.user.id);
+          
+          if (syncDecision.shouldSync) {
+            console.log(`🔄 AUTO-LOGIN DEBUG: Starting comprehensive sync - Reason: ${syncDecision.reason}...`);
+            
+            const { ComprehensiveServerSyncService } = await import('./src/services/comprehensiveServerSyncService');
+            const syncResult = await ComprehensiveServerSyncService.performComprehensiveSync(autoLoginResult.user.id);
+            
+            if (syncResult.success) {
+              console.log('✅ AUTO-LOGIN DEBUG: Comprehensive sync completed successfully');
+              console.log('📊 AUTO-LOGIN DEBUG: Synced tables:', syncResult.syncedTables);
+              
+              // Store sync time after successful sync
+              try {
+                const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
+                await AsyncStorage.setItem(`last_sync_time_${autoLoginResult.user.id}`, Date.now().toString());
+                console.log('✅ AUTO-LOGIN DEBUG: Sync timestamp stored');
+              } catch (error) {
+                console.error('❌ AUTO-LOGIN DEBUG: Failed to store sync time:', error);
+              }
+            } else {
+              console.warn('⚠️ AUTO-LOGIN DEBUG: Comprehensive sync failed:', syncResult.error);
+            }
+          } else {
+            console.log(`⏭️ AUTO-LOGIN DEBUG: Skipping sync - Local DB is ${syncDecision.reason} (offline-first mode)`);
+            // Work with local data only
+            
+            // Even if sync is skipped, clean up any duplicates that may exist
+            try {
+              const { ComprehensiveServerSyncService } = await import('./src/services/comprehensiveServerSyncService');
+              await Promise.all([
+                ComprehensiveServerSyncService.cleanupDuplicateDoctorsByName(autoLoginResult.user.id),
+                ComprehensiveServerSyncService.cleanupDuplicateMeetings(autoLoginResult.user.id),
+                ComprehensiveServerSyncService.cleanupDuplicateSavedBrochures(autoLoginResult.user.id),
+                ComprehensiveServerSyncService.cleanupDuplicateMeetingSlideNotes(autoLoginResult.user.id)
+              ]);
+            } catch (cleanupError) {
+              console.warn('⚠️ AUTO-LOGIN DEBUG: Error cleaning up duplicates:', cleanupError);
+            }
+          }
+        } catch (error) {
+          console.error('❌ AUTO-LOGIN DEBUG: Sync check error:', error);
+        }
         
         return
       }
@@ -130,7 +286,21 @@ export default function App() {
           
           // Register session and initialize sync service
           await SessionManagementService.registerSessionWithConflictCheck(result.user.id)
-          await SmartSyncService.initialize()
+          // await AdvancedSyncService.initialize() // DISABLED - causing infinite doctor creation
+          // await UnifiedSyncService.initialize() // Temporarily disabled to fix sync issues
+          
+          // Perform initial sync from server to local database
+          // console.log('Performing initial sync from server...')
+          // try {
+          //   const syncResult = await InitialSyncService.performInitialSync()
+          //   if (syncResult.success) {
+          //     console.log('Initial sync completed successfully')
+          //   } else {
+          //     console.warn('Initial sync failed:', syncResult.error)
+          //   }
+          // } catch (error) {
+          //   console.error('Initial sync error:', error)
+          // }
         } else {
           setIsAuthenticated(false)
           setUserRole(null)
@@ -160,127 +330,14 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <NavigationContainer>
-        <Stack.Navigator 
-          initialRouteName={isAuthenticated ? (userRole === 'admin' ? 'AdminTabs' : 'MRTabs') : 'Welcome'}
-          screenOptions={{
-            headerShown: false,
-          }}
-        >
-        <Stack.Screen 
-          name="Welcome" 
-          component={WelcomeScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="Login" 
-          component={LoginScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="AdminTabs" 
-          component={AdminTabs}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="AdminDashboard" 
-          component={AdminDashboardScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="AddMR" 
-          component={AddMRScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="ViewAllMRs" 
-          component={ViewAllMRsScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="AddBrochure" 
-          component={AddBrochureScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="ViewAllBrochures" 
-          component={ViewAllBrochuresScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="DocumentViewer" 
-          component={DocumentViewerScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="AdminSlideManagement" 
-          component={AdminSlideManagementScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="MRTabs" 
-          component={MRTabs}
-          options={{
-            headerShown: false
-          }}
-        />
-        {/* <Stack.Screen 
-          name="PresentationMode" 
-          component={PresentationModeScreen}
-          options={{
-            headerShown: false
-          }}
-        /> */}
-        <Stack.Screen 
-          name="SlideManagement" 
-          component={SlideManagementScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="MeetingDetails" 
-          component={MeetingDetailsScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="PDFConversion" 
-          component={PDFConversionScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-        <Stack.Screen 
-          name="BrochureViewer" 
-          component={BrochureViewerScreen}
-          options={{
-            headerShown: false
-          }}
-        />
-      </Stack.Navigator>
-      </NavigationContainer>
+      <AppDataProvider>
+        <GlobalFormProvider>
+          <AppNavigator />
+          
+          {/* Unified Sync Indicator - Top Banner - Temporarily disabled */}
+          {/* <UnifiedSyncIndicator /> */}
+        </GlobalFormProvider>
+      </AppDataProvider>
     </SafeAreaProvider>
   );
 }

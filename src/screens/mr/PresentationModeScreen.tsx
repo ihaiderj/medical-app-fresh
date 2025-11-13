@@ -14,6 +14,8 @@ import {
 } from "react-native"
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
+import { runOnJS } from 'react-native-reanimated'
+import { Gesture, GestureDetector } from 'react-native-gesture-handler'
 import { PDFConversionService, PresentationData } from "../../services/pdfConversionService"
 
 interface PresentationModeScreenProps {
@@ -39,136 +41,120 @@ export default function PresentationModeScreen({ navigation, route }: Presentati
   const [isLoading, setIsLoading] = useState(true)
   const timerRef = useRef<NodeJS.Timeout | null>(null)
 
-  // Mock brochure data - in real app, this would come from API
-  const mockBrochures = [
-    {
-      id: 1,
-      title: "CardioMax Pro Series",
-      category: "Cardiology",
-      fileUrl: "/medical-slide-cardio-intro.png",
-      slides: [
-        {
-          id: 1,
-          title: "Introduction to CardioMax",
-          image: "/medical-slide-cardio-intro.png",
-          group: "Overview",
-        },
-        {
-          id: 2,
-          title: "Treatment Options",
-          image: "/medical-slide-treatment-options.png",
-          group: "Overview",
-        },
-        {
-          id: 3,
-          title: "Clinical Studies",
-          image: "/medical-slide-clinical-studies.png",
-          group: "Evidence",
-        },
-        {
-          id: 4,
-          title: "Patient Benefits",
-          image: "/medical-slide-patient-benefits.png",
-          group: "Evidence",
-        },
-        {
-          id: 5,
-          title: "Dosage Guidelines",
-          image: "/medical-slide-dosage-guidelines.png",
-          group: "Implementation",
-        },
-      ],
-    },
-    {
-      id: 4,
-      title: "Visualet Fervid 23-080-2025",
-      category: "Cardiology",
-      fileUrl: "/visualet-fervid-23-080-2025.pdf",
-      isPDF: true,
-      slides: [
-        {
-          id: 1,
-          title: "Visualet Fervid - Overview",
-          image: "/medical-slide-cardio-intro.png",
-          group: "Overview",
-        },
-        {
-          id: 2,
-          title: "Clinical Benefits",
-          image: "/medical-slide-patient-benefits.png",
-          group: "Benefits",
-        },
-        {
-          id: 3,
-          title: "Dosage Guidelines",
-          image: "/medical-slide-dosage-guidelines.png",
-          group: "Implementation",
-        },
-        {
-          id: 4,
-          title: "Clinical Studies",
-          image: "/medical-slide-clinical-studies.png",
-          group: "Evidence",
-        },
-        {
-          id: 5,
-          title: "Side Effects",
-          image: "/medical-slide-side-effects.png",
-          group: "Safety",
-        },
-      ],
-    },
-  ]
+  // Get presentation data based on presentationId or brochureId
+  const getPresentationData = async () => {
+    try {
+      // First try to load from converted presentations (for ZIP files processed as presentations)
+      if (isConverted && presentationId) {
+        const convertedData = await PDFConversionService.getPresentationData(presentationId.toString())
+        if (convertedData) {
+          return {
+            id: presentationId,
+            title: convertedData.title,
+            slides: convertedData.slides.map(slide => ({
+              id: slide.pageNumber,
+              title: slide.title,
+              image: slide.imagePath,
+              group: `Page ${slide.pageNumber}`
+            })),
+            isConverted: true,
+            totalPages: convertedData.totalPages
+          }
+        }
+      }
+
+      // If not converted, try to load brochure data (for regular presentations)
+      if (brochureId) {
+        const { BrochureManagementService } = await import('../../services/brochureManagementService')
+        const brochureResult = await BrochureManagementService.getBrochureData(brochureId)
+
+        if (brochureResult.success && brochureResult.data) {
+          return {
+            id: presentationId || brochureId,
+            title: brochureTitle || brochureResult.data.title,
+            slides: brochureResult.data.slides.map(slide => ({
+              id: slide.id,
+              title: slide.title,
+              image: slide.imageUri,
+              group: slide.groupId || 'Default'
+            })),
+            isConverted: false
+          }
+        }
+      }
+
+      // Fallback: Return mock data if nothing else works
+      return {
+        id: presentationId || brochureId || 1,
+        title: brochureTitle || "CardioMax Pro Series",
+        slides: [
+          {
+            id: 1,
+            title: "Introduction to CardioMax",
+            image: require("../../../public/medical-slide-cardio-intro.png"),
+            group: "Overview",
+          },
+          {
+            id: 2,
+            title: "Treatment Options",
+            image: require("../../../public/medical-slide-treatment-options.png"),
+            group: "Overview",
+          },
+          {
+            id: 3,
+            title: "Clinical Studies",
+            image: require("../../../public/medical-slide-clinical-studies.png"),
+            group: "Evidence",
+          },
+          {
+            id: 4,
+            title: "Patient Benefits",
+            image: require("../../../public/medical-slide-patient-benefits.png"),
+            group: "Evidence",
+          },
+          {
+            id: 5,
+            title: "Dosage Guidelines",
+            image: require("../../../public/medical-slide-dosage-guidelines.png"),
+            group: "Implementation",
+          },
+        ],
+      }
+    } catch (error) {
+      console.error('Failed to load presentation data:', error)
+      // Return fallback mock data
+      return {
+        id: presentationId || brochureId || 1,
+        title: brochureTitle || "CardioMax Pro Series",
+        slides: [
+          {
+            id: 1,
+            title: "Introduction to CardioMax",
+            image: require("../../../public/medical-slide-cardio-intro.png"),
+            group: "Overview",
+          },
+        ],
+      }
+    }
+  }
 
   // Load presentation data based on presentationId
   useEffect(() => {
     const loadPresentation = async () => {
       try {
         setIsLoading(true)
-        
-        if (isConverted || isPDF) {
-          // Handle converted presentation - load converted images
-          console.log('Loading converted presentation:', presentationId)
-          const convertedData = await PDFConversionService.getPresentationData(presentationId.toString())
-          
-          if (convertedData) {
-            console.log('Found converted presentation:', convertedData)
-            setConvertedPresentation(convertedData)
-            setPresentation({
-              id: presentationId,
-              title: convertedData.title,
-              slides: convertedData.slides.map(slide => ({
-                id: slide.pageNumber,
-                title: slide.title,
-                image: slide.imagePath,
-                group: `Page ${slide.pageNumber}`
-              })),
-              isConverted: true,
-              totalPages: convertedData.totalPages
-            })
-          } else {
-            console.log('No converted presentation found, using fallback')
-            setPresentation({
-              id: presentationId,
-              title: brochureTitle || "Visualet Fervid 23-080-2025",
-              isConverted: true,
-              slides: []
-            })
-          }
-        } else {
-          // Handle regular presentation
-          const brochure = mockBrochures.find(b => b.id === presentationId)
-          if (brochure) {
-            setPresentation(brochure)
-          } else {
-            // Fallback to default presentation
-            setPresentation({
-              id: presentationId || 1,
-              title: brochureTitle || "CardioMax Pro Series",
-              slides: mockBrochures[0].slides,
-            })
-          }
-        }
+        console.log('PresentationMode: Loading presentation:', { presentationId, brochureId, brochureTitle, isPDF, isConverted })
+
+        const presentationData = await getPresentationData()
+
+        console.log('PresentationMode: Loaded presentation:', {
+          id: presentationData.id,
+          title: presentationData.title,
+          slidesCount: presentationData.slides?.length || 0,
+          isConverted: presentationData.isConverted
+        })
+
+        setPresentation(presentationData)
       } catch (error) {
         console.error('Failed to load presentation:', error)
         Alert.alert("Error", "Failed to load presentation")
@@ -178,7 +164,7 @@ export default function PresentationModeScreen({ navigation, route }: Presentati
     }
 
     loadPresentation()
-  }, [presentationId, brochureTitle, brochureFile, isPDF, isConverted])
+  }, [presentationId, brochureId, brochureTitle, isPDF, isConverted])
 
   const doctors = [
     { id: 1, name: "Dr. Michael Smith" },
@@ -212,18 +198,21 @@ export default function PresentationModeScreen({ navigation, route }: Presentati
   }
 
   const handlePreviousSlide = () => {
+    console.log('Previous slide clicked, current index:', currentSlideIndex)
     if (currentSlideIndex > 0) {
       setCurrentSlideIndex(currentSlideIndex - 1)
     }
   }
 
   const handleNextSlide = () => {
+    console.log('Next slide clicked, current index:', currentSlideIndex, 'total:', presentation?.slides?.length || 0)
     if (presentation?.slides && currentSlideIndex < presentation.slides.length - 1) {
       setCurrentSlideIndex(currentSlideIndex + 1)
     }
   }
 
   const handleSlideSelect = (index: number) => {
+    console.log('Slide selected:', index)
     setCurrentSlideIndex(index)
     setShowSlideIndex(false)
   }
@@ -282,6 +271,56 @@ export default function PresentationModeScreen({ navigation, route }: Presentati
     },
     {} as Record<string, any[]>,
   ) || {}
+
+  // Simple tap gesture test
+  const tapGesture = Gesture.Tap()
+    .onStart(() => {
+      console.log('=== TAP GESTURE DETECTED ===')
+    })
+
+  // Swipe gesture handler with debugging
+  const swipeGesture = Gesture.Pan()
+    .activeOffsetX([-15, 15])
+    .failOffsetY([-30, 30])
+    .onStart(() => {
+      console.log('=== SWIPE GESTURE STARTED ===')
+    })
+    .onUpdate((event) => {
+      console.log('=== SWIPE GESTURE UPDATE ===', {
+        translationX: event.translationX,
+        translationY: event.translationY,
+        velocityX: event.velocityX,
+        velocityY: event.velocityY
+      })
+    })
+    .onEnd((event) => {
+      'worklet'
+      const SWIPE_THRESHOLD = 50
+
+      console.log('=== SWIPE GESTURE ENDED ===', {
+        translationX: event.translationX,
+        translationY: event.translationY,
+        velocityX: event.velocityX,
+        velocityY: event.velocityY,
+        threshold: SWIPE_THRESHOLD
+      })
+
+      if (event.translationX < -SWIPE_THRESHOLD) {
+        console.log('✅ SWIPE LEFT DETECTED - Moving to next slide')
+        runOnJS(handleNextSlide)()
+      } else if (event.translationX > SWIPE_THRESHOLD) {
+        console.log('✅ SWIPE RIGHT DETECTED - Moving to previous slide')
+        runOnJS(handlePreviousSlide)()
+      } else {
+        console.log('❌ SWIPE NOT STRONG ENOUGH - No action taken')
+      }
+    })
+
+  // Combine tap and swipe gestures
+  const combinedGesture = Gesture.Simultaneous(tapGesture, swipeGesture)
+  
+  // Debug: Log gesture detector rendering
+  console.log('=== RENDERING PRESENTATION MODE GESTURE DETECTOR ===')
 
   // Show loading state if presentation is not loaded yet
   if (isLoading || !presentation) {
@@ -351,13 +390,15 @@ export default function PresentationModeScreen({ navigation, route }: Presentati
         ) : (
           // Slide Display (for both regular slides and PDFs with slides)
           <>
-            <Image 
-              source={getImageSource(currentSlide.image)} 
-              style={styles.slideImage} 
-              resizeMode="contain"
-              onError={(error) => console.log('Image load error:', error)}
-              onLoad={() => console.log('Image loaded successfully')}
-            />
+            <GestureDetector gesture={combinedGesture}>
+              <Image
+                source={getImageSource(currentSlide.image)}
+                style={styles.slideImage}
+                resizeMode="contain"
+                onError={(error) => console.log('Image load error:', error)}
+                onLoad={() => console.log('Image loaded successfully')}
+              />
+            </GestureDetector>
 
             {/* Slide Navigation Overlay */}
             <View style={styles.slideNavigation}>
@@ -429,7 +470,7 @@ export default function PresentationModeScreen({ navigation, route }: Presentati
                   <Text style={styles.pdfInfoTitle}>{presentation.title}</Text>
                   <Text style={styles.pdfInfoSubtitle}>PDF Document</Text>
                   <Text style={styles.pdfInfoDescription}>
-                    This is a PDF brochure. Tap "Open PDF" in the presentation view to view the document.
+                    This is a PDF brochure. Tap &quot;Open PDF&quot; in the presentation view to view the document.
                   </Text>
                 </View>
               ) : (

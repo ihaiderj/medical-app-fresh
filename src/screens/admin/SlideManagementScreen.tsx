@@ -41,12 +41,16 @@ import { BrochureManagementService, BrochureSlide, SlideGroup } from '../../serv
 import { MRService } from '../../services/MRService'
 import { AuthService } from '../../services/AuthService'
 import { OfflineFirstService } from '../../services/offlineFirstService'
+import { UnifiedDataService } from '../../services/UnifiedDataService'
 import BrochureSyncStatus from '../../components/BrochureSyncStatus'
 import SyncStatusIndicator from '../../components/SyncStatusIndicator'
 import { SmartSyncService } from '../../services/smartSyncService'
 import { FilePathUtils } from '../../utils/filePathUtils'
 import { useModalQueue } from '../../hooks/useModalQueue'
 import { useAppData } from '../../context/AppDataContext'
+import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius, isTablet } from '../../utils/responsive'
+import { useGlobalForms } from '../../context/GlobalFormContext'
+import DoctorSelectionModal from '../../components/DoctorSelectionModal'
 
 interface SlideManagementScreenProps {
   navigation: any
@@ -90,19 +94,6 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [groupCreationMode, setGroupCreationMode] = useState<'manual' | 'doctor'>('manual')
   const [currentUserRole, setCurrentUserRole] = useState<'admin' | 'mr' | null>(null)
   const [doctorSearchQuery, setDoctorSearchQuery] = useState('')
-  const [showAddDoctorModal, setShowAddDoctorModal] = useState(false)
-
-  // Doctor form for inline creation
-  const [doctorForm, setDoctorForm] = useState({
-    first_name: '',
-    last_name: '',
-    specialty: '',
-    hospital: '',
-    phone: '',
-    email: '',
-    location: '',
-    notes: '',
-  })
 
   // Orientation management
   const [currentOrientation, setCurrentOrientation] = useState<'portrait' | 'landscape'>('portrait')
@@ -120,10 +111,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [selectedMeeting, setSelectedMeeting] = useState<any | null>(null)
   const [availableMeetings, setAvailableMeetings] = useState<any[]>([])
   const [showDoctorSelectionModal, setShowDoctorSelectionModal] = useState(false)
-  const [showGroupDoctorSelectionModal, setShowGroupDoctorSelectionModal] = useState(false)
+  const [doctorSelectionContext, setDoctorSelectionContext] = useState<'meeting' | 'group' | null>(null)
   const [showMeetingSelectionModal, setShowMeetingSelectionModal] = useState(false)
   const [showNewMeetingForm, setShowNewMeetingForm] = useState(false)
-  const [doctorModalSource, setDoctorModalSource] = useState<'meeting' | 'group' | null>(null)
   const [newMeetingForm, setNewMeetingForm] = useState({
     doctor_id: '',
     title: '',
@@ -141,6 +131,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
   const { width: screenWidth, height: screenHeight } = Dimensions.get('window')
   const imageSize = 360 // Base image size
+
+  const { showDoctorForm, showMeetingForm } = useGlobalForms()
 
   useEffect(() => {
     loadBrochureData()
@@ -165,34 +157,52 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   // Perform sync when exiting view mode
   const performExitSync = async () => {
     try {
-      console.log('SlideManagement: Exiting view mode, checking for changes to sync')
+      console.log('🔵 BROCHURE_SYNC: Exiting view mode, checking for changes to sync')
       const userResult = await AuthService.getCurrentUser()
       if (userResult.success && userResult.user && userResult.user.role === 'mr') {
         // Check if current brochure needs sync
         const brochureResult = await BrochureManagementService.getBrochureData(brochureId)
-        if (brochureResult.success && brochureResult.data && brochureResult.data.needsSync) {
-          console.log('SlideManagement: Found changes to sync, uploading to server')
-          console.log('SlideManagement: Current local slides count:', brochureResult.data.slides.length)
-          console.log('SlideManagement: Current local groups count:', brochureResult.data.groups.length)
-          console.log('SlideManagement: Current slide titles:', brochureResult.data.slides.slice(0, 5).map(s => s.title))
-          console.log('SlideManagement: Current group names:', brochureResult.data.groups.map(g => g.name))
+        if (brochureResult.success && brochureResult.data) {
+          console.log('🔵 BROCHURE_SYNC: Brochure sync status check:')
+          console.log('🔵 BROCHURE_SYNC: - needsSync:', brochureResult.data.needsSync)
+          console.log('🔵 BROCHURE_SYNC: - isModified:', brochureResult.data.isModified)
+          console.log('🔵 BROCHURE_SYNC: - Brochure ID:', brochureId)
+          console.log('🔵 BROCHURE_SYNC: - Brochure Title:', brochureTitle)
           
-          const uploadResult = await BrochureManagementService.syncBrochureToServer(
-            userResult.user.id,
-            brochureId,
-            brochureTitle,
-            brochureResult.data.slides,
-            brochureResult.data.groups
-          )
+          if (brochureResult.data.needsSync || brochureResult.data.isModified) {
+            console.log('🔵 BROCHURE_SYNC: Found changes to sync, uploading to server')
+            console.log('🔵 BROCHURE_SYNC: Current local slides count:', brochureResult.data.slides.length)
+            console.log('🔵 BROCHURE_SYNC: Current local groups count:', brochureResult.data.groups.length)
+            console.log('🔵 BROCHURE_SYNC: Current slide titles:', brochureResult.data.slides.slice(0, 5).map(s => s.title))
+            console.log('🔵 BROCHURE_SYNC: Current group names:', brochureResult.data.groups.map(g => g.name))
+            console.log('🔵 BROCHURE_SYNC: All slide IDs:', brochureResult.data.slides.map(s => s.id))
+            console.log('🔵 BROCHURE_SYNC: All group IDs:', brochureResult.data.groups.map(g => g.id))
+            
+            const uploadResult = await BrochureManagementService.syncBrochureToServer(
+              userResult.user.id,
+              brochureId,
+              brochureTitle,
+              brochureResult.data.slides,
+              brochureResult.data.groups
+            )
 
-          if (uploadResult.success) {
-            await BrochureManagementService.markBrochureAsSynced(brochureId)
-            console.log('SlideManagement: Changes synced successfully on exit')
+            if (uploadResult.success) {
+              console.log('🔵 BROCHURE_SYNC: Upload successful, marking as synced')
+              console.log('🔵 BROCHURE_SYNC: Server lastModified:', uploadResult.lastModified)
+              await BrochureManagementService.markBrochureAsSynced(brochureId)
+              console.log('🔵 BROCHURE_SYNC: Changes synced successfully on exit')
+            } else {
+              console.error('🔵 BROCHURE_SYNC: Upload failed:', uploadResult.error)
+            }
+          } else {
+            console.log('🔵 BROCHURE_SYNC: No changes to sync, brochure is up to date')
           }
         }
+      } else {
+        console.log('🔵 BROCHURE_SYNC: Skipping sync - user is not MR role')
       }
     } catch (error) {
-      console.warn('SlideManagement: Exit sync error:', error)
+      console.error('🔵 BROCHURE_SYNC: Exit sync error:', error)
     }
   }
 
@@ -207,6 +217,23 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       console.error('Error checking user role:', error)
     }
   }
+
+  // Load doctors when group modal opens (for MR users)
+  useEffect(() => {
+    if (showGroupModal && currentUserRole === 'mr') {
+      console.log('Group modal opened, loading doctors...')
+      loadAvailableDoctors()
+    }
+  }, [showGroupModal, currentUserRole])
+
+
+  // Load doctors when doctor selection modal opens (for MR users)
+  useEffect(() => {
+    if (showDoctorSelectionModal && currentUserRole === 'mr') {
+      console.log('Doctor selection modal opened, loading doctors...')
+      loadAvailableDoctors()
+    }
+  }, [showDoctorSelectionModal, currentUserRole])
 
   // Initialize orientation
   const initializeOrientation = async () => {
@@ -422,14 +449,22 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
     try {
       let successCount = 0
+      const renamedSlides: Array<{ slideId: string; oldTitle: string; newTitle: string }> = []
 
       // Rename all selected slides
       for (let i = 0; i < selectedSlides.length; i++) {
         const slideId = selectedSlides[i]
+        const slide = slides.find(s => s.id === slideId)
+        const oldTitle = slide?.title || 'Unknown'
+        
         // If multiple slides selected, append number to make titles unique
         const finalTitle = selectedSlides.length > 1
           ? `${newSlideTitle.trim()} ${i + 1}`
           : newSlideTitle.trim()
+
+        console.log(`🟡 SLIDE_RENAME: Renaming slide ID: ${slideId}`)
+        console.log(`🟡 SLIDE_RENAME: Old title: "${oldTitle}" → New title: "${finalTitle}"`)
+        console.log(`🟡 SLIDE_RENAME: Brochure ID: ${brochureId}`)
 
         const result = await BrochureManagementService.updateSlideTitle(
           brochureId,
@@ -439,17 +474,26 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
         if (result.success) {
           successCount++
+          renamedSlides.push({ slideId, oldTitle, newTitle: finalTitle })
+          console.log(`🟡 SLIDE_RENAME: Successfully renamed slide ${slideId}`)
+        } else {
+          console.error(`🟡 SLIDE_RENAME: Failed to rename slide ${slideId}:`, result.error)
         }
       }
 
       if (successCount > 0) {
+        console.log(`🟡 SLIDE_RENAME: Completed renaming ${successCount} slide(s)`)
+        console.log(`🟡 SLIDE_RENAME: Renamed slides:`, renamedSlides)
+        
         setShowRenameModal(false)
         setNewSlideTitle('')
         exitSelectionMode()
         loadBrochureData()
         
         // Mark brochure as modified for sync tracking
+        console.log(`🟡 SLIDE_RENAME: Marking brochure ${brochureId} as modified for sync`)
         await BrochureManagementService.markBrochureAsModified(brochureId)
+        console.log(`🟡 SLIDE_RENAME: Brochure marked as modified, will sync on next sync operation`)
         
         const message = successCount === 1 
           ? 'Slide renamed successfully'
@@ -459,6 +503,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         Alert.alert('Error', 'Failed to rename slides')
       }
     } catch (error) {
+      console.error('🟡 SLIDE_RENAME: Error renaming slides:', error)
       Alert.alert('Error', 'Failed to rename slides')
     }
   }
@@ -478,33 +523,35 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   }
 
   const handleCreateGroup = async () => {
-    console.log('=== HANDLE CREATE GROUP CALLED ===')
-    console.log('Creation mode:', groupCreationMode)
-    console.log('Selected doctor:', selectedDoctor)
-    console.log('New group name:', newGroupName)
-    console.log('Selected slides:', selectedSlides.length)
+    console.log('🟢 GROUP_CREATE: Starting group creation')
+    console.log('🟢 GROUP_CREATE: Creation mode:', groupCreationMode)
+    console.log('🟢 GROUP_CREATE: Selected doctor:', selectedDoctor ? `${selectedDoctor.first_name} ${selectedDoctor.last_name} (ID: ${selectedDoctor.id})` : 'None')
+    console.log('🟢 GROUP_CREATE: Manual group name:', newGroupName)
+    console.log('🟢 GROUP_CREATE: Selected slides count:', selectedSlides.length)
+    console.log('🟢 GROUP_CREATE: Selected slide IDs:', selectedSlides)
     
     // Determine group name based on creation mode
     let groupName = ''
     if (groupCreationMode === 'doctor' && selectedDoctor) {
       groupName = `${selectedDoctor.first_name} ${selectedDoctor.last_name}`.trim()
-      console.log('Using doctor name for group:', groupName)
+      console.log('🟢 GROUP_CREATE: Using doctor name for group:', groupName)
     } else {
       groupName = newGroupName.trim()
-      console.log('Using manual name for group:', groupName)
+      console.log('🟢 GROUP_CREATE: Using manual name for group:', groupName)
     }
 
     if (!groupName || selectedSlides.length === 0) {
-      console.log('Validation failed - group name or slides missing')
+      console.log('🟢 GROUP_CREATE: Validation failed - group name or slides missing')
       Alert.alert('Error', 'Please enter group name (or select doctor) and select slides')
       return
     }
 
     try {
-      console.log('=== STARTING GROUP CREATION ===')
-      console.log('Group name:', groupName)
-      console.log('Slides count:', selectedSlides.length)
-      console.log('Brochure ID:', brochureId)
+      console.log('🟢 GROUP_CREATE: Creating group with details:')
+      console.log('🟢 GROUP_CREATE: - Group name:', groupName)
+      console.log('🟢 GROUP_CREATE: - Slides count:', selectedSlides.length)
+      console.log('🟢 GROUP_CREATE: - Brochure ID:', brochureId)
+      console.log('🟢 GROUP_CREATE: - Doctor ID:', groupCreationMode === 'doctor' && selectedDoctor ? selectedDoctor.id : 'None')
       
       const result = await BrochureManagementService.createSlideGroup(
         brochureId,
@@ -514,43 +561,42 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         groupCreationMode === 'doctor' && selectedDoctor ? selectedDoctor.id : undefined
       )
 
-      console.log('=== GROUP CREATION COMPLETED ===')
-      console.log('Result success:', result.success)
-      console.log('Result error:', result.error)
+      console.log('🟢 GROUP_CREATE: Group creation result:', {
+        success: result.success,
+        error: result.error,
+        groupId: result.success ? 'Created' : 'Failed'
+      })
 
       if (result.success) {
-        console.log('=== CLOSING MODAL AND CLEANING UP ===')
+        console.log('🟢 GROUP_CREATE: Group created successfully, cleaning up UI')
         // Close modal first to prevent UI blocking
         setShowGroupModal(false)
         setNewGroupName('')
         setSelectedDoctor(null)
         setGroupCreationMode('manual')
         setSelectedSlides([])
-        console.log('Modal state cleared')
         
         // Mark brochure as modified for sync tracking (non-blocking)
-        console.log('=== MARKING BROCHURE AS MODIFIED ===')
-        BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
-          console.warn('Failed to mark brochure as modified:', err)
+        console.log(`🟢 GROUP_CREATE: Marking brochure ${brochureId} as modified for sync`)
+        BrochureManagementService.markBrochureAsModified(brochureId).then(() => {
+          console.log(`🟢 GROUP_CREATE: Brochure marked as modified, will sync on next sync operation`)
+        }).catch(err => {
+          console.error('🟢 GROUP_CREATE: Failed to mark brochure as modified:', err)
         })
         
         // Reload data after UI updates
-        console.log('=== SCHEDULING DATA RELOAD ===')
         setTimeout(() => {
-          console.log('=== RELOADING BROCHURE DATA ===')
           loadBrochureData()
         }, 100)
         
-        console.log('=== SHOWING SUCCESS ALERT ===')
         Alert.alert('Success', `Group "${groupName}" created successfully`)
-        console.log('=== HANDLE CREATE GROUP FINISHED ===')
+        console.log('🟢 GROUP_CREATE: Group creation completed successfully')
       } else {
-        console.log('=== GROUP CREATION FAILED ===')
+        console.error('🟢 GROUP_CREATE: Group creation failed:', result.error)
         Alert.alert('Error', result.error || 'Failed to create group')
       }
     } catch (error) {
-      console.error('=== GROUP CREATION ERROR ===', error)
-      console.error('Error details:', JSON.stringify(error))
+      console.error('🟢 GROUP_CREATE: Exception during group creation:', error)
       Alert.alert('Error', 'Failed to create group')
     }
   }
@@ -576,7 +622,21 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       // This ensures consistency with My Doctors screen
       const doctorsResult = await OfflineFirstService.getDoctors(userResult.user.id)
       if (doctorsResult.success && doctorsResult.data) {
-        setAvailableDoctors(doctorsResult.data)
+        const unique = new Map<string, any>();
+        doctorsResult.data.forEach(doctor => {
+          const key = doctor.server_id || doctor.id;
+          if (!unique.has(key)) {
+            unique.set(key, doctor);
+          }
+        });
+
+        const sorted = Array.from(unique.values()).sort((a, b) => {
+          const nameA = `${a.first_name || ''} ${a.last_name || ''}`.trim().toLowerCase();
+          const nameB = `${b.first_name || ''} ${b.last_name || ''}`.trim().toLowerCase();
+          return nameA.localeCompare(nameB);
+        });
+
+        setAvailableDoctors(sorted);
         console.log('Loaded doctors for group creation:', doctorsResult.data.length)
       } else {
         console.log('Failed to load doctors:', doctorsResult.error)
@@ -621,135 +681,23 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       }
 
       // Instead of navigating away, show an inline doctor creation form
-      setShowAddDoctorModal(true)
+      showDoctorForm(undefined, () => {
+        loadAvailableDoctors()
+        loadBrochureData()
+      })
     } catch (error) {
       console.error('Error opening add doctor modal:', error)
       Alert.alert('Error', 'Failed to open doctor creation')
     }
   }
 
-  // Reset doctor form
-  const resetDoctorForm = () => {
-    setDoctorForm({
-      first_name: '',
-      last_name: '',
-      specialty: '',
-      hospital: '',
-      phone: '',
-      email: '',
-      location: '',
-      notes: '',
-    })
-  }
-
-  // Handle saving new doctor
-  const handleSaveNewDoctor = async () => {
-    try {
-      // Validate required fields
-      if (!doctorForm.first_name.trim() || !doctorForm.last_name.trim()) {
-        Alert.alert('Validation Error', 'Please enter both first and last name')
-        return
-      }
-
-      if (!doctorForm.specialty.trim()) {
-        Alert.alert('Validation Error', 'Please enter the doctor\'s specialty')
-        return
-      }
-
-      if (!doctorForm.hospital.trim()) {
-        Alert.alert('Validation Error', 'Please enter the hospital/clinic name')
-        return
-      }
-
-      const userResult = await AuthService.getCurrentUser()
-      if (!userResult.success || !userResult.user) {
-        Alert.alert('Error', 'Please log in again')
-        return
-      }
-
-      // Create doctor using offline-first service
-      const result = await OfflineFirstService.createDoctor({
-        mr_id: userResult.user.id,
-        first_name: doctorForm.first_name.trim(),
-        last_name: doctorForm.last_name.trim(),
-        specialty: doctorForm.specialty.trim(),
-        hospital: doctorForm.hospital.trim(),
-        phone: doctorForm.phone.trim(),
-        email: doctorForm.email.trim(),
-        location: doctorForm.location.trim(),
-      })
-
-      if (result.success) {
-        // Store the new doctor name and data for auto-selection
-        const newDoctorName = `${doctorForm.first_name.trim()} ${doctorForm.last_name.trim()}`
-        
-        const tempDoctor = {
-          doctor_id: result.data?.id || `temp_${Date.now()}`,
-          first_name: doctorForm.first_name.trim(),
-          last_name: doctorForm.last_name.trim(),
-          specialty: doctorForm.specialty.trim(),
-          hospital: doctorForm.hospital.trim(),
-          phone: doctorForm.phone.trim(),
-          email: doctorForm.email.trim(),
-          location: doctorForm.location.trim(),
-          profile_image_url: null
-        }
-
-        // Immediately select the new doctor and switch to doctor mode
-        setSelectedDoctor(tempDoctor)
-        setGroupCreationMode('doctor')
-        
-        // Notify global state about doctor change
-        notifyDoctorChange()
-        
-        // Reset form
-        resetDoctorForm()
-        
-        // Close add doctor modal and open appropriate selection modal with proper timing
-        modalQueue.closeModal('addDoctor', () => {
-          // Show success message
-          Alert.alert('Success', 'Doctor added successfully!', [
-            {
-              text: 'OK',
-              onPress: () => {
-                // Reload doctors in background
-                loadAvailableDoctors()
-                
-                // Return to the appropriate doctor selection modal based on source
-                if (doctorModalSource === 'group') {
-                  modalQueue.openModal('groupDoctorSelection')
-                  setShowGroupDoctorSelectionModal(true)
-                } else {
-                  modalQueue.openModal('doctorSelection')
-                  setShowDoctorSelectionModal(true)
-                }
-                setDoctorModalSource(null) // Reset source
-              }
-            }
-          ])
-        })
-        
-        setShowAddDoctorModal(false)
-
-      } else {
-        Alert.alert('Error', result.error || 'Failed to add doctor')
-      }
-    } catch (error) {
-      console.error('Error adding doctor:', error)
-      Alert.alert('Error', 'Failed to add doctor')
-    }
-  }
-
-  // Load available meetings for notes
+  // Load available meetings for notes (offline-first: read from local DB only)
   const loadAvailableMeetings = async () => {
     try {
       const userResult = await AuthService.getCurrentUser()
       if (userResult.success && userResult.user && userResult.user.role === 'mr') {
-        // Load meetings from BOTH sources to get all meetings (old and new)
-        const [localMeetingsResult, serverMeetingsResult] = await Promise.all([
-          OfflineFirstService.getMeetings(userResult.user.id),
-          MRService.getMeetings(userResult.user.id)
-        ])
+        // Load meetings from local DB only (offline-first architecture)
+        const localMeetingsResult = await OfflineFirstService.getMeetings(userResult.user.id)
         
         let allMeetings: any[] = []
         
@@ -758,41 +706,20 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           allMeetings = Array.isArray(localMeetingsResult.data) ? localMeetingsResult.data : []
         }
         
-        // Collect server meetings
-        if (serverMeetingsResult.success && serverMeetingsResult.data) {
-          const serverMeetings = Array.isArray(serverMeetingsResult.data) ? serverMeetingsResult.data : []
-          
-          // Merge server meetings with local, avoiding duplicates
-          serverMeetings.forEach(serverMeeting => {
-            const isDuplicate = allMeetings.some(localMeeting => 
-              (localMeeting.server_id && localMeeting.server_id === serverMeeting.meeting_id) ||
-              (localMeeting.meeting_id && localMeeting.meeting_id === serverMeeting.meeting_id)
-            )
-            
-            if (!isDuplicate) {
-              allMeetings.push(serverMeeting)
-            }
-          })
-        }
-        
         setAvailableMeetings(allMeetings)
-        console.log('Loaded meetings (combined):', allMeetings.length)
+        console.log('Loaded meetings from local DB:', allMeetings.length)
         
-        // Also load available doctors for new meeting creation
+        // Also load available doctors for new meeting creation (from local DB)
         console.log('Loading doctors for notes modal...')
-        const userResult2 = await AuthService.getCurrentUser()
-        if (userResult2.success && userResult2.user) {
-          console.log('Loading doctors for MR:', userResult2.user.id)
-          const doctorsResult = await MRService.getAssignedDoctors(userResult2.user.id)
-          console.log('Doctors result:', doctorsResult)
-          if (doctorsResult.success && doctorsResult.data) {
-            console.log('Doctors data:', doctorsResult.data)
-            setAvailableDoctors(doctorsResult.data)
-            console.log('Set available doctors, count:', doctorsResult.data.length)
-          } else {
-            console.log('Failed to load doctors:', doctorsResult.error)
-            setAvailableDoctors([])
-          }
+        const doctorsResult = await OfflineFirstService.getDoctors(userResult.user.id)
+        console.log('Doctors result:', doctorsResult)
+        if (doctorsResult.success && doctorsResult.data) {
+          console.log('Doctors data:', doctorsResult.data)
+          setAvailableDoctors(doctorsResult.data)
+          console.log('Set available doctors, count:', doctorsResult.data.length)
+        } else {
+          console.log('Failed to load doctors:', doctorsResult.error)
+          setAvailableDoctors([])
         }
       }
     } catch (error) {
@@ -814,7 +741,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         return
       }
 
-      let meetingId = selectedMeeting?.meeting_id || selectedMeeting
+      let meetingId = selectedMeeting?.meeting_id || selectedMeeting?.id || selectedMeeting
+      
+      // If meetingId is still an object, extract the id
+      if (typeof meetingId === 'object' && meetingId !== null) {
+        meetingId = meetingId.meeting_id || meetingId.id || null
+      }
 
       // Create new meeting if needed
       if (showNewMeetingForm) {
@@ -824,28 +756,54 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           return
         }
 
-        console.log('=== CREATING NEW MEETING FROM ADD NOTES ===')
+        console.log('=== CREATING NEW MEETING FROM ADD NOTES (OFFLINE-FIRST) ===')
         console.log('Meeting data to create:', {
           ...newMeetingForm,
-          doctor_id: selectedDoctor.doctor_id,
+          doctor_id: selectedDoctor.id || selectedDoctor.server_id,
           mr_id: userResult.user.id,
           brochure_id: brochureId,
           brochure_title: brochureTitle
         })
 
-        const newMeetingResult = await MRService.createMeeting({
-          ...newMeetingForm,
-          doctor_id: selectedDoctor.doctor_id,
+        // Use OfflineFirstService to save to local DB first (offline-first architecture)
+        const newMeetingResult = await OfflineFirstService.createMeeting({
           mr_id: userResult.user.id,
-          brochure_id: brochureId,
-          brochure_title: brochureTitle
+          doctor_id: selectedDoctor.id || selectedDoctor.server_id,
+          doctor_server_id: selectedDoctor.server_id,
+          brochure_id: brochureId || undefined,
+          title: newMeetingForm.title.trim(),
+          purpose: newMeetingForm.purpose.trim(),
+          scheduled_date: newMeetingForm.scheduled_date || new Date().toISOString(),
+          duration_minutes: newMeetingForm.duration_minutes || 30,
+          status: 'scheduled',
+          notes: newMeetingForm.notes || (brochureTitle ? `Brochure: ${brochureTitle}` : undefined)
         })
 
-        console.log('Meeting creation result:', newMeetingResult)
+        console.log('Meeting creation result (local DB):', newMeetingResult)
 
         if (newMeetingResult.success && newMeetingResult.data) {
-          meetingId = newMeetingResult.data.meeting_id
-          console.log('SUCCESS: Meeting created with ID:', meetingId)
+          meetingId = newMeetingResult.data.id
+          console.log('SUCCESS: Meeting created locally with ID:', meetingId)
+          
+          // Reload meetings list to include the new meeting
+          await loadAvailableMeetings()
+          
+          // Find the newly created meeting in the list
+          const meetingsResult = await OfflineFirstService.getMeetings(userResult.user.id)
+          if (meetingsResult.success && meetingsResult.data) {
+            const createdMeeting = meetingsResult.data.find(m => m.id === meetingId)
+            if (createdMeeting) {
+              setSelectedMeeting({
+                meeting_id: createdMeeting.id,
+                id: createdMeeting.id,
+                title: createdMeeting.title,
+                doctor_name: `${selectedDoctor.first_name} ${selectedDoctor.last_name}`,
+                hospital: selectedDoctor.hospital,
+                scheduled_date: createdMeeting.scheduled_date,
+                purpose: createdMeeting.purpose
+              })
+            }
+          }
           
           // Notify global state about meeting change
           notifyMeetingChange()
@@ -855,7 +813,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           return
         }
       }
-
+      
+      // Ensure meetingId is a string, not an object
+      if (typeof meetingId === 'object' && meetingId !== null) {
+        meetingId = meetingId.meeting_id || meetingId.id || null
+      }
+      
       if (!meetingId) {
         Alert.alert('Error', 'Please select or create a meeting')
         return
@@ -870,15 +833,15 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       console.log('Note Text:', noteText.trim())
       console.log('Brochure ID:', brochureId)
       
-      const noteResult = await MRService.addSlideNote({
+      // Use OfflineFirstService to save note to local DB first (offline-first architecture)
+      const noteResult = await OfflineFirstService.createMeetingNote({
         meeting_id: meetingId,
         slide_id: currentSlideForNotes.id,
         slide_title: currentSlideForNotes.title,
         slide_order: currentSlideForNotes.order,
-        note_text: noteText.trim(),
         brochure_id: brochureId,
-        slide_image_uri: currentSlideForNotes.imageUri, // Add slide image URI
-        timestamp: new Date().toISOString()
+        note_text: noteText.trim(),
+        slide_image_uri: currentSlideForNotes.imageUri
       })
 
       console.log('Note save result:', noteResult)
@@ -2160,7 +2123,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                 />
                 {selectedSlides.length > 1 && (
                   <Text style={styles.helpText}>
-                    Example: "Product" will become "Product 1", "Product 2", etc.
+                    Example: &quot;Product&quot; will become &quot;Product 1&quot;, &quot;Product 2&quot;, etc.
                   </Text>
                 )}
               </View>
@@ -2267,11 +2230,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                               <TouchableOpacity
                                 style={styles.changeButton}
                                 onPress={() => {
-                                  modalQueue.closeModal('groupModal', () => {
-                                    modalQueue.openModal('groupDoctorSelection')
-                                    setShowGroupDoctorSelectionModal(true)
-                                  })
+                                  setDoctorSelectionContext('group')
                                   setShowGroupModal(false)
+                                  setTimeout(() => {
+                                    setShowDoctorSelectionModal(true)
+                                  }, 100)
                                 }}
                               >
                                 <Text style={styles.changeButtonText}>Change</Text>
@@ -2281,11 +2244,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                             <TouchableOpacity
                               style={styles.selectDoctorButton}
                               onPress={() => {
-                                modalQueue.closeModal('groupModal', () => {
-                                  modalQueue.openModal('groupDoctorSelection')
-                                  setShowGroupDoctorSelectionModal(true)
-                                })
+                                setDoctorSelectionContext('group')
                                 setShowGroupModal(false)
+                                setTimeout(() => {
+                                  setShowDoctorSelectionModal(true)
+                                }, 100)
                               }}
                             >
                               <Ionicons name="person-add" size={20} color="#8b5cf6" />
@@ -2567,159 +2530,79 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
          </Modal>
 
          {/* Doctor Selection Modal */}
-         <Modal visible={showDoctorSelectionModal} transparent animationType="slide">
-           <View style={styles.modalOverlay}>
-             <View style={styles.modalContent}>
-               <View style={styles.modalHeader}>
-                 <Text style={styles.modalTitle}>Select Doctor</Text>
-                 <TouchableOpacity onPress={() => setShowDoctorSelectionModal(false)}>
-                   <Ionicons name="close" size={24} color="#6b7280" />
-                 </TouchableOpacity>
-               </View>
+         <DoctorSelectionModal
+           visible={showDoctorSelectionModal}
+           onClose={() => {
+             if (doctorSelectionContext === 'group') {
+               setShowDoctorSelectionModal(false)
+               setDoctorSelectionContext(null)
+               setTimeout(() => {
+                 setShowGroupModal(true)
+               }, 100)
+             } else {
+               setShowDoctorSelectionModal(false)
+               setDoctorSelectionContext(null)
+             }
+           }}
+           onSelectDoctor={(doctor) => {
+             setSelectedDoctor(doctor)
+             setShowDoctorSelectionModal(false)
+             
+             if (doctorSelectionContext === 'group') {
+               // Return to group creation modal
+               setGroupCreationMode('doctor')
+               setDoctorSelectionContext(null)
+               setTimeout(() => {
+                 setShowGroupModal(true)
+               }, 100)
+             } else {
+               // Return to meeting form (existing behavior)
+               setNewMeetingForm({...newMeetingForm, doctor_id: doctor.id || doctor.server_id})
+               setDoctorSelectionContext(null)
+               setTimeout(() => {
+                 setShowNewMeetingForm(true)
+               }, 100)
+             }
+           }}
+           onAddDoctor={() => {
+             const context = doctorSelectionContext
+             setShowDoctorSelectionModal(false)
+             showDoctorForm(undefined, async (newDoctor) => {
+               // Reload doctors list first
+               await loadAvailableDoctors()
+               
+               // If new doctor was created, set it as selected
+               if (newDoctor) {
+                 setSelectedDoctor(newDoctor)
+                 
+                 if (context === 'group') {
+                   // Return to group creation modal
+                   setGroupCreationMode('doctor')
+                   setDoctorSelectionContext(null)
+                   setTimeout(() => {
+                     setShowGroupModal(true)
+                   }, 100)
+                 } else {
+                   // Return to new meeting form with doctor selected
+                   setNewMeetingForm({...newMeetingForm, doctor_id: newDoctor.id || newDoctor.server_id})
+                   setDoctorSelectionContext(null)
+                   setTimeout(() => {
+                     setShowNewMeetingForm(true)
+                   }, 100)
+                 }
+               } else {
+                 // Otherwise, show doctor selection modal again
+                 setDoctorSelectionContext(context)
+                 setTimeout(() => {
+                   setShowDoctorSelectionModal(true)
+                 }, 100)
+               }
+             })
+           }}
+           availableDoctors={availableDoctors}
+           isLoadingDoctors={isLoadingDoctors}
+         />
 
-               <ScrollView style={styles.modalBody}>
-                 {availableDoctors.length > 0 ? (
-                   availableDoctors.map(doctor => (
-                     <TouchableOpacity
-                       key={doctor.doctor_id}
-                       style={[
-                         styles.doctorSelectionCard,
-                         selectedDoctor?.doctor_id === doctor.doctor_id && styles.doctorSelectionCardSelected
-                       ]}
-                       onPress={() => {
-                         setSelectedDoctor(doctor)
-                         setNewMeetingForm({...newMeetingForm, doctor_id: doctor.doctor_id})
-                         setShowDoctorSelectionModal(false)
-                         // Return to new meeting form
-                         setTimeout(() => {
-                           setShowNewMeetingForm(true)
-                         }, 100)
-                       }}
-                     >
-                       <View style={styles.doctorInfo}>
-                         <View style={styles.doctorAvatar}>
-                           {doctor.profile_image_url ? (
-                             <Image source={{ uri: doctor.profile_image_url }} style={styles.doctorAvatarImage} />
-                           ) : (
-                             <Ionicons name="person" size={20} color="#8b5cf6" />
-                           )}
-                         </View>
-                         <View style={styles.doctorDetails}>
-                           <Text style={styles.doctorName}>{doctor.first_name} {doctor.last_name}</Text>
-                           <Text style={styles.doctorSpecialty}>{doctor.specialty}</Text>
-                           <Text style={styles.doctorHospital}>{doctor.hospital}</Text>
-                         </View>
-                       </View>
-                       <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
-                     </TouchableOpacity>
-                   ))
-                 ) : (
-                   <View style={styles.emptyState}>
-                     <Ionicons name="person-outline" size={48} color="#9ca3af" />
-                     <Text style={styles.emptyStateText}>No doctors available</Text>
-                     <Text style={styles.emptyStateSubtext}>Add doctors first to create meetings</Text>
-                   </View>
-                 )}
-               </ScrollView>
-
-               <View style={styles.modalActions}>
-                 <TouchableOpacity
-                   style={styles.addNewButton}
-                   onPress={() => {
-                     setDoctorModalSource('meeting')
-                     modalQueue.closeModal('doctorSelection', () => {
-                       modalQueue.openModal('addDoctor')
-                       setShowAddDoctorModal(true)
-                     })
-                     setShowDoctorSelectionModal(false)
-                   }}
-                 >
-                   <Ionicons name="add" size={20} color="#8b5cf6" />
-                   <Text style={styles.addNewButtonText}>Add New Doctor</Text>
-                 </TouchableOpacity>
-               </View>
-             </View>
-           </View>
-         </Modal>
-
-        {/* Group Doctor Selection Modal */}
-        <Modal visible={showGroupDoctorSelectionModal} transparent animationType="slide">
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-               <View style={styles.modalHeader}>
-                 <Text style={styles.modalTitle}>Select Doctor for Group</Text>
-                 <TouchableOpacity onPress={() => setShowGroupDoctorSelectionModal(false)}>
-                   <Ionicons name="close" size={24} color="#6b7280" />
-                 </TouchableOpacity>
-               </View>
-
-               <ScrollView style={styles.modalBody} contentContainerStyle={styles.modalBodyContent}>
-                 {availableDoctors.length > 0 ? (
-                   availableDoctors.map(doctor => (
-                     <TouchableOpacity
-                       key={doctor.doctor_id}
-                       style={[
-                         styles.doctorSelectionCard,
-                         selectedDoctor?.doctor_id === doctor.doctor_id && styles.doctorSelectionCardSelected
-                       ]}
-                       onPress={() => {
-                         setSelectedDoctor(doctor)
-                         setShowGroupDoctorSelectionModal(false)
-                         // Return to group modal
-                         setTimeout(() => {
-                           setShowGroupModal(true)
-                         }, 100)
-                       }}
-                     >
-                       <View style={styles.doctorInfo}>
-                         <View style={styles.doctorAvatar}>
-                           {doctor.profile_image_url ? (
-                             <Image source={{ uri: doctor.profile_image_url }} style={styles.doctorAvatarImage} />
-                           ) : (
-                             <Ionicons name="person" size={20} color="#8b5cf6" />
-                           )}
-                         </View>
-                         <View style={styles.doctorDetails}>
-                           <Text style={styles.doctorName}>
-                             {doctor.first_name} {doctor.last_name}
-                           </Text>
-                           <Text style={styles.doctorSpecialty}>{doctor.specialty}</Text>
-                           <Text style={styles.doctorHospital}>{doctor.hospital}</Text>
-                         </View>
-                       </View>
-                       {selectedDoctor?.doctor_id === doctor.doctor_id && (
-                         <Ionicons name="checkmark-circle" size={24} color="#8b5cf6" />
-                       )}
-                     </TouchableOpacity>
-                   ))
-                 ) : (
-                   <View style={styles.emptyState}>
-                     <Ionicons name="person-outline" size={48} color="#d1d5db" />
-                     <Text style={styles.emptyStateText}>No doctors available</Text>
-                     <Text style={styles.emptyStateSubtext}>Add a doctor to continue</Text>
-                   </View>
-                 )}
-               </ScrollView>
-
-               <View style={styles.modalActions}>
-                 <TouchableOpacity
-                   style={styles.addNewButton}
-                   onPress={() => {
-                     setDoctorModalSource('group')
-                     modalQueue.closeModal('groupDoctorSelection', () => {
-                       modalQueue.openModal('addDoctor')
-                       setShowAddDoctorModal(true)
-                     })
-                     setShowGroupDoctorSelectionModal(false)
-                   }}
-                 >
-                   <Ionicons name="add" size={20} color="#8b5cf6" />
-                   <Text style={styles.addNewButtonText}>Add New Doctor</Text>
-                 </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
 
         {/* Meeting Selection Modal */}
          <Modal visible={showMeetingSelectionModal} transparent animationType="slide">
@@ -2739,9 +2622,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
                <ScrollView style={styles.modalBody}>
                  {availableMeetings.length > 0 ? (
-                   availableMeetings.map(meeting => (
+                   availableMeetings.map((meeting, index) => {
+                     const meetingKey = meeting.meeting_id || meeting.id || `meeting-${index}`
+                     return (
                      <TouchableOpacity
-                       key={meeting.meeting_id}
+                       key={meetingKey}
                        style={[
                          styles.meetingSelectionCard,
                          selectedMeeting?.meeting_id === meeting.meeting_id && styles.meetingSelectionCardSelected
@@ -2761,7 +2646,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                        </View>
                        <Ionicons name="chevron-forward" size={16} color="#9ca3af" />
                      </TouchableOpacity>
-                   ))
+                     )
+                   })
                  ) : (
                    <View style={styles.emptyState}>
                      <Ionicons name="calendar-outline" size={48} color="#9ca3af" />
@@ -2775,27 +2661,79 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                  <TouchableOpacity
                    style={styles.addNewButton}
                    onPress={() => {
-                     setShowMeetingSelectionModal(false)
-                     if (!selectedDoctor) {
-                       Alert.alert('Select Doctor First', 'Please select a doctor before creating a meeting', [
-                         { 
-                           text: 'Select Doctor', 
-                           onPress: () => {
-                             setShowMeetingSelectionModal(false)
-                             setDoctorModalSource('meeting')
-                             setTimeout(() => {
-                               setShowDoctorSelectionModal(true)
-                             }, 100)
-                           }
-                         },
-                         { text: 'Cancel', style: 'cancel' }
-                       ])
-                       return
-                     }
-                     setShowMeetingSelectionModal(false)
-                     setTimeout(() => {
-                       setShowNewMeetingForm(true)
-                     }, 100)
+                    setShowMeetingSelectionModal(false)
+                    showMeetingForm(undefined, undefined, async (createdMeeting?: any) => {
+                      // Reload meetings list to include the newly created meeting
+                      await loadAvailableMeetings()
+                      
+                      // Get the updated meetings list directly
+                      const userResult = await AuthService.getCurrentUser()
+                      let updatedMeetings: any[] = []
+                      if (userResult.success && userResult.user && userResult.user.role === 'mr') {
+                        const meetingsResult = await OfflineFirstService.getMeetings(userResult.user.id)
+                        if (meetingsResult.success && meetingsResult.data) {
+                          updatedMeetings = Array.isArray(meetingsResult.data) ? meetingsResult.data : []
+                        }
+                      }
+                      
+                      // If a meeting was created, find it in the reloaded list and set it as selected
+                      if (createdMeeting) {
+                        // Try to find the meeting in the reloaded list by ID
+                        const meetingId = createdMeeting.id || createdMeeting.meeting_id
+                        const foundMeeting = updatedMeetings.find(m => 
+                          (m.id === meetingId) || (m.meeting_id === meetingId)
+                        )
+                        
+                        if (foundMeeting) {
+                          // Transform LocalMeeting to match expected format (with meeting_id, doctor_name, hospital)
+                          // LocalMeeting has 'id' but UI expects 'meeting_id'
+                          // We need to get doctor info to populate doctor_name and hospital
+                          const doctorId = foundMeeting.doctor_id
+                          let doctorName = ''
+                          let hospital = ''
+                          
+                          // Try to get doctor info from availableDoctors or load it
+                          const doctor = availableDoctors.find(d => 
+                            (d.id === doctorId) || (d.server_id === doctorId)
+                          )
+                          
+                          if (doctor) {
+                            doctorName = `${doctor.first_name || ''} ${doctor.last_name || ''}`.trim()
+                            hospital = doctor.hospital || ''
+                          }
+                          
+                          const transformedMeeting = {
+                            meeting_id: foundMeeting.id,
+                            id: foundMeeting.id,
+                            title: foundMeeting.title,
+                            doctor_name: doctorName || createdMeeting.doctor_name || '',
+                            hospital: hospital || createdMeeting.hospital || '',
+                            scheduled_date: foundMeeting.scheduled_date,
+                            purpose: foundMeeting.purpose,
+                            doctor_id: foundMeeting.doctor_id
+                          }
+                          setSelectedMeeting(transformedMeeting)
+                        } else {
+                          // If not found in list yet, transform the createdMeeting to match expected format
+                          const transformedMeeting = {
+                            meeting_id: createdMeeting.id || createdMeeting.meeting_id,
+                            id: createdMeeting.id || createdMeeting.meeting_id,
+                            title: createdMeeting.title,
+                            doctor_name: createdMeeting.doctor_name || '',
+                            hospital: createdMeeting.hospital || '',
+                            scheduled_date: createdMeeting.scheduled_date,
+                            purpose: createdMeeting.purpose,
+                            doctor_id: createdMeeting.doctor_id
+                          }
+                          setSelectedMeeting(transformedMeeting)
+                        }
+                      }
+                      
+                      // Return to notes modal with the meeting selected
+                      setTimeout(() => {
+                        setShowNotesModal(true)
+                      }, 100)
+                    })
                    }}
                  >
                    <Ionicons name="add" size={20} color="#8b5cf6" />
@@ -2831,11 +2769,28 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                          <TouchableOpacity
                            style={styles.changeDoctorButton}
                            onPress={() => {
+                             setDoctorSelectionContext('meeting')
                              setShowNewMeetingForm(false)
-                             setDoctorModalSource('meeting')
-                             setTimeout(() => {
-                               setShowDoctorSelectionModal(true)
-                             }, 100)
+                    showDoctorForm(undefined, async (newDoctor) => {
+                      // Reload doctors list first
+                      await loadAvailableDoctors()
+                      
+                      // If new doctor was created, set it as selected
+                      if (newDoctor) {
+                        setSelectedDoctor(newDoctor)
+                        setNewMeetingForm({...newMeetingForm, doctor_id: newDoctor.id || newDoctor.server_id})
+                        setDoctorSelectionContext(null)
+                        // Return to new meeting form with doctor selected
+                        setTimeout(() => {
+                          setShowNewMeetingForm(true)
+                        }, 100)
+                      } else {
+                        // Otherwise, show doctor selection modal
+                        setTimeout(() => {
+                          setShowDoctorSelectionModal(true)
+                        }, 100)
+                      }
+                    })
                            }}
                          >
                            <Text style={styles.changeDoctorText}>Change</Text>
@@ -2859,8 +2814,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                      <TouchableOpacity
                        style={styles.selectionButton}
                        onPress={() => {
+                         setDoctorSelectionContext('meeting')
                          setShowNewMeetingForm(false)
-                         setDoctorModalSource('meeting')
                          setTimeout(() => {
                            setShowDoctorSelectionModal(true)
                          }, 100)
@@ -2924,25 +2879,43 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                        const userResult = await AuthService.getCurrentUser()
                        if (!userResult.success || !userResult.user) return
 
-                       const meetingResult = await MRService.createMeeting({
-                         ...newMeetingForm,
-                         doctor_id: selectedDoctor.doctor_id,
+                       // Use OfflineFirstService to save to local DB first (offline-first architecture)
+                       const meetingResult = await OfflineFirstService.createMeeting({
                          mr_id: userResult.user.id,
-                         brochure_id: brochureId,
-                         brochure_title: brochureTitle
+                         doctor_id: selectedDoctor.id || selectedDoctor.server_id,
+                         doctor_server_id: selectedDoctor.server_id,
+                         brochure_id: brochureId || undefined,
+                         title: newMeetingForm.title.trim(),
+                         purpose: newMeetingForm.purpose.trim(),
+                         scheduled_date: newMeetingForm.scheduled_date || new Date().toISOString(),
+                         duration_minutes: newMeetingForm.duration_minutes || 30,
+                         status: 'scheduled',
+                         notes: newMeetingForm.notes || (brochureTitle ? `Brochure: ${brochureTitle}` : undefined)
                        })
 
-                       if (meetingResult.success && meetingResult.data) {
-                         const newMeeting = {
-                           meeting_id: meetingResult.data.meeting_id,
-                           title: newMeetingForm.title,
-                           doctor_name: `${selectedDoctor.first_name} ${selectedDoctor.last_name}`,
-                           hospital: selectedDoctor.hospital,
-                           scheduled_date: newMeetingForm.scheduled_date,
-                           purpose: newMeetingForm.purpose
+                       if (meetingResult.success && meetingResult.data?.id) {
+                         const newMeetingId = meetingResult.data.id
+                         // Reload meetings list to include the new meeting
+                         await loadAvailableMeetings()
+                         
+                         // Find the newly created meeting
+                         const meetingsResult = await OfflineFirstService.getMeetings(userResult.user.id)
+                         if (meetingsResult.success && meetingsResult.data) {
+                           const createdMeeting = meetingsResult.data.find(m => m.id === newMeetingId)
+                           if (createdMeeting) {
+                             const newMeeting = {
+                               meeting_id: createdMeeting.id,
+                               id: createdMeeting.id,
+                               title: createdMeeting.title,
+                               doctor_name: `${selectedDoctor.first_name} ${selectedDoctor.last_name}`,
+                               hospital: selectedDoctor.hospital,
+                               scheduled_date: createdMeeting.scheduled_date,
+                               purpose: createdMeeting.purpose
+                             }
+                             setSelectedMeeting(newMeeting)
+                             setAvailableMeetings(prev => [newMeeting, ...prev])
+                           }
                          }
-                         setSelectedMeeting(newMeeting)
-                         setAvailableMeetings(prev => [newMeeting, ...prev])
                          
                          // Notify global state about meeting change
                          notifyMeetingChange()
@@ -2981,136 +2954,6 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
              </View>
            </View>
          </Modal>
-
-         {/* Add Doctor Modal */}
-         <Modal visible={showAddDoctorModal} transparent animationType="slide">
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Add New Doctor</Text>
-                <TouchableOpacity onPress={() => {
-                  setShowAddDoctorModal(false)
-                  resetDoctorForm()
-                }}>
-                  <Ionicons name="close" size={24} color="#6b7280" />
-                </TouchableOpacity>
-              </View>
-
-              <ScrollView style={styles.modalBody}>
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>First Name *</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Enter doctor's first name"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.first_name}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, first_name: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Last Name *</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Enter doctor's last name"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.last_name}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, last_name: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Specialty *</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="e.g., Cardiology, Neurology"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.specialty}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, specialty: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Hospital/Clinic *</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="Enter hospital or clinic name"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.hospital}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, hospital: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Phone Number</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="+1 (555) 123-4567"
-                    keyboardType="phone-pad"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.phone}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, phone: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Email</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="doctor@hospital.com"
-                    keyboardType="email-address"
-                    autoCapitalize="none"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.email}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, email: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Location</Text>
-                  <TextInput
-                    style={styles.input}
-                    placeholder="City, State"
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.location}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, location: text })}
-                  />
-                </View>
-
-                <View style={styles.inputGroup}>
-                  <Text style={styles.inputLabel}>Notes</Text>
-                  <TextInput
-                    style={[styles.input, styles.textArea]}
-                    placeholder="Any additional notes about the doctor..."
-                    multiline
-                    numberOfLines={3}
-                    placeholderTextColor="#9ca3af"
-                    value={doctorForm.notes}
-                    onChangeText={(text) => setDoctorForm({ ...doctorForm, notes: text })}
-                  />
-                </View>
-              </ScrollView>
-
-              <View style={styles.modalActions}>
-                <TouchableOpacity
-                  style={styles.cancelButton}
-                  onPress={() => {
-                    setShowAddDoctorModal(false)
-                    resetDoctorForm()
-                  }}
-                >
-                  <Text style={styles.cancelButtonText}>Cancel</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.saveButton}
-                  onPress={handleSaveNewDoctor}
-                >
-                  <Text style={styles.saveButtonText}>Add Doctor</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
 
         {/* Fullscreen Viewer Modal */}
         <Modal visible={showFullscreenViewer} transparent animationType="fade">
@@ -3930,16 +3773,16 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     backgroundColor: '#ffffff',
-    borderRadius: 16,
-    width: '90%',
-    maxHeight: '80%',
+    borderRadius: getModalBorderRadius(),
+    width: getModalWidth(90),
+    maxHeight: getModalMaxHeight(80),
   },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: getModalPadding(),
+    paddingVertical: isTablet() ? 20 : 16,
     borderBottomWidth: 1,
     borderBottomColor: '#e5e7eb',
   },
@@ -3949,7 +3792,7 @@ const styles = StyleSheet.create({
     color: '#1f2937',
   },
   modalBody: {
-    padding: 20,
+    padding: getModalPadding(),
   },
   modalBodyContent: {
     paddingBottom: 20,
@@ -3978,8 +3821,8 @@ const styles = StyleSheet.create({
   },
   modalActions: {
     flexDirection: 'row',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: getModalPadding(),
+    paddingVertical: isTablet() ? 20 : 16,
     borderTopWidth: 1,
     borderTopColor: '#e5e7eb',
     gap: 12,

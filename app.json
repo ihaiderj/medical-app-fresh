@@ -16,6 +16,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.ihaiderj.medicalapp.dev",
+      "deploymentTarget": "16.0",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -43,11 +44,20 @@
       "expo-dev-client",
       "expo-document-picker",
       "expo-image-picker",
-      "expo-file-system"
+      "expo-file-system",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "16.0"
+          }
+        }
+      ],
+      "expo-sqlite"
     ],
     "extra": {
       "eas": {
-        "projectId": "e1898a77-f735-4f1a-bea4-03517c9161f2"
+        "projectId": "264174ba-9998-4c8d-ae1f-4cbcf3c52715"
       }
     }
   }

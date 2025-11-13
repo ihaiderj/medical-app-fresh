@@ -1,78 +1,277 @@
 import { View, Text, ScrollView, TouchableOpacity, StyleSheet, SafeAreaView, Alert, ActivityIndicator } from "react-native"
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from "../../services/MRService"
 import { SmartSyncService } from "../../services/smartSyncService"
 import { SessionManagementService } from "../../services/sessionManagementService"
 import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus"
+import { useAppData } from '../../context/AppDataContext';
+import { OfflineFirstService } from '../../services/offlineFirstService';
+import { LocalDatabaseService } from '../../services/localDatabaseService';
+import { ComprehensiveServerSyncService } from '../../services/comprehensiveServerSyncService';
+import { AdvancedSyncService } from '../../services/advancedSyncService';
+import { FirstTimeLoginService } from '../../services/firstTimeLoginService';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 interface MRDashboardScreenProps {
   navigation: any
 }
 
 export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps) {
+  const { user, onMeetingChange, onDoctorChange, onBrochureChange, onActivityChange } = useAppData();
   const [dashboardStats, setDashboardStats] = useState<MRDashboardStats | null>(null)
   const [recentActivities, setRecentActivities] = useState<MRRecentActivity[]>([])
   const [upcomingMeetings, setUpcomingMeetings] = useState<MRUpcomingMeeting[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [userProfile, setUserProfile] = useState<any>(null)
   const [availableBrochuresCount, setAvailableBrochuresCount] = useState(0)
+  const [isSyncing, setIsSyncing] = useState(false)
+  const [syncProgress, setSyncProgress] = useState<{ step: string; message: string; progress: number } | null>(null)
+
+  // Set user profile from context immediately
+  useEffect(() => {
+    if (user && !userProfile) {
+      setUserProfile(user);
+    }
+  }, [user]);
+
+  const loadDashboardData = useCallback(async () => {
+    console.log('🔍 DASHBOARD DEBUG: Starting data load...');
+    console.log('🔍 DASHBOARD DEBUG: User ID:', user?.id);
+    console.log('🔍 DASHBOARD DEBUG: User object:', user);
+    
+    if (!user?.id) {
+      console.log('❌ DASHBOARD DEBUG: No user ID, waiting for user data...');
+      return;
+    }
+    
+    setIsLoading(true);
+    console.log('🔍 DASHBOARD DEBUG: Loading state set to true');
+    
+    try {
+      // Load user profile from local database
+      console.log('🔍 DASHBOARD DEBUG: Loading user profile...');
+      try {
+        const localUser = await LocalDatabaseService.getUserById(user.id);
+        console.log('🔍 DASHBOARD DEBUG: Local user from DB:', localUser);
+        if (localUser) {
+          setUserProfile(localUser);
+          console.log('✅ DASHBOARD DEBUG: User profile set from local DB');
+        } else if (user) {
+          // Fallback to user from context
+          setUserProfile(user);
+          console.log('✅ DASHBOARD DEBUG: User profile set from context (fallback)');
+        }
+      } catch (error) {
+        console.error('❌ DASHBOARD DEBUG: Failed to load user profile:', error);
+        // Fallback to user from context
+        if (user) {
+          setUserProfile(user);
+          console.log('✅ DASHBOARD DEBUG: User profile set from context (error fallback)');
+        }
+      }
+
+      console.log('🔍 DASHBOARD DEBUG: Loading stats...');
+      const statsResult = await OfflineFirstService.getDashboardStats(user.id);
+      console.log('🔍 DASHBOARD DEBUG: Stats result:', statsResult);
+      if (statsResult.success && statsResult.data) {
+        setDashboardStats(statsResult.data);
+        console.log('✅ DASHBOARD DEBUG: Stats loaded successfully:', statsResult.data);
+      } else {
+        console.error('❌ DASHBOARD DEBUG: Failed to load dashboard stats:', statsResult.error);
+        console.log('🔍 DASHBOARD DEBUG: Setting default stats (all zeros)');
+        setDashboardStats({
+          doctors_connected: 0,
+          scheduled_meetings: 0,
+          brochures_available: 0,
+          active_presentations: 0,
+          monthly_meetings: 0,
+          completed_meetings: 0,
+          brochures_uploaded: 0
+        });
+      }
+      console.log('🔍 DASHBOARD DEBUG: Stats loading completed.');
+
+      console.log('🔍 DASHBOARD DEBUG: Loading activities...');
+      const activitiesResult = await OfflineFirstService.getRecentActivities(5, user.id);
+      console.log('🔍 DASHBOARD DEBUG: Activities result:', activitiesResult);
+      if (activitiesResult.success && activitiesResult.data) {
+        setRecentActivities(activitiesResult.data);
+        console.log('✅ DASHBOARD DEBUG: Activities loaded successfully:', activitiesResult.data.length, 'items');
+      } else {
+        console.error('❌ DASHBOARD DEBUG: Failed to load recent activities:', activitiesResult.error);
+        console.log('🔍 DASHBOARD DEBUG: Setting empty activities array');
+        setRecentActivities([]);
+      }
+      console.log('🔍 DASHBOARD DEBUG: Activities loading completed.');
+
+      console.log('🔍 DASHBOARD DEBUG: Loading meetings...');
+      const meetingsResult = await OfflineFirstService.getUpcomingMeetings(3, user.id);
+      console.log('🔍 DASHBOARD DEBUG: Meetings result:', meetingsResult);
+      if (meetingsResult.success && meetingsResult.data) {
+        setUpcomingMeetings(meetingsResult.data);
+        console.log('✅ DASHBOARD DEBUG: Meetings loaded successfully:', meetingsResult.data.length, 'items');
+      } else {
+        console.error('❌ DASHBOARD DEBUG: Failed to load upcoming meetings:', meetingsResult.error);
+        console.log('🔍 DASHBOARD DEBUG: Setting empty meetings array');
+        setUpcomingMeetings([]);
+      }
+      console.log('🔍 DASHBOARD DEBUG: Meetings loading completed.');
+
+      // Load available brochures count - use saved brochures count from stats
+      console.log('🔍 DASHBOARD DEBUG: Setting brochure count...');
+      if (statsResult.success && statsResult.data) {
+        const brochureCount = statsResult.data.brochures_available || 0;
+        setAvailableBrochuresCount(brochureCount);
+        console.log('✅ DASHBOARD DEBUG: Brochure count set to:', brochureCount);
+      } else {
+        setAvailableBrochuresCount(0);
+        console.log('🔍 DASHBOARD DEBUG: Brochure count set to 0 (fallback)');
+      }
+
+    } catch (error) {
+      console.error('❌ DASHBOARD DEBUG: Error loading dashboard data:', error);
+      console.log('🔍 DASHBOARD DEBUG: Setting fallback values due to error');
+      setDashboardStats({
+        doctors_connected: 0,
+        scheduled_meetings: 0,
+        brochures_available: 0,
+        active_presentations: 0,
+        monthly_meetings: 0,
+        completed_meetings: 0,
+        brochures_uploaded: 0
+      });
+      setRecentActivities([]);
+      setUpcomingMeetings([]);
+      setAvailableBrochuresCount(0);
+    } finally {
+      setIsLoading(false);
+      console.log('🔍 DASHBOARD DEBUG: Loading state set to false');
+      console.log('🔍 DASHBOARD DEBUG: Final state - isLoading:', false);
+      console.log('🔍 DASHBOARD DEBUG: Final state - userProfile:', userProfile);
+      console.log('🔍 DASHBOARD DEBUG: Final state - dashboardStats:', dashboardStats);
+      console.log('🔍 DASHBOARD DEBUG: Final state - recentActivities count:', recentActivities.length);
+      console.log('🔍 DASHBOARD DEBUG: Final state - upcomingMeetings count:', upcomingMeetings.length);
+      console.log('🔍 DASHBOARD DEBUG: Final state - availableBrochuresCount:', availableBrochuresCount);
+      console.log('✅ DASHBOARD DEBUG: Data loading completed.');
+    }
+  }, [user?.id]);
 
   // Load dashboard data on component mount
   useEffect(() => {
     loadDashboardData()
-  }, [])
+  }, [loadDashboardData])
 
-  const loadDashboardData = async () => {
-    setIsLoading(true)
+  // Subscribe to meeting changes to refresh dashboard stats
+  useEffect(() => {
+    const unsubscribe = onMeetingChange(() => {
+      console.log('MRDashboard: Received meeting change notification, refreshing dashboard...');
+      loadDashboardData();
+    });
+    return unsubscribe;
+  }, [onMeetingChange, loadDashboardData])
+
+  // Subscribe to doctor changes to refresh dashboard stats
+  useEffect(() => {
+    const unsubscribe = onDoctorChange(() => {
+      console.log('MRDashboard: Received doctor change notification, refreshing dashboard...');
+      loadDashboardData();
+    });
+    return unsubscribe;
+  }, [onDoctorChange, loadDashboardData])
+
+  // Subscribe to brochure changes to refresh dashboard stats
+  useEffect(() => {
+    const unsubscribe = onBrochureChange(() => {
+      console.log('MRDashboard: Received brochure change notification, refreshing dashboard...');
+      loadDashboardData();
+    });
+    return unsubscribe;
+  }, [onBrochureChange, loadDashboardData])
+
+  // Subscribe to activity changes to refresh dashboard stats
+  useEffect(() => {
+    const unsubscribe = onActivityChange(() => {
+      console.log('MRDashboard: Received activity change notification, refreshing dashboard...');
+      loadDashboardData();
+    });
+    return unsubscribe;
+  }, [onActivityChange, loadDashboardData])
+
+  const debugReloadData = async () => {
+    console.log('🔍 DASHBOARD DEBUG: Manual reload triggered');
+    console.log('🔍 DASHBOARD DEBUG: Current state before reload:');
+    console.log('  - isLoading:', isLoading);
+    console.log('  - userProfile:', userProfile);
+    console.log('  - dashboardStats:', dashboardStats);
+    console.log('  - recentActivities count:', recentActivities.length);
+    console.log('  - upcomingMeetings count:', upcomingMeetings.length);
+    console.log('  - availableBrochuresCount:', availableBrochuresCount);
+    
+    await loadDashboardData();
+    
+    console.log('🔍 DASHBOARD DEBUG: Reload completed');
+    Alert.alert("Debug", "Dashboard data reloaded. Check logs for details.");
+  };
+
+  const handleManualSync = async () => {
+    if (!user?.id || isSyncing) return;
+    
+    console.log('🚀 MANUAL SYNC DEBUG: Starting manual sync (upload-only) for user:', user.id);
+    setIsSyncing(true);
+    setSyncProgress({ step: 'Starting', message: 'Preparing sync...', progress: 0 });
+    
     try {
-      // Get user profile
-      const userResult = await AuthService.getCurrentUser()
-      if (userResult.success) {
-        setUserProfile(userResult.user)
+      // Upload local changes to server (this will reduce pending count)
+      setSyncProgress({ step: 'Uploading', message: 'Uploading local changes to server...', progress: 50 });
+      console.log('🚀 MANUAL SYNC DEBUG: Uploading local changes...');
+      
+      // Perform upload-only sync (no download - faster and matches offline-first principle)
+      const syncResult = await AdvancedSyncService.uploadPendingChangesOnly(user.id);
+      
+      if (syncResult.success) {
+        console.log('✅ MANUAL SYNC DEBUG: Manual sync completed successfully');
+        console.log('📊 MANUAL SYNC DEBUG: Synced operations:', syncResult.syncedOperations);
+        console.log('📊 MANUAL SYNC DEBUG: Failed operations:', syncResult.failedOperations);
         
-        // Load MR-specific dashboard data
-        const [
-          statsResult,
-          activitiesResult,
-          meetingsResult,
-          brochuresResult
-        ] = await Promise.all([
-          MRService.getDashboardStats(userResult.user.id),
-          MRService.getRecentActivities(userResult.user.id, 5),
-          MRService.getUpcomingMeetings(userResult.user.id, 3),
-          MRService.getAssignedBrochures(userResult.user.id)
-        ])
-
-        // Set dashboard stats
-        if (statsResult.success && statsResult.data) {
-          setDashboardStats(statsResult.data)
-        }
-
-        // Set recent activities
-        if (activitiesResult.success && activitiesResult.data) {
-          setRecentActivities(activitiesResult.data)
-        }
-
-        // Set upcoming meetings
-        if (meetingsResult.success && meetingsResult.data) {
-          setUpcomingMeetings(meetingsResult.data)
-        }
-
-        // Set available brochures count
-        if (brochuresResult.success && brochuresResult.data) {
-          setAvailableBrochuresCount(brochuresResult.data.length)
-        }
+        // Update last sync timestamp
+        await FirstTimeLoginService.updateLastSyncTimestamp();
+        
+        // Reload dashboard data to show updated information
+        await loadDashboardData();
+        
+        setSyncProgress({ step: 'Complete', message: `Sync completed! ${syncResult.syncedOperations} operations synced.`, progress: 100 });
+        
+        // Clear progress after 3 seconds
+        setTimeout(() => {
+          setSyncProgress(null);
+        }, 3000);
+      } else {
+        console.error('❌ MANUAL SYNC DEBUG: Manual sync failed:', syncResult.errors);
+        const errorMessage = syncResult.errors.length > 0 
+          ? syncResult.errors.join(', ') 
+          : 'Unknown error';
+        setSyncProgress({ step: 'Error', message: `Sync failed: ${errorMessage}`, progress: 0 });
+        
+        // Clear error after 5 seconds
+        setTimeout(() => {
+          setSyncProgress(null);
+        }, 5000);
       }
     } catch (error) {
-      console.error('MR Dashboard data loading error:', error)
-      Alert.alert("Error", "Failed to load dashboard data")
+      console.error('❌ MANUAL SYNC DEBUG: Manual sync error:', error);
+      setSyncProgress({ step: 'Error', message: `Sync error: ${error instanceof Error ? error.message : 'Unknown error'}`, progress: 0 });
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setSyncProgress(null);
+      }, 5000);
     } finally {
-      setIsLoading(false)
+      setIsSyncing(false);
     }
-  }
+  };
 
   const handleLogout = async () => {
     Alert.alert(
@@ -179,17 +378,54 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     return 'Good Evening'
   }
 
+  const handleDumpAsyncStorage = async () => {
+    console.log("========================================");
+    console.log("DUMPING ASYNC STORAGE FOR atul@gmail.com");
+    console.log("========================================");
+    try {
+      const allKeys = await AsyncStorage.getAllKeys();
+      const allData = await AsyncStorage.multiGet(allKeys);
+
+      allData.forEach(([key, value]) => {
+        console.log(`\n--- KEY: ${key} ---`);
+        try {
+          // Try to parse JSON for better readability
+          console.log(JSON.parse(value || '{}'));
+        } catch {
+          // If not JSON, just log the raw value
+          console.log(value);
+        }
+      });
+      Alert.alert("AsyncStorage Dumped", "Check the Metro logs for the complete data dump.");
+    } catch (e) {
+      console.error("Failed to dump AsyncStorage", e);
+      Alert.alert("Error", "Could not dump AsyncStorage. Check logs.");
+    }
+    console.log("========================================");
+  };
+
+
+  // Debug logging for stats calculation
+  console.log('🔍 DASHBOARD RENDER DEBUG: dashboardStats:', dashboardStats);
+  console.log('🔍 DASHBOARD RENDER DEBUG: availableBrochuresCount:', availableBrochuresCount);
+  console.log('🔍 DASHBOARD RENDER DEBUG: isLoading:', isLoading);
+  console.log('🔍 DASHBOARD RENDER DEBUG: userProfile:', userProfile);
+  console.log('🔍 DASHBOARD RENDER DEBUG: recentActivities count:', recentActivities.length);
+  console.log('🔍 DASHBOARD RENDER DEBUG: upcomingMeetings count:', upcomingMeetings.length);
+
   const stats = dashboardStats ? [
-    { label: "Brochures Available", value: availableBrochuresCount.toString(), icon: "document", color: "#8b5cf6" },
-    { label: "Scheduled Meetings", value: dashboardStats.scheduled_meetings.toString(), icon: "calendar", color: "#d97706" },
-    { label: "Doctors Connected", value: dashboardStats.doctors_connected.toString(), icon: "people", color: "#ef4444" },
-    { label: "This Month Meetings", value: dashboardStats.monthly_meetings.toString(), icon: "trending-up", color: "#6b7280" },
+    { label: "Brochures Available", value: (availableBrochuresCount || 0).toString(), icon: "document", color: "#8b5cf6" },
+    { label: "Scheduled Meetings", value: (dashboardStats.scheduled_meetings || 0).toString(), icon: "calendar", color: "#d97706" },
+    { label: "Doctors Connected", value: (dashboardStats.doctors_connected || 0).toString(), icon: "people", color: "#ef4444" },
+    // { label: "This Month Meetings", value: (dashboardStats.monthly_meetings || 0).toString(), icon: "trending-up", color: "#6b7280" },
   ] : [
-    { label: "Brochures Available", value: availableBrochuresCount.toString(), icon: "document", color: "#8b5cf6" },
+    { label: "Brochures Available", value: (availableBrochuresCount || 0).toString(), icon: "document", color: "#8b5cf6" },
     { label: "Scheduled Meetings", value: "0", icon: "calendar", color: "#d97706" },
     { label: "Doctors Connected", value: "0", icon: "people", color: "#ef4444" },
-    { label: "This Month Meetings", value: "0", icon: "trending-up", color: "#6b7280" },
+    // { label: "This Month Meetings", value: "0", icon: "trending-up", color: "#6b7280" },
   ]
+
+  console.log('🔍 DASHBOARD RENDER DEBUG: Calculated stats array:', stats);
 
   const quickActions = [
     { title: "Schedule Meeting", icon: "calendar-outline", action: () => navigation.navigate("Doctors") },
@@ -197,6 +433,16 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     { title: "Upload Brochure", icon: "cloud-upload-outline", action: () => navigation.navigate("AddBrochure") },
     { title: "Meeting Records", icon: "list-outline", action: () => navigation.navigate("Meetings") },
   ]
+
+  // Debug logging for what will be rendered
+  const displayName = userProfile ? `${userProfile.first_name || ''} ${userProfile.last_name || ''}`.trim() : 
+                     (user ? `${user.first_name || ''} ${user.last_name || ''}`.trim() : 'MR User');
+  
+  console.log('🔍 DASHBOARD RENDER DEBUG: Display name will be:', displayName);
+  console.log('🔍 DASHBOARD RENDER DEBUG: Will show loading?', isLoading);
+  console.log('🔍 DASHBOARD RENDER DEBUG: Will show stats?', !isLoading && stats.length > 0);
+  console.log('🔍 DASHBOARD RENDER DEBUG: Will show activities?', !isLoading && recentActivities.length > 0);
+  console.log('🔍 DASHBOARD RENDER DEBUG: Will show meetings?', !isLoading && upcomingMeetings.length > 0);
 
   return (
     <View style={styles.container}>
@@ -208,10 +454,24 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
           <View>
             <Text style={styles.greeting}>{getGreeting()}</Text>
             <Text style={styles.userName}>
-              {userProfile ? `${userProfile.first_name} ${userProfile.last_name}` : 'MR User'}
+              {displayName}
             </Text>
           </View>
           <View style={styles.headerActions}>
+            <TouchableOpacity style={styles.debugButton} onPress={debugReloadData}>
+              <Ionicons name="refresh" size={24} color="#3b82f6" />
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.syncButton, isSyncing && styles.syncButtonActive]} 
+              onPress={handleManualSync}
+              disabled={isSyncing}
+            >
+              <Ionicons 
+                name={isSyncing ? "sync" : "cloud-upload-outline"} 
+                size={24} 
+                color={isSyncing ? "#f59e0b" : "#10b981"} 
+              />
+            </TouchableOpacity>
             <TouchableOpacity style={styles.profileButton}>
               <Ionicons name="person-circle" size={40} color="#8b5cf6" />
             </TouchableOpacity>
@@ -220,6 +480,31 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Sync Progress Indicator */}
+        {syncProgress && (
+          <View style={styles.syncProgressContainer}>
+            <View style={styles.syncProgressHeader}>
+              <Ionicons 
+                name={syncProgress.step === 'Error' ? 'alert-circle' : 'cloud-upload-outline'} 
+                size={20} 
+                color={syncProgress.step === 'Error' ? '#ef4444' : '#10b981'} 
+              />
+              <Text style={styles.syncProgressStep}>{syncProgress.step}</Text>
+            </View>
+            <Text style={styles.syncProgressMessage}>{syncProgress.message}</Text>
+            {syncProgress.progress > 0 && syncProgress.step !== 'Error' && (
+              <View style={styles.syncProgressBar}>
+                <View 
+                  style={[
+                    styles.syncProgressFill, 
+                    { width: `${syncProgress.progress}%` }
+                  ]} 
+                />
+              </View>
+            )}
+          </View>
+        )}
 
         {/* Stats Cards - 2 columns */}
         <View style={styles.statsContainer}>
@@ -296,8 +581,8 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
           </View>
         </View>
 
-        {/* Upcoming Meetings */}
-        {upcomingMeetings.length > 0 && (
+        {/* Upcoming Meetings - REMOVED per user request */}
+        {false && upcomingMeetings.length > 0 && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Upcoming Meetings</Text>
             <View style={styles.activityContainer}>
@@ -358,6 +643,60 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
+  },
+  debugButton: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: "#eff6ff",
+    borderWidth: 1,
+    borderColor: "#3b82f6",
+  },
+  syncButton: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: "#f0fdf4",
+    borderWidth: 1,
+    borderColor: "#10b981",
+  },
+  syncButtonActive: {
+    backgroundColor: "#fef3c7",
+    borderColor: "#f59e0b",
+  },
+  syncProgressContainer: {
+    marginHorizontal: 20,
+    marginVertical: 10,
+    padding: 16,
+    backgroundColor: "#f8fafc",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  syncProgressHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+    gap: 8,
+  },
+  syncProgressStep: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#1f2937",
+  },
+  syncProgressMessage: {
+    fontSize: 14,
+    color: "#6b7280",
+    marginBottom: 8,
+  },
+  syncProgressBar: {
+    height: 4,
+    backgroundColor: "#e5e7eb",
+    borderRadius: 2,
+    overflow: "hidden",
+  },
+  syncProgressFill: {
+    height: "100%",
+    backgroundColor: "#10b981",
+    borderRadius: 2,
   },
   profileButton: {
     padding: 4,

@@ -70,17 +70,28 @@ export interface MRAssignedDoctor {
 
 export interface MRMeeting {
   meeting_id: string
+  id?: string  // Alias for meeting_id
   title: string
+  doctor_id: string
   doctor_name: string
+  doctor_first_name?: string
+  doctor_last_name?: string
   doctor_specialty: string
   hospital: string
   scheduled_date: string
+  meeting_date?: string  // Alias for scheduled_date
   duration_minutes: number
   status: string
   purpose?: string
+  notes?: string
   brochure_title?: string
   notes_count: number
   last_note_date?: string
+  follow_up_required?: boolean
+  follow_up_date?: string | null
+  follow_up_time?: string | null
+  follow_up_notes?: string | null
+  profile_image_url?: string | null
   created_at: string
   updated_at: string
 }
@@ -152,15 +163,115 @@ export class MRService {
 
   static async getAssignedBrochures(mrId: string): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
     try {
+      console.log('🔍 SERVER DEBUG: Fetching assigned brochures from server for MR:', mrId);
       const { data, error } = await supabase.rpc('get_mr_assigned_brochures', { p_mr_id: mrId })
 
       if (error) {
-        return { success: false, error: error.message }
+        console.warn('❌ SERVER DEBUG: MRService.getAssignedBrochures rpc error:', error.message)
+        throw error
       }
 
+      console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} assigned brochures on server:`, 
+        data?.map(b => ({ id: b.id, title: b.title, category: b.category })));
       return { success: true, data }
+    } catch (rpcError) {
+      console.warn('⚠️ SERVER DEBUG: MRService.getAssignedBrochures falling back to direct query:', rpcError)
+
+      try {
+        console.log('🔍 SERVER DEBUG: Using fallback query for brochures...');
+        const { data: brochures, error: fallbackError } = await supabase
+          .from('brochures')
+          .select('*')
+          .eq('status', 'active')
+          .or(`is_public.eq.true,uploaded_by.eq.${mrId}`)
+          .order('created_at', { ascending: false })
+
+        if (fallbackError) {
+          console.error('❌ SERVER DEBUG: MRService.getAssignedBrochures fallback error:', fallbackError)
+          return { success: false, error: fallbackError.message }
+        }
+
+        console.log(`✅ SERVER DEBUG: Fallback query found ${brochures?.length || 0} brochures:`, 
+          brochures?.map(b => ({ id: b.id, title: b.title, category: b.category })));
+
+        const uploaderIds = Array.from(new Set((brochures || []).map(b => b.uploaded_by).filter(Boolean)))
+        let uploaderMap: Record<string, string> = {}
+
+        if (uploaderIds.length > 0) {
+          const { data: uploaders, error: uploaderError } = await supabase
+            .from('users')
+            .select('id, first_name, last_name, role')
+            .in('id', uploaderIds)
+
+          if (!uploaderError && uploaders) {
+            uploaderMap = uploaders.reduce<Record<string, string>>((acc, user) => {
+              const fullName = `${user.first_name || ''} ${user.last_name || ''}`.trim()
+              acc[user.id] = fullName || (user.role === 'admin' ? 'Administrator' : 'Unknown')
+              return acc
+            }, {})
+          }
+        }
+
+        const mapped = (brochures || []).map((item: any) => ({
+          id: item.id,
+          brochure_id: item.id,
+          title: item.title,
+          category: item.category,
+          description: item.description,
+          thumbnail_url: item.thumbnail_url,
+          view_count: item.view_count ?? 0,
+          download_count: item.download_count ?? 0,
+          uploaded_by_name: uploaderMap[item.uploaded_by] || 'Unknown',
+          created_at: item.created_at,
+          file_url: item.file_url,
+          file_name: item.file_name,
+          file_type: item.file_type,
+        })) as MRAssignedBrochure[]
+
+        return { success: true, data: mapped }
+      } catch (fallbackCatchError) {
+        console.error('MRService.getAssignedBrochures final failure:', fallbackCatchError)
+        return { success: false, error: 'Failed to fetch MR assigned brochures' }
+      }
+    }
+  }
+
+  static async getBrochureById(brochureId: string): Promise<MRAssignedBrochure | null> {
+    try {
+      const { data, error } = await supabase
+        .from('brochures')
+        .select('id, title, category, description, thumbnail_url, view_count, download_count, file_url, file_name, file_type, created_at, uploaded_by:profiles!brochures_uploaded_by_fkey(full_name)')
+        .eq('id', brochureId)
+        .single()
+
+      if (error) {
+        console.error('Error fetching brochure by ID:', error)
+        return null
+      }
+
+      if (!data) {
+        return null
+      }
+
+      // Transform the data to match MRAssignedBrochure interface
+      return {
+        id: data.id,
+        brochure_id: data.id,
+        title: data.title,
+        category: data.category,
+        description: data.description,
+        thumbnail_url: data.thumbnail_url,
+        view_count: data.view_count || 0,
+        download_count: data.download_count || 0,
+        file_url: data.file_url,
+        file_name: data.file_name,
+        file_type: data.file_type,
+        created_at: data.created_at,
+        uploaded_by_name: data.uploaded_by?.full_name || 'Unknown'
+      }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR assigned brochures' }
+      console.error('Exception in getBrochureById:', error)
+      return null
     }
   }
 
@@ -197,14 +308,33 @@ export class MRService {
 
   static async getAssignedDoctors(mrId: string): Promise<{ success: boolean; data?: MRAssignedDoctor[]; error?: string }> {
     try {
+      console.log('🔍 SERVER DEBUG: Fetching assigned doctors from server for MR:', mrId);
       const { data, error } = await supabase.rpc('get_mr_assigned_doctors', { p_mr_id: mrId })
 
       if (error) {
+        console.error('❌ SERVER DEBUG: Get assigned doctors error:', error);
         return { success: false, error: error.message }
       }
 
-      return { success: true, data }
+      // Debug: Log the actual response structure to understand the mapping
+      console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} assigned doctors on server`);
+      if (data && data.length > 0) {
+        console.log('🔍 SERVER DEBUG: First doctor object keys:', Object.keys(data[0]));
+        console.log('🔍 SERVER DEBUG: First doctor object:', JSON.stringify(data[0], null, 2));
+        console.log('🔍 SERVER DEBUG: First doctor doctor_id:', (data[0] as any).doctor_id);
+        console.log('🔍 SERVER DEBUG: First doctor id:', (data[0] as any).id);
+      }
+      
+      // Map the response to ensure doctor_id is available
+      const mappedData = data?.map((d: any) => ({
+        ...d,
+        doctor_id: d.doctor_id || d.id, // Ensure doctor_id is set
+        id: d.id || d.doctor_id // Also set id for compatibility
+      }));
+      
+      return { success: true, data: mappedData }
     } catch (error) {
+      console.error('❌ SERVER DEBUG: Failed to fetch MR assigned doctors:', error);
       return { success: false, error: 'Failed to fetch MR assigned doctors' }
     }
   }
@@ -472,8 +602,8 @@ export class MRService {
     }
   }
 
-  // Get MR's assigned brochures
-  static async getAssignedBrochures(): Promise<{ success: boolean; data?: any[]; error?: string }> {
+  // Get all public brochures with category info
+  static async getPublicBrochures(): Promise<{ success: boolean; data?: any[]; error?: string }> {
     try {
       const { data, error } = await supabase
         .from('brochures')
@@ -529,12 +659,15 @@ export class MRService {
   // Get MR profile with permissions
   static async getMRProfile(): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
+      console.log('🔍 SERVER DEBUG: Fetching MR profile from server...');
       const { data: { user } } = await supabase.auth.getUser()
       
       if (!user) {
+        console.error('❌ SERVER DEBUG: User not authenticated for profile fetch');
         return { success: false, error: 'User not authenticated' }
       }
 
+      console.log('🔍 SERVER DEBUG: Authenticated user ID:', user.id);
       const { data, error } = await supabase
         .from('users')
         .select('*')
@@ -542,56 +675,15 @@ export class MRService {
         .single()
 
       if (error) {
-        console.error('Get MR profile error:', error)
+        console.error('❌ SERVER DEBUG: Get MR profile error:', error)
         return { success: false, error: error.message }
       }
 
+      console.log('✅ SERVER DEBUG: MR profile fetched successfully:', data);
       return { success: true, data }
     } catch (error) {
       console.error('Get MR profile error:', error)
       return { success: false, error: 'Failed to load profile' }
-    }
-  }
-
-  /**
-   * Track brochure download - DIRECT SQL APPROACH
-   */
-  static async trackBrochureDownload(
-    brochureId: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      // Get current download count
-      const { data: currentData, error: fetchError } = await supabase
-        .from('brochures')
-        .select('download_count')
-        .eq('id', brochureId)
-        .single()
-
-      if (fetchError) {
-        return { success: false, error: fetchError.message }
-      }
-
-      // Update with new count
-      const newCount = (currentData?.download_count || 0) + 1
-      console.log('Updating download count from', currentData?.download_count, 'to', newCount)
-      
-      const { data, error } = await supabase
-        .from('brochures')
-        .update({ 
-          download_count: newCount,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', brochureId)
-
-      if (error) {
-        console.error('Download count update error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Download count updated successfully:', data)
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to track download' }
     }
   }
 
@@ -684,18 +776,21 @@ export class MRService {
    */
   static async getMeetings(mrId: string, filter?: string): Promise<{ success: boolean; data?: MRMeeting[]; error?: string }> {
     try {
+      console.log('🔍 SERVER DEBUG: Fetching meetings from server for MR:', mrId);
       const { data, error } = await supabase.rpc('get_mr_meetings_with_notes', {
         p_mr_id: mrId
       })
 
       if (error) {
-        console.error('Get meetings error:', error)
+        console.error('❌ SERVER DEBUG: Get meetings error:', error)
         return { success: false, error: error.message }
       }
 
+      console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} meetings on server:`, 
+        data?.map(m => ({ id: m.id, title: m.title, scheduled_date: m.scheduled_date, status: m.status })));
       return { success: true, data: data || [] }
     } catch (error) {
-      console.error('Get meetings error:', error)
+      console.error('❌ SERVER DEBUG: Failed to get meetings:', error)
       return { success: false, error: 'Failed to get meetings' }
     }
   }
@@ -756,6 +851,43 @@ export class MRService {
     }
   }
 
+  static async updateSlideNote(noteId: string, noteText: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('update_slide_note', {
+        p_note_id: noteId,
+        p_note_text: noteText
+      })
+
+      if (error) {
+        console.error('Update slide note error:', error)
+        return { success: false, error: error.message }
+      }
+
+      return { success: true }
+    } catch (error: any) {
+      console.error('Update slide note error:', error)
+      return { success: false, error: error.message || 'Failed to update note' }
+    }
+  }
+
+  static async deleteSlideNote(noteId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('delete_slide_note', {
+        p_note_id: noteId
+      })
+
+      if (error) {
+        console.error('Delete slide note error:', error)
+        return { success: false, error: error.message }
+      }
+
+      return { success: true }
+    } catch (error: any) {
+      console.error('Delete slide note error:', error)
+      return { success: false, error: error.message || 'Failed to delete note' }
+    }
+  }
+
   static async getMeetingDetailsLegacy(meetingId: string): Promise<{ success: boolean; data?: MeetingDetails; error?: string }> {
     try {
       const { data, error } = await supabase.rpc('get_meeting_details_with_notes', {
@@ -781,72 +913,6 @@ export class MRService {
     } catch (error) {
       console.error('Get meeting details error:', error)
       return { success: false, error: 'Failed to get meeting details' }
-    }
-  }
-
-  /**
-   * Track brochure view - DIRECT SQL APPROACH
-   */
-  static async trackBrochureView(
-    brochureId: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      // Get current view count
-      const { data: currentData, error: fetchError } = await supabase
-        .from('brochures')
-        .select('view_count')
-        .eq('id', brochureId)
-        .single()
-
-      if (fetchError) {
-        return { success: false, error: fetchError.message }
-      }
-
-      // Update with new count
-      const newCount = (currentData?.view_count || 0) + 1
-      console.log('Updating view count from', currentData?.view_count, 'to', newCount)
-      
-      const { data, error } = await supabase
-        .from('brochures')
-        .update({ 
-          view_count: newCount,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', brochureId)
-
-      if (error) {
-        console.error('View count update error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('View count updated successfully:', data)
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to track view' }
-    }
-  }
-
-  // Track brochure download
-  static async trackBrochureDownload(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase
-        .from('brochures')
-        .update({ 
-          download_count: supabase.sql`download_count + 1`,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', brochureId)
-        .select()
-
-      if (error) {
-        console.error('Download count update error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Download count updated successfully:', data)
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to track download' }
     }
   }
 
@@ -992,6 +1058,20 @@ export class MRService {
     }
   }
 
+  static async getDoctors(mrId: string): Promise<{ success: boolean; data?: MRAssignedDoctor[]; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_mr_doctors', { p_mr_id: mrId })
+
+      if (error) {
+        return { success: false, error: error.message }
+      }
+
+      return { success: true, data }
+    } catch (error) {
+      return { success: false, error: 'Failed to fetch doctors' }
+    }
+  }
+
   static async updateDoctor(doctorId: string, doctorData: any): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
       const { data, error } = await supabase.rpc('update_mr_doctor_assignment', {
@@ -1014,6 +1094,22 @@ export class MRService {
       return { success: true, data }
     } catch (error) {
       return { success: false, error: 'Failed to update doctor assignment' }
+    }
+  }
+
+  static async deleteDoctor(doctorId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { error } = await supabase.rpc('delete_mr_doctor_assignment', {
+        p_doctor_id: doctorId
+      });
+
+      if (error) {
+        return { success: false, error: error.message };
+      }
+
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: 'Failed to delete doctor' };
     }
   }
 }
