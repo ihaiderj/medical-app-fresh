@@ -39,7 +39,7 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
   const modalQueue = useModalQueue()
   
   // Global state management
-  const { notifyDoctorChange, notifyMeetingChange, user, onMeetingChange } = useAppData()
+  const { notifyDoctorChange, notifyMeetingChange, user, onMeetingChange, onDoctorChange } = useAppData()
 
   // Bottom sheet date picker
   const datePicker = useBottomSheetDatePicker()
@@ -130,6 +130,23 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     });
     return unsubscribe;
   }, [onMeetingChange])
+
+  // Subscribe to doctor changes to refresh availableDoctors
+  // This ensures newly created doctors are immediately available for lookup
+  useEffect(() => {
+    console.log('🟢 DOCTOR_REFRESH: MeetingsScreen subscribing to doctor changes');
+    const unsubscribe = onDoctorChange(() => {
+      console.log('🟢 DOCTOR_REFRESH: MeetingsScreen received doctor change notification, refreshing available doctors...');
+      loadAvailableDoctors().then(() => {
+        // After doctors are refreshed, reload meetings to update doctor names
+        loadMeetings();
+      });
+    });
+    return () => {
+      console.log('🟢 DOCTOR_REFRESH: MeetingsScreen unsubscribing from doctor changes');
+      unsubscribe();
+    };
+  }, [onDoctorChange])
 
   // Reload doctors when refresh is triggered from doctor changes
   useEffect(() => {
@@ -238,6 +255,11 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
   const loadMeetings = async () => {
     setIsLoading(true)
     try {
+      // Ensure doctors are loaded first (needed for deduplication)
+      if (availableDoctors.length === 0) {
+        await loadAvailableDoctors();
+      }
+      
       // Load meetings from local database using UnifiedDataService
       const userId = user?.id;
       const result = await UnifiedDataService.getMeetings(userId)
@@ -248,40 +270,142 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         const dedupedMeetings: any[] = [];
         
         // First pass: collect all meetings and group by key
+        // Improved deduplication: group by server_id OR by (title + scheduled_date) regardless of doctor_id
         const meetingsByKey = new Map<string, any[]>();
+        const meetingsByTitleDate = new Map<string, any[]>();
+        
         result.data.forEach(meeting => {
           if (!meeting.is_deleted) {
-            const key = meeting.server_id 
-              ? `server_${meeting.server_id}` 
-              : `local_${meeting.doctor_id}_${meeting.scheduled_date}_${meeting.title}`;
-            
-            if (!meetingsByKey.has(key)) {
-              meetingsByKey.set(key, []);
+            // Primary key: server_id if available
+            if (meeting.server_id) {
+              const key = `server_${meeting.server_id}`;
+              if (!meetingsByKey.has(key)) {
+                meetingsByKey.set(key, []);
+              }
+              meetingsByKey.get(key)!.push(meeting);
+            } else {
+              // For local meetings, also group by title + date (to catch duplicates with different doctor_id)
+              const titleDateKey = `local_title_date_${meeting.title}_${meeting.scheduled_date}`;
+              if (!meetingsByTitleDate.has(titleDateKey)) {
+                meetingsByTitleDate.set(titleDateKey, []);
+              }
+              meetingsByTitleDate.get(titleDateKey)!.push(meeting);
+              
+              // Also group by doctor_id + date + title (original logic)
+              const doctorKey = `local_${meeting.doctor_id}_${meeting.scheduled_date}_${meeting.title}`;
+              if (!meetingsByKey.has(doctorKey)) {
+                meetingsByKey.set(doctorKey, []);
+              }
+              meetingsByKey.get(doctorKey)!.push(meeting);
             }
-            meetingsByKey.get(key)!.push(meeting);
           }
         });
         
-        // Second pass: for each key, keep the best meeting
+        // Second pass: process meetings grouped by server_id or doctor_id
+        const processedMeetingIds = new Set<string>();
+        
         meetingsByKey.forEach((meetings, key) => {
           if (meetings.length === 1) {
-            dedupedMeetings.push(meetings[0]);
+            const meeting = meetings[0];
+            // Check if this meeting is a duplicate of another by title+date
+            const titleDateKey = `local_title_date_${meeting.title}_${meeting.scheduled_date}`;
+            const titleDateGroup = meetingsByTitleDate.get(titleDateKey);
+            
+            if (titleDateGroup && titleDateGroup.length > 1 && !meeting.server_id) {
+              // Multiple meetings with same title+date - keep the one with valid doctor_id
+              const validDoctorMeeting = titleDateGroup.find(m => {
+                const doctor = getDoctorForMeeting(m);
+                return doctor !== null;
+              });
+              
+              if (validDoctorMeeting && validDoctorMeeting.id !== meeting.id) {
+                // This meeting has invalid doctor, skip it
+                console.log(`🔴 MEETING_DEDUP: Skipping duplicate meeting "${meeting.title}" with invalid doctor_id: ${meeting.id}`);
+                return;
+              }
+            }
+            
+            processedMeetingIds.add(meeting.id);
+            dedupedMeetings.push(meeting);
           } else {
-            // Keep the one with server_id, or the most recent
+            // Multiple meetings with same key - keep the best one
+            // Priority: valid doctor_id > server_id > most recent updated_at
             const bestMeeting = meetings.reduce((best, current) => {
+              const bestDoctor = getDoctorForMeeting(best);
+              const currentDoctor = getDoctorForMeeting(current);
+              
+              // Prefer meeting with valid doctor
+              if (currentDoctor && !bestDoctor) return current;
+              if (!currentDoctor && bestDoctor) return best;
+              
+              // If both have valid doctors or both invalid, prefer server_id
               if (current.server_id && !best.server_id) return current;
               if (!current.server_id && best.server_id) return best;
-              return new Date(current.updated_at) > new Date(best.updated_at) ? current : best;
+              
+              // Finally, prefer most recent
+              const bestDate = best.updated_at ? new Date(best.updated_at).getTime() : 0;
+              const currentDate = current.updated_at ? new Date(current.updated_at).getTime() : 0;
+              return currentDate > bestDate ? current : best;
             });
+            
+            processedMeetingIds.add(bestMeeting.id);
             dedupedMeetings.push(bestMeeting);
+            console.log(`🔴 MEETING_DEDUP: Found ${meetings.length} duplicate meetings for key "${key}", keeping best: ${bestMeeting.title || bestMeeting.id}`);
           }
         });
         
-        setMeetings(dedupedMeetings)
+        // Third pass: filter out orphaned meetings (meetings with invalid doctor_id)
+        const finalMeetings = dedupedMeetings.filter(meeting => {
+          // If meeting has no server_id and doctor_id doesn't match any available doctor, it's orphaned
+          if (!meeting.server_id && meeting.doctor_id) {
+            const doctor = getDoctorForMeeting(meeting);
+            if (!doctor) {
+              console.log(`🔴 MEETING_DEDUP: Filtering out orphaned meeting "${meeting.title}" with invalid doctor_id: ${meeting.doctor_id}`);
+              return false;
+            }
+          }
+          return true;
+        });
+        
+        dedupedMeetings.length = 0;
+        dedupedMeetings.push(...finalMeetings);
+        
+        // Enrich meetings with follow-up data
+        const enrichedMeetings = await Promise.all(
+          dedupedMeetings.map(async (meeting) => {
+            try {
+              const meetingId = meeting.id || meeting.meeting_id;
+              const [latestFollowUpResult, followUpCountResult] = await Promise.all([
+                OfflineFirstService.getLatestMeetingFollowUp(meetingId),
+                OfflineFirstService.getFollowUpCount(meetingId)
+              ]);
+              
+              return {
+                ...meeting,
+                latest_follow_up: latestFollowUpResult.success ? latestFollowUpResult.data : null,
+                follow_up_count: followUpCountResult.success ? followUpCountResult.data : 0,
+                follow_up_required: (followUpCountResult.success && followUpCountResult.data > 0) || meeting.follow_up_required
+              };
+            } catch (error) {
+              console.warn(`Failed to load follow-up data for meeting ${meeting.id}:`, error);
+              return {
+                ...meeting,
+                latest_follow_up: null,
+                follow_up_count: 0
+              };
+            }
+          })
+        );
+        
+        setMeetings(enrichedMeetings)
+        
+        // NOTE: Cleanup should only run during comprehensive sync (server-to-local), not after every load
+        // Running cleanup here causes issues when manually deleting meetings - it incorrectly groups and deletes other meetings
+        // Cleanup will happen automatically during comprehensive sync or can be triggered manually if needed
         
         // Extract unique statuses with safe operations
         const uniqueStatuses = ["All", ...new Set(
-          dedupedMeetings.map(m => m.status).filter(status => status)
+          enrichedMeetings.map(m => m.status).filter(status => status)
         )]
         setStatuses(uniqueStatuses)
       } else {
@@ -431,7 +555,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         matchesFilter = meetingDate.getMonth() === now.getMonth() && 
                        meetingDate.getFullYear() === now.getFullYear()
       } else if (selectedFilter === "Follow-up Required") {
-        matchesFilter = meeting.follow_up_required === true
+        // Check if meeting has any follow-ups (new system) or follow_up_required flag (legacy)
+        matchesFilter = (meeting.follow_up_count > 0) || (meeting.follow_up_required === true)
       } else if (selectedFilter === "Completed") {
         matchesFilter = meeting.status === "completed"
       }
@@ -569,27 +694,29 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         return;
       }
 
-      console.log('Calling OfflineFirstService.updateMeeting with meetingId:', meetingId);
+      console.log('Calling OfflineFirstService.createMeetingFollowUp with meetingId:', meetingId);
       console.log('Follow-up data:', {
-        follow_up_required: true,
+        meeting_id: meetingId,
         follow_up_date: followUpDate,
         follow_up_time: followUpTime,
-        follow_up_notes: followUpNotes || undefined
+        follow_up_notes: followUpNotes || undefined,
+        status: 'scheduled'
       });
 
-      // Update meeting using offline-first service
-      const result = await OfflineFirstService.updateMeeting(meetingId, {
-        follow_up_required: true,
+      // Create new follow-up using the new system
+      const result = await OfflineFirstService.createMeetingFollowUp({
+        meeting_id: meetingId,
         follow_up_date: followUpDate,
         follow_up_time: followUpTime,
-        follow_up_notes: followUpNotes || undefined
+        follow_up_notes: followUpNotes || undefined,
+        status: 'scheduled'
       });
 
-      console.log('Follow-up update result:', result);
+      console.log('Follow-up create result:', result);
       
       if (result.success) {
-        console.log('SUCCESS: Follow-up saved successfully to local DB');
-        Alert.alert("Success", "Follow-up saved successfully!");
+        console.log('SUCCESS: Follow-up created successfully');
+        Alert.alert("Success", "Follow-up created successfully!");
         setShowFollowUpModal(false);
         // Reset form
         setFollowUpDate("");
@@ -601,12 +728,12 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         // Notify global state
         notifyMeetingChange();
       } else {
-        console.log('ERROR: Follow-up save failed:', result.error);
-        Alert.alert("Error", result.error || "Failed to save follow-up");
+        console.log('ERROR: Follow-up creation failed:', result.error);
+        Alert.alert("Error", result.error || "Failed to create follow-up");
       }
     } catch (error) {
       console.error('EXCEPTION in handleSaveFollowUp:', error);
-      Alert.alert("Error", "Failed to save follow-up");
+      Alert.alert("Error", "Failed to create follow-up");
     }
   }
 
@@ -755,19 +882,42 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
               // Determine if this is a local-only meeting or server meeting
               const isLocalMeeting = meeting.id && !meeting.meeting_id && !meeting.server_id
               const meetingId = meeting.meeting_id || meeting.id
+              const serverId = meeting.server_id
               
               console.log('Is local meeting:', isLocalMeeting)
               console.log('Attempting to delete meeting with ID:', meetingId)
+              console.log('Server ID:', serverId)
               
+              // Delete by both id and server_id if available to handle duplicates
               let result
               if (isLocalMeeting) {
                 // Use OfflineFirstService for local meetings
                 console.log('Calling OfflineFirstService.deleteMeeting...')
                 result = await OfflineFirstService.deleteMeeting(meetingId)
+                
+                // Also try to delete by server_id if it exists (for duplicates)
+                if (serverId && result.success) {
+                  try {
+                    await OfflineFirstService.deleteMeeting(serverId)
+                    console.log('Also deleted duplicate by server_id:', serverId)
+                  } catch (e) {
+                    console.log('Note: Could not delete by server_id (may not exist):', e)
+                  }
+                }
               } else {
                 // Use MRService for server meetings
                 console.log('Calling MRService.deleteMeeting...')
                 result = await MRService.deleteMeeting(meetingId)
+                
+                // Also try to delete by server_id if different from meetingId
+                if (serverId && serverId !== meetingId && result.success) {
+                  try {
+                    await MRService.deleteMeeting(serverId)
+                    console.log('Also deleted duplicate by server_id:', serverId)
+                  } catch (e) {
+                    console.log('Note: Could not delete by server_id (may not exist):', e)
+                  }
+                }
               }
               
               console.log('=== DELETE RESULT ===')
@@ -778,6 +928,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
               if (result.success) {
                 console.log('SUCCESS: Meeting deleted successfully')
                 Alert.alert("Success", "Meeting deleted successfully!")
+                // Notify meeting change to refresh all screens
+                notifyMeetingChange()
                 loadMeetings() // Refresh the meetings list
               } else {
                 console.log('ERROR: Delete failed:', result.error)
@@ -948,13 +1100,22 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
                 <Text style={styles.presentationTitle}>{meeting.purpose || 'No purpose specified'}</Text>
             </View>
 
-              {meeting.follow_up_required && meeting.follow_up_date ? (
+              {(meeting.latest_follow_up || (meeting.follow_up_required && meeting.follow_up_date)) ? (
               <View style={styles.followUpInfo}>
                 <Ionicons name="calendar" size={14} color="#d97706" />
+                <View style={styles.followUpContent}>
                   <Text style={styles.followUpText}>
-                    Follow-up: {formatDate(meeting.follow_up_date)}
-                    {meeting.follow_up_time ? ` at ${meeting.follow_up_time}` : ''}
+                    {meeting.latest_follow_up 
+                      ? `Follow-up #${meeting.latest_follow_up.sequence_number}: ${formatDate(meeting.latest_follow_up.follow_up_date)}${meeting.latest_follow_up.follow_up_time ? ` at ${meeting.latest_follow_up.follow_up_time}` : ''}`
+                      : `Follow-up: ${formatDate(meeting.follow_up_date)}${meeting.follow_up_time ? ` at ${meeting.follow_up_time}` : ''}`
+                    }
                   </Text>
+                  {meeting.follow_up_count > 1 && (
+                    <View style={styles.followUpCountBadge}>
+                      <Text style={styles.followUpCountText}>{meeting.follow_up_count} total</Text>
+                    </View>
+                  )}
+                </View>
               </View>
             ) : null}
 
@@ -1531,10 +1692,28 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     gap: 6,
   },
+  followUpContent: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
   followUpText: {
     fontSize: 12,
     color: "#d97706",
     fontWeight: "500",
+    flex: 1,
+  },
+  followUpCountBadge: {
+    backgroundColor: "#d97706",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+  },
+  followUpCountText: {
+    fontSize: 10,
+    color: "#ffffff",
+    fontWeight: "600",
   },
   meetingActions: {
     flexDirection: "row",

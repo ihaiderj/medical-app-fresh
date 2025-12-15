@@ -409,8 +409,14 @@ export class UnifiedDataService {
 
   /**
    * Delete a doctor (unified operation)
+   * Returns information about related meetings if they exist
    */
-  static async deleteDoctor(doctorId: string): Promise<{ success: boolean; error?: string }> {
+  static async deleteDoctor(doctorId: string, deleteRelatedMeetings: boolean = false): Promise<{ 
+    success: boolean; 
+    error?: string;
+    hasMeetings?: boolean;
+    meetingCount?: number;
+  }> {
     try {
       const userResult = await AuthService.getCurrentUser();
       if (!userResult.success || !userResult.user) {
@@ -418,8 +424,22 @@ export class UnifiedDataService {
       }
 
       // Use offline-first service for deletion
-      const result = await OfflineFirstService.deleteDoctor(doctorId);
-      return result;
+      const result = await OfflineFirstService.deleteDoctor(doctorId, deleteRelatedMeetings);
+      
+      if (result.success && result.data) {
+        return { 
+          success: true,
+          hasMeetings: result.data.hasMeetings,
+          meetingCount: result.data.meetingCount
+        };
+      }
+      
+      return { 
+        success: false, 
+        error: result.error || 'Failed to delete doctor',
+        hasMeetings: result.data?.hasMeetings,
+        meetingCount: result.data?.meetingCount
+      };
     } catch (error) {
       console.error('UnifiedDataService.deleteDoctor error:', error);
       return { success: false, error: 'Failed to delete doctor' };

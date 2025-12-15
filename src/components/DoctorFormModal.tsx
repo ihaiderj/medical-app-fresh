@@ -39,7 +39,7 @@ export default function DoctorFormModal({
   existingDoctor,
   title = "Add New Doctor"
 }: DoctorFormModalProps) {
-  const { user } = useAppData();
+  const { user, notifyDoctorChange } = useAppData();
   const [currentUserId, setCurrentUserId] = useState<string | null>(user?.id ?? null);
   const [formData, setFormData] = useState({
     first_name: '',
@@ -177,6 +177,17 @@ export default function DoctorFormModal({
       }
 
       if (result.success) {
+        // Notify AppDataContext that doctor was created/updated
+        // Use InteractionManager to defer notification until after interactions complete
+        // This prevents setState during render error
+        console.log('🟢 DOCTOR_REFRESH: Doctor saved successfully, notifying AppDataContext (deferred)');
+        
+        // Import InteractionManager dynamically to avoid issues
+        const { InteractionManager } = require('react-native');
+        InteractionManager.runAfterInteractions(() => {
+          notifyDoctorChange();
+        });
+        
         Alert.alert(
           'Success', 
           existingDoctor ? 'Doctor updated successfully' : 'Doctor created successfully',

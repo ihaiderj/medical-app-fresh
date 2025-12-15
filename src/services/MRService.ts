@@ -851,6 +851,142 @@ export class MRService {
     }
   }
 
+  /**
+   * Create a new meeting follow-up
+   */
+  static async createMeetingFollowUp(followUpData: {
+    meeting_id: string
+    follow_up_date: string
+    follow_up_time: string
+    follow_up_notes?: string
+    status?: 'scheduled' | 'completed' | 'cancelled'
+  }): Promise<{ success: boolean; data?: { follow_up_id: string }; error?: string }> {
+    try {
+      console.log('=== MRService.createMeetingFollowUp DEBUG ===')
+      console.log('followUpData:', followUpData)
+      
+      const { data, error } = await supabase.rpc('create_meeting_followup', {
+        p_meeting_id: followUpData.meeting_id,
+        p_follow_up_date: followUpData.follow_up_date,
+        p_follow_up_time: followUpData.follow_up_time,
+        p_follow_up_notes: followUpData.follow_up_notes || null,
+        p_status: followUpData.status || 'scheduled'
+      })
+
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
+      if (error) {
+        console.error('Create follow-up error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Follow-up created successfully')
+      return { success: true, data: { follow_up_id: data?.follow_up_id || data?.id } }
+    } catch (error: any) {
+      console.error('Exception in createMeetingFollowUp:', error)
+      return { success: false, error: error.message || 'Failed to create follow-up' }
+    }
+  }
+
+  /**
+   * Update an existing meeting follow-up
+   */
+  static async updateMeetingFollowUpById(followUpId: string, followUpData: {
+    follow_up_date?: string
+    follow_up_time?: string
+    follow_up_notes?: string
+    status?: 'scheduled' | 'completed' | 'cancelled'
+  }): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      console.log('=== MRService.updateMeetingFollowUpById DEBUG ===')
+      console.log('followUpId:', followUpId)
+      console.log('followUpData:', followUpData)
+      
+      const { data, error } = await supabase.rpc('update_meeting_followup_by_id', {
+        p_follow_up_id: followUpId,
+        p_follow_up_date: followUpData.follow_up_date || null,
+        p_follow_up_time: followUpData.follow_up_time || null,
+        p_follow_up_notes: followUpData.follow_up_notes || null,
+        p_status: followUpData.status || null
+      })
+
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
+      if (error) {
+        console.error('Update follow-up error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Follow-up updated successfully')
+      return { success: true, data }
+    } catch (error: any) {
+      console.error('Exception in updateMeetingFollowUpById:', error)
+      return { success: false, error: error.message || 'Failed to update follow-up' }
+    }
+  }
+
+  /**
+   * Delete a meeting follow-up
+   */
+  static async deleteMeetingFollowUp(followUpId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      console.log('=== MRService.deleteMeetingFollowUp DEBUG ===')
+      console.log('followUpId:', followUpId)
+      
+      const { data, error } = await supabase.rpc('delete_meeting_followup', {
+        p_follow_up_id: followUpId
+      })
+
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
+      if (error) {
+        console.error('Delete follow-up error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Follow-up deleted successfully')
+      return { success: true }
+    } catch (error: any) {
+      console.error('Exception in deleteMeetingFollowUp:', error)
+      return { success: false, error: error.message || 'Failed to delete follow-up' }
+    }
+  }
+
+  /**
+   * Get all follow-ups for a meeting
+   */
+  static async getMeetingFollowUps(meetingId: string): Promise<{ success: boolean; data?: any[]; error?: string }> {
+    try {
+      console.log('=== MRService.getMeetingFollowUps DEBUG ===')
+      console.log('meetingId:', meetingId)
+      
+      const { data, error } = await supabase.rpc('get_meeting_followups', {
+        p_meeting_id: meetingId
+      })
+
+      console.log('Supabase RPC result:')
+      console.log('- data:', data)
+      console.log('- error:', error)
+
+      if (error) {
+        console.error('Get follow-ups error:', error)
+        return { success: false, error: error.message }
+      }
+
+      console.log('Follow-ups fetched successfully')
+      return { success: true, data: data || [] }
+    } catch (error: any) {
+      console.error('Exception in getMeetingFollowUps:', error)
+      return { success: false, error: error.message || 'Failed to get follow-ups' }
+    }
+  }
+
   static async updateSlideNote(noteId: string, noteText: string): Promise<{ success: boolean; error?: string }> {
     try {
       const { data, error } = await supabase.rpc('update_slide_note', {

@@ -50,6 +50,7 @@ BEGIN
 
     RETURN jsonb_build_object(
         'success', true,
+        'brochure_sync_id', (SELECT id FROM brochure_sync WHERE mr_id = p_mr_id AND brochure_id = p_brochure_id),
         'message', 'Brochure changes saved successfully',
         'last_modified', NOW()
     );

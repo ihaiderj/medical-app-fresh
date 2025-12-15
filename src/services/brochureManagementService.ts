@@ -237,7 +237,7 @@ export class BrochureManagementService {
         // Filter image files
         const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
         const imageFiles = extractedFiles.filter(file => 
-          imageExtensions.some(ext => file.toLowerCase().endsWith(ext))
+          file && imageExtensions.some(ext => file.toLowerCase().endsWith(ext))
         )
         
         console.log('Image files found:', imageFiles.length)
@@ -577,6 +577,22 @@ export class BrochureManagementService {
         )
       }
       
+      // Queue changes for sync if userId provided
+      if (userId) {
+        try {
+          const { LocalDatabaseService } = await import('./localDatabaseService');
+          await LocalDatabaseService.addBrochureToSyncQueue(brochureId, userId, {
+            brochureId,
+            title: brochureData.title,
+            slides: brochureData.slides,
+            groups: brochureData.groups,
+            lastModified: now
+          });
+        } catch (error) {
+          console.warn('Failed to queue brochure changes:', error);
+        }
+      }
+      
       return { success: true }
     } catch (error) {
       console.error('Update slide title error:', error)
@@ -633,7 +649,7 @@ export class BrochureManagementService {
       }
       
       const filteredSlides = brochureData.slides.filter(slide => 
-        slide.title.toLowerCase().startsWith(letter.toLowerCase())
+        slide.title && slide.title.toLowerCase().startsWith(letter.toLowerCase())
       )
       
       return { success: true, slides: filteredSlides }
@@ -714,6 +730,11 @@ export class BrochureManagementService {
         `${brochureDir}brochure_data.json`,
         JSON.stringify(brochureData, null, 2)
       )
+      
+      // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+      await this.markBrochureAsModified(brochureId).catch(err => {
+        console.warn('Failed to mark brochure as modified after group creation:', err);
+      });
       
       return { success: true, groupId }
     } catch (error) {
@@ -798,6 +819,11 @@ export class BrochureManagementService {
         JSON.stringify(brochureData, null, 2)
       )
       
+      // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+      await this.markBrochureAsModified(brochureId).catch(err => {
+        console.warn('Failed to mark brochure as modified after slide deletion:', err);
+      });
+      
       return { success: true }
     } catch (error) {
       console.error('Delete slide error:', error)
@@ -862,6 +888,11 @@ export class BrochureManagementService {
       )
       
       console.log('BrochureManager: Slide added successfully, total slides now:', brochureData.slides.length)
+      
+      // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+      await this.markBrochureAsModified(brochureId).catch(err => {
+        console.warn('Failed to mark brochure as modified after slide addition:', err);
+      });
       
       return { success: true, slideId }
     } catch (error) {
@@ -972,10 +1003,96 @@ export class BrochureManagementService {
   }
 
   /**
+   * Reassign doctor ID in all groups across all brochures
+   * Called when a doctor is deleted to update group references
+   */
+  static async reassignDoctorInGroups(oldDoctorId: string, newDoctorId: string): Promise<{ success: boolean; updatedCount: number; error?: string }> {
+    try {
+      let updatedCount = 0;
+      
+      // Get all brochure directories
+      const dirInfo = await FileSystem.getInfoAsync(this.STORAGE_DIR);
+      if (!dirInfo.exists) {
+        return { success: true, updatedCount: 0 };
+      }
+      
+      const brochureDirs = await FileSystem.readDirectoryAsync(this.STORAGE_DIR);
+      
+      for (const brochureDir of brochureDirs) {
+        const brochureId = brochureDir;
+        const brochureDataPath = `${this.STORAGE_DIR}${brochureId}/brochure_data.json`;
+        
+        try {
+          // Check if brochure_data.json exists
+          const fileInfo = await FileSystem.getInfoAsync(brochureDataPath);
+          if (!fileInfo.exists) {
+            continue;
+          }
+          
+          // Read brochure data
+          const brochureDataContent = await FileSystem.readAsStringAsync(brochureDataPath);
+          const brochureData: BrochureData = JSON.parse(brochureDataContent);
+          
+          // Check if any groups reference the old doctor ID
+          let hasChanges = false;
+          if (brochureData.groups && brochureData.groups.length > 0) {
+            for (const group of brochureData.groups) {
+              if (group.doctorId === oldDoctorId) {
+                group.doctorId = newDoctorId;
+                group.updatedAt = new Date().toISOString();
+                hasChanges = true;
+                updatedCount++;
+              }
+            }
+          }
+          
+          // Save updated data if changes were made
+          if (hasChanges) {
+            brochureData.updatedAt = new Date().toISOString();
+            brochureData.localLastModified = new Date().toISOString();
+            brochureData.isModified = true;
+            brochureData.needsSync = true;
+            
+            await FileSystem.writeAsStringAsync(
+              brochureDataPath,
+              JSON.stringify(brochureData, null, 2)
+            );
+            
+            console.log(`🔵 GROUP_DOCTOR_REASSIGN: Updated groups in brochure ${brochureId}`);
+          }
+        } catch (error) {
+          console.warn(`🔵 GROUP_DOCTOR_REASSIGN: Failed to process brochure ${brochureId}:`, error);
+          // Continue with next brochure
+        }
+      }
+      
+      console.log(`🔵 GROUP_DOCTOR_REASSIGN: Reassigned doctor ID in ${updatedCount} groups across all brochures`);
+      return { success: true, updatedCount };
+    } catch (error) {
+      console.error('🔵 GROUP_DOCTOR_REASSIGN: Error reassigning doctor in groups:', error);
+      return { success: false, updatedCount: 0, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
    * Mark brochure as modified (for sync tracking)
    */
-  static async markBrochureAsModified(brochureId: string): Promise<{ success: boolean; error?: string }> {
+  static async markBrochureAsModified(brochureId: string, userId?: string): Promise<{ success: boolean; error?: string }> {
     try {
+      // Get userId from AuthService if not provided
+      let finalUserId = userId;
+      if (!finalUserId) {
+        try {
+          const { AuthService } = await import('./AuthService');
+          const userResult = await AuthService.getCurrentUser();
+          if (userResult.success && userResult.user) {
+            finalUserId = userResult.user.id;
+          }
+        } catch (error) {
+          console.warn('🔵 BROCHURE_SYNC: Could not get userId from AuthService:', error);
+        }
+      }
+
       const result = await this.getBrochureData(brochureId)
       if (!result.success || !result.data) {
         console.error('🔵 BROCHURE_SYNC: Cannot mark as modified - brochure not found:', brochureId)
@@ -1005,6 +1122,24 @@ export class BrochureManagementService {
         `${brochureDir}brochure_data.json`,
         JSON.stringify(result.data, null, 2)
       )
+
+      // Add to sync queue if not already queued and userId available
+      if (!wasNeedsSync && finalUserId) {
+        try {
+          const { LocalDatabaseService } = await import('./localDatabaseService');
+          await LocalDatabaseService.addBrochureToSyncQueue(brochureId, finalUserId, {
+            brochureId,
+            title: result.data.title,
+            slides: result.data.slides,
+            groups: result.data.groups,
+            lastModified: now
+          });
+          console.log('🔵 BROCHURE_SYNC: Added brochure changes to sync queue');
+        } catch (error) {
+          console.warn('🔵 BROCHURE_SYNC: Failed to add to sync queue:', error);
+          // Don't fail the operation if queue add fails
+        }
+      }
 
       console.log('🔵 BROCHURE_SYNC: Brochure marked as modified successfully')
       return { success: true }

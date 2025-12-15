@@ -8,12 +8,14 @@ import { AuthService } from "../../services/AuthService"
 import { SmartSyncService } from "../../services/smartSyncService"
 import { SessionManagementService } from "../../services/sessionManagementService"
 import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius } from "../../utils/responsive"
+import { useAppData } from '../../context/AppDataContext'
 
 interface AdminDashboardScreenProps {
   navigation: any
 }
 
 export default function AdminDashboardScreen({ navigation }: AdminDashboardScreenProps) {
+  const { logoutUser } = useAppData();
   const [showManageBrochures, setShowManageBrochures] = useState(false)
   const [showManageMRs, setShowManageMRs] = useState(false)
   const [showViewMeetings, setShowViewMeetings] = useState(false)
@@ -140,10 +142,10 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
               
               const result = await AuthService.logout()
               if (result.success) {
-                navigation.reset({
-                  index: 0,
-                  routes: [{ name: 'Login' }],
-                })
+                // Use AppDataContext logoutUser which will automatically trigger navigation change
+                // when user state becomes null, the AppNavigator will show Login screen
+                // No need to manually reset navigation - AppNavigator handles it automatically
+                logoutUser();
               } else {
                 Alert.alert("Error", "Failed to logout. Please try again.")
               }

@@ -28,7 +28,7 @@ interface DoctorsScreenProps {
 
 export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps) {
   const { showDoctorForm } = useGlobalForms()
-  const { user } = useAppData();
+  const { user, onDoctorChange } = useAppData();
   const [searchQuery, setSearchQuery] = useState("")
   const [selectedSpecialty, setSelectedSpecialty] = useState("All")
   const [doctors, setDoctors] = useState<any[]>([])
@@ -37,6 +37,20 @@ export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps)
   const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false)
 
+  // Subscribe to doctor changes from AppDataContext
+  // This ensures the screen refreshes when doctors are created/updated from anywhere in the app
+  useEffect(() => {
+    console.log('🟢 DOCTOR_REFRESH: DoctorsScreen subscribing to doctor changes');
+    const unsubscribe = onDoctorChange(() => {
+      console.log('🟢 DOCTOR_REFRESH: Doctor change detected, refreshing DoctorsScreen');
+      setRefreshTrigger(prev => prev + 1);
+    });
+    
+    return () => {
+      console.log('🟢 DOCTOR_REFRESH: DoctorsScreen unsubscribing from doctor changes');
+      unsubscribe();
+    };
+  }, [onDoctorChange]);
 
   // Load doctors on component mount, when refresh is triggered, or when user becomes available
   useEffect(() => {
@@ -157,7 +171,43 @@ export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps)
     })
   }
 
-  const handleDeleteDoctor = (doctor: any) => {
+  const handleDeleteDoctor = async (doctor: any) => {
+    try {
+      // First check if doctor has meetings
+      const checkResult = await UnifiedDataService.deleteDoctor(doctor.id, false);
+      
+      if (!checkResult.success && checkResult.hasMeetings && checkResult.meetingCount) {
+        // Doctor has meetings - show warning with options
+        Alert.alert(
+          "Cannot Delete Doctor",
+          `Dr. ${safeString(doctor.first_name)} ${safeString(doctor.last_name)} has ${checkResult.meetingCount} meeting(s) associated.\n\nWhat would you like to do?`,
+          [
+            { text: "Cancel", style: "cancel" },
+            {
+              text: `Delete Doctor & ${checkResult.meetingCount} Meeting(s)`,
+              style: "destructive",
+              onPress: async () => {
+                try {
+                  const deleteResult = await UnifiedDataService.deleteDoctor(doctor.id, true);
+                  if (deleteResult.success) {
+                    Alert.alert(
+                      "Success", 
+                      `Doctor and ${checkResult.meetingCount} meeting(s) deleted successfully!`
+                    );
+                    loadDoctors();
+                  } else {
+                    Alert.alert("Error", deleteResult.error || "Failed to delete doctor and meetings");
+                  }
+                } catch (error) {
+                  console.error('Error deleting doctor with meetings:', error);
+                  Alert.alert("Error", "Failed to delete doctor and meetings");
+                }
+              }
+            }
+          ]
+        );
+      } else {
+        // No meetings - proceed with normal deletion
     Alert.alert(
       "Delete Doctor",
       `Are you sure you want to delete Dr. ${safeString(doctor.first_name)} ${safeString(doctor.last_name)}?`,
@@ -168,22 +218,26 @@ export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps)
           style: "destructive",
           onPress: async () => {
             try {
-              const result = await UnifiedDataService.deleteDoctor(doctor.id)
-                
+                  const result = await UnifiedDataService.deleteDoctor(doctor.id, false);
                 if (result.success) {
-                  Alert.alert("Success", "Doctor deleted successfully!")
-                  loadDoctors()
+                    Alert.alert("Success", "Doctor deleted successfully!");
+                    loadDoctors();
                 } else {
-                  Alert.alert("Error", result.error || "Failed to delete doctor")
+                    Alert.alert("Error", result.error || "Failed to delete doctor");
               }
             } catch (error) {
-              console.error('Error deleting doctor:', error)
-              Alert.alert("Error", "Failed to delete doctor")
+                  console.error('Error deleting doctor:', error);
+                  Alert.alert("Error", "Failed to delete doctor");
             }
           }
         }
       ]
-    )
+        );
+      }
+    } catch (error) {
+      console.error('Error checking doctor meetings:', error);
+      Alert.alert("Error", "Failed to check doctor information");
+    }
   }
 
   return (

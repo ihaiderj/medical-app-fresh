@@ -177,26 +177,26 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
             console.log('🔵 BROCHURE_SYNC: Current group names:', brochureResult.data.groups.map(g => g.name))
             console.log('🔵 BROCHURE_SYNC: All slide IDs:', brochureResult.data.slides.map(s => s.id))
             console.log('🔵 BROCHURE_SYNC: All group IDs:', brochureResult.data.groups.map(g => g.id))
-            
-            const uploadResult = await BrochureManagementService.syncBrochureToServer(
-              userResult.user.id,
-              brochureId,
-              brochureTitle,
-              brochureResult.data.slides,
-              brochureResult.data.groups
-            )
+          
+          const uploadResult = await BrochureManagementService.syncBrochureToServer(
+            userResult.user.id,
+            brochureId,
+            brochureTitle,
+            brochureResult.data.slides,
+            brochureResult.data.groups
+          )
 
-            if (uploadResult.success) {
+          if (uploadResult.success) {
               console.log('🔵 BROCHURE_SYNC: Upload successful, marking as synced')
               console.log('🔵 BROCHURE_SYNC: Server lastModified:', uploadResult.lastModified)
-              await BrochureManagementService.markBrochureAsSynced(brochureId)
+            await BrochureManagementService.markBrochureAsSynced(brochureId)
               console.log('🔵 BROCHURE_SYNC: Changes synced successfully on exit')
             } else {
               console.error('🔵 BROCHURE_SYNC: Upload failed:', uploadResult.error)
-            }
+          }
           } else {
             console.log('🔵 BROCHURE_SYNC: No changes to sync, brochure is up to date')
-          }
+        }
         }
       } else {
         console.log('🔵 BROCHURE_SYNC: Skipping sync - user is not MR role')
@@ -492,7 +492,9 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         
         // Mark brochure as modified for sync tracking
         console.log(`🟡 SLIDE_RENAME: Marking brochure ${brochureId} as modified for sync`)
-        await BrochureManagementService.markBrochureAsModified(brochureId)
+        const userResult = await AuthService.getCurrentUser()
+        const userId = userResult.success && userResult.user ? userResult.user.id : undefined
+        await BrochureManagementService.markBrochureAsModified(brochureId, userId)
         console.log(`🟡 SLIDE_RENAME: Brochure marked as modified, will sync on next sync operation`)
         
         const message = successCount === 1 
@@ -578,7 +580,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         
         // Mark brochure as modified for sync tracking (non-blocking)
         console.log(`🟢 GROUP_CREATE: Marking brochure ${brochureId} as modified for sync`)
-        BrochureManagementService.markBrochureAsModified(brochureId).then(() => {
+        AuthService.getCurrentUser().then(userResult => {
+          const userId = userResult.success && userResult.user ? userResult.user.id : undefined
+          return BrochureManagementService.markBrochureAsModified(brochureId, userId)
+        }).then(() => {
           console.log(`🟢 GROUP_CREATE: Brochure marked as modified, will sync on next sync operation`)
         }).catch(err => {
           console.error('🟢 GROUP_CREATE: Failed to mark brochure as modified:', err)
@@ -706,8 +711,82 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           allMeetings = Array.isArray(localMeetingsResult.data) ? localMeetingsResult.data : []
         }
         
-        setAvailableMeetings(allMeetings)
-        console.log('Loaded meetings from local DB:', allMeetings.length)
+        // Deduplicate meetings to prevent multiplication
+        // Group by unique key: server_id > id > (doctor_id + scheduled_date + title)
+        const meetingsByKey = new Map<string, any[]>()
+        const seenIds = new Set<string>()
+        
+        allMeetings.forEach(meeting => {
+          // Skip deleted meetings
+          if (meeting.is_deleted) return
+          
+          // Normalize and determine unique key for this meeting
+          let key: string
+          const serverId = String(meeting.server_id || '').trim()
+          const localId = String(meeting.id || meeting.meeting_id || '').trim()
+          
+          if (serverId) {
+            key = `server_${serverId}`
+          } else if (localId) {
+            key = `id_${localId}`
+          } else {
+            // Fallback: use doctor_id + scheduled_date + title (normalized)
+            const doctorId = String(meeting.doctor_id || '').trim()
+            const scheduledDate = String(meeting.scheduled_date || '').trim()
+            const title = String(meeting.title || meeting.purpose || '').trim().toLowerCase()
+            key = `composite_${doctorId}_${scheduledDate}_${title}`
+          }
+          
+          // Additional check: if we've seen this exact ID before, skip it
+          const uniqueId = serverId || localId
+          if (uniqueId && seenIds.has(uniqueId)) {
+            console.log(`🔴 MEETING_DEDUP: Skipping duplicate ID: ${uniqueId}`)
+            return
+          }
+          if (uniqueId) {
+            seenIds.add(uniqueId)
+          }
+          
+          if (!meetingsByKey.has(key)) {
+            meetingsByKey.set(key, [])
+          }
+          meetingsByKey.get(key)!.push(meeting)
+        })
+        
+        // For each key, keep only the best meeting (prefer server_id, then most recent)
+        const dedupedMeetings: any[] = []
+        meetingsByKey.forEach((meetings, key) => {
+          if (meetings.length === 1) {
+            dedupedMeetings.push(meetings[0])
+          } else {
+            // Multiple meetings with same key - keep the best one
+            // Priority: has server_id > most recent updated_at
+            const bestMeeting = meetings.reduce((best, current) => {
+              const bestHasServerId = Boolean(best.server_id)
+              const currentHasServerId = Boolean(current.server_id)
+              
+              if (currentHasServerId && !bestHasServerId) return current
+              if (!currentHasServerId && bestHasServerId) return best
+              
+              // Both have or don't have server_id - compare by date
+              const bestDate = best.updated_at ? new Date(best.updated_at).getTime() : 0
+              const currentDate = current.updated_at ? new Date(current.updated_at).getTime() : 0
+              return currentDate > bestDate ? current : best
+            })
+            dedupedMeetings.push(bestMeeting)
+            console.log(`🔴 MEETING_DEDUP: Found ${meetings.length} duplicate meetings for key "${key}", keeping best: ${bestMeeting.title || bestMeeting.id} (server_id: ${bestMeeting.server_id || 'none'})`)
+          }
+        })
+        
+        // Sort by scheduled_date (most recent first)
+        dedupedMeetings.sort((a, b) => {
+          const dateA = a.scheduled_date ? new Date(a.scheduled_date).getTime() : 0
+          const dateB = b.scheduled_date ? new Date(b.scheduled_date).getTime() : 0
+          return dateB - dateA
+        })
+        
+        setAvailableMeetings(dedupedMeetings)
+        console.log('Loaded meetings from local DB:', allMeetings.length, '-> Deduplicated to:', dedupedMeetings.length)
         
         // Also load available doctors for new meeting creation (from local DB)
         console.log('Loading doctors for notes modal...')
@@ -1008,6 +1087,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                 JSON.stringify(brochureData, null, 2)
               )
 
+              // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+              await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+                console.warn('Failed to mark brochure as modified after group deletion:', err);
+              });
+
               setSelectedGroup(null)
               loadBrochureData()
               Alert.alert('Success', 'Group deleted successfully')
@@ -1039,6 +1123,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           `${brochureDir}brochure_data.json`,
           JSON.stringify(brochureData, null, 2)
         )
+
+        // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+        await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+          console.warn('Failed to mark brochure as modified after group rename:', err);
+        });
 
         setShowRenameGroupModal(false)
         setNewGroupName('')

@@ -16,8 +16,10 @@ import { Ionicons } from '@expo/vector-icons'
 import { useNavigation, useRoute } from '@react-navigation/native'
 import { MRService } from '../../services/MRService'
 import { OfflineFirstService } from '../../services/offlineFirstService'
-import { LocalDatabaseService } from '../../services/localDatabaseService'
+import { LocalDatabaseService, LocalMeetingFollowUp, LocalMeetingNote } from '../../services/localDatabaseService'
 import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius, isTablet } from '../../utils/responsive'
+import BottomSheetDatePicker from '../../components/BottomSheetDatePicker'
+import { useBottomSheetDatePicker, DatePickerResult } from '../../hooks/useBottomSheetDatePicker'
 
 interface MeetingDetails {
   meeting_id: string
@@ -46,6 +48,7 @@ interface SlideNote {
   slide_image_uri?: string
   created_at: string
   updated_at: string
+  follow_up_id?: string
 }
 
 const MeetingDetailsScreen = () => {
@@ -64,6 +67,17 @@ const MeetingDetailsScreen = () => {
   const [newNoteText, setNewNoteText] = useState('')
   const [showFullImageModal, setShowFullImageModal] = useState(false)
   const [fullImageSlide, setFullImageSlide] = useState<SlideNote | null>(null)
+  const [followUps, setFollowUps] = useState<LocalMeetingFollowUp[]>([])
+  const [showFollowUpModal, setShowFollowUpModal] = useState(false)
+  const [showEditFollowUpModal, setShowEditFollowUpModal] = useState(false)
+  const [selectedFollowUp, setSelectedFollowUp] = useState<LocalMeetingFollowUp | null>(null)
+  const [followUpForm, setFollowUpForm] = useState({
+    follow_up_date: '',
+    follow_up_time: '',
+    follow_up_notes: '',
+    status: 'scheduled' as 'scheduled' | 'completed' | 'cancelled'
+  })
+  const datePicker = useBottomSheetDatePicker()
 
   useEffect(() => {
     loadMeetingDetails()
@@ -85,8 +99,14 @@ const MeetingDetailsScreen = () => {
           // Load doctor details
           const doctor = await LocalDatabaseService.getDoctorById(localMeeting.doctor_id)
           
-          // Load meeting notes
-          const notes = await LocalDatabaseService.getMeetingNotes(meetingId)
+          // Load meeting notes and follow-ups
+          const [notes, followUpsData] = await Promise.all([
+            LocalDatabaseService.getMeetingNotes(meetingId),
+            LocalDatabaseService.getMeetingFollowUps(meetingId).catch((error) => {
+              console.warn('MeetingDetailsScreen: Failed to load follow-ups:', error);
+              return []; // Return empty array on error
+            })
+          ])
           
           // Format to match MeetingDetails interface
           const formattedDetails: MeetingDetails = {
@@ -115,14 +135,17 @@ const MeetingDetailsScreen = () => {
             note_text: note.note_text,
             slide_image_uri: note.slide_image_uri,
             created_at: note.created_at,
-            updated_at: note.updated_at || note.created_at
-          }))
+            updated_at: note.updated_at || note.created_at,
+            follow_up_id: note.follow_up_id // Add follow_up_id for grouping
+          } as SlideNote & { follow_up_id?: string }))
           
           console.log('Meeting data (local):', formattedDetails)
           console.log('Slide notes count (local):', formattedNotes.length)
+          console.log('Follow-ups count (local):', followUpsData.length)
           
           setMeetingDetails(formattedDetails)
           setSlideNotes(formattedNotes)
+          setFollowUps(followUpsData)
           return
         }
       } catch (localError) {
@@ -272,6 +295,7 @@ const MeetingDetailsScreen = () => {
 
       // Add a generic meeting note (not tied to a specific slide) using offline-first approach
       // We'll use slide_order 0 to indicate it's a general meeting note
+      // Associate with selected follow-up if one is selected
       const result = await OfflineFirstService.createMeetingNote({
         meeting_id: meetingId,
         meeting_server_id: meetingServerId,
@@ -280,7 +304,8 @@ const MeetingDetailsScreen = () => {
         slide_order: 0, // 0 indicates general note, not slide-specific
         brochure_id: meetingDetails?.brochure_info?.brochure_id || '',
         note_text: newNoteText.trim(),
-        slide_image_uri: undefined
+        slide_image_uri: undefined,
+        follow_up_id: selectedFollowUp?.id // Associate with follow-up if selected
       })
       
       if (result.success) {
@@ -288,6 +313,7 @@ const MeetingDetailsScreen = () => {
         Alert.alert('Success', 'Note added successfully')
         setShowAddNoteModal(false)
         setNewNoteText('')
+        setSelectedFollowUp(null) // Clear selected follow-up
         loadMeetingDetails()
       } else {
         console.error('MeetingDetailsScreen: Failed to add note:', result.error)
@@ -307,6 +333,158 @@ const MeetingDetailsScreen = () => {
       hour: '2-digit',
       minute: '2-digit'
     })
+  }
+
+  const formatDateOnly = (dateString: string) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    })
+  }
+
+  // Group notes by follow-up
+  const groupNotesByFollowUp = () => {
+    const notesByFollowUp = new Map<string | null, SlideNote[]>()
+    
+    // Initialize with null for original meeting notes
+    notesByFollowUp.set(null, [])
+    
+    // Group notes by follow_up_id
+    slideNotes.forEach(note => {
+      const followUpId = note.follow_up_id || null
+      if (!notesByFollowUp.has(followUpId)) {
+        notesByFollowUp.set(followUpId, [])
+      }
+      notesByFollowUp.get(followUpId)!.push(note)
+    })
+    
+    return notesByFollowUp
+  }
+
+  // Handle create follow-up
+  const handleCreateFollowUp = async () => {
+    try {
+      if (!followUpForm.follow_up_date || !followUpForm.follow_up_time) {
+        Alert.alert('Error', 'Please select both date and time')
+        return
+      }
+
+      const result = await OfflineFirstService.createMeetingFollowUp({
+        meeting_id: meetingId,
+        follow_up_date: followUpForm.follow_up_date,
+        follow_up_time: followUpForm.follow_up_time,
+        follow_up_notes: followUpForm.follow_up_notes || undefined,
+        status: followUpForm.status
+      })
+
+      if (result.success) {
+        Alert.alert('Success', 'Follow-up created successfully')
+        setShowFollowUpModal(false)
+        setFollowUpForm({
+          follow_up_date: '',
+          follow_up_time: '',
+          follow_up_notes: '',
+          status: 'scheduled'
+        })
+        loadMeetingDetails()
+      } else {
+        Alert.alert('Error', result.error || 'Failed to create follow-up')
+      }
+    } catch (error) {
+      console.error('Error creating follow-up:', error)
+      Alert.alert('Error', 'Failed to create follow-up')
+    }
+  }
+
+  // Handle edit follow-up
+  const handleEditFollowUp = (followUp: LocalMeetingFollowUp) => {
+    setSelectedFollowUp(followUp)
+    setFollowUpForm({
+      follow_up_date: followUp.follow_up_date,
+      follow_up_time: followUp.follow_up_time,
+      follow_up_notes: followUp.follow_up_notes || '',
+      status: followUp.status
+    })
+    setShowEditFollowUpModal(true)
+  }
+
+  const handleUpdateFollowUp = async () => {
+    if (!selectedFollowUp) return
+
+    try {
+      const result = await OfflineFirstService.updateMeetingFollowUp(selectedFollowUp.id, {
+        follow_up_date: followUpForm.follow_up_date,
+        follow_up_time: followUpForm.follow_up_time,
+        follow_up_notes: followUpForm.follow_up_notes || undefined,
+        status: followUpForm.status
+      })
+
+      if (result.success) {
+        Alert.alert('Success', 'Follow-up updated successfully')
+        setShowEditFollowUpModal(false)
+        setSelectedFollowUp(null)
+        loadMeetingDetails()
+      } else {
+        Alert.alert('Error', result.error || 'Failed to update follow-up')
+      }
+    } catch (error) {
+      console.error('Error updating follow-up:', error)
+      Alert.alert('Error', 'Failed to update follow-up')
+    }
+  }
+
+  // Handle delete follow-up
+  const handleDeleteFollowUp = (followUp: LocalMeetingFollowUp) => {
+    Alert.alert(
+      'Delete Follow-up',
+      `Are you sure you want to delete Follow-up #${followUp.sequence_number}? This will also delete all notes associated with this follow-up.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const result = await OfflineFirstService.deleteMeetingFollowUp(followUp.id)
+              if (result.success) {
+                Alert.alert('Success', 'Follow-up deleted successfully')
+                loadMeetingDetails()
+              } else {
+                Alert.alert('Error', result.error || 'Failed to delete follow-up')
+              }
+            } catch (error) {
+              console.error('Error deleting follow-up:', error)
+              Alert.alert('Error', 'Failed to delete follow-up')
+            }
+          }
+        }
+      ]
+    )
+  }
+
+  // Handle add notes to follow-up
+  const handleAddNotesToFollowUp = (followUp: LocalMeetingFollowUp) => {
+    // Navigate to note creation with follow-up context
+    // For now, we'll use the existing add note modal but associate with follow-up
+    setSelectedFollowUp(followUp)
+    setShowAddNoteModal(true)
+  }
+
+  // Get notes count for a follow-up
+  const getFollowUpNotesCount = (followUpId: string | null) => {
+    if (followUpId === null) {
+      return slideNotes.filter(n => !n.follow_up_id).length
+    }
+    return slideNotes.filter(n => n.follow_up_id === followUpId).length
+  }
+
+  // Check if follow-up date/time has passed
+  const isFollowUpPast = (followUp: LocalMeetingFollowUp) => {
+    const followUpDateTime = new Date(followUp.follow_up_date)
+    const [hours, minutes] = followUp.follow_up_time.split(':')
+    followUpDateTime.setHours(parseInt(hours), parseInt(minutes))
+    return followUpDateTime < new Date()
   }
 
   if (isLoading) {
@@ -401,7 +579,105 @@ const MeetingDetailsScreen = () => {
           </View>
         </View>
 
-        {/* Slide Notes */}
+        {/* Follow-ups Section */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Ionicons name="repeat" size={24} color="#d97706" />
+            <Text style={styles.cardTitle}>Follow-ups ({followUps.length})</Text>
+            <TouchableOpacity
+              style={styles.addButton}
+              onPress={() => {
+                setFollowUpForm({
+                  follow_up_date: new Date().toISOString().split('T')[0],
+                  follow_up_time: new Date().toTimeString().slice(0, 5),
+                  follow_up_notes: '',
+                  status: 'scheduled'
+                })
+                setShowFollowUpModal(true)
+              }}
+            >
+              <Ionicons name="add-circle" size={20} color="#d97706" />
+              <Text style={styles.addButtonText}>Add</Text>
+            </TouchableOpacity>
+          </View>
+          
+          {followUps.length > 0 ? (
+            followUps.map((followUp) => {
+              const notesCount = getFollowUpNotesCount(followUp.id)
+              const isPast = isFollowUpPast(followUp)
+              
+              return (
+                <View key={followUp.id} style={[styles.followUpCard, isPast && notesCount === 0 && styles.followUpCardPast]}>
+                  <View style={styles.followUpHeader}>
+                    <View style={styles.followUpTitleRow}>
+                      <View style={styles.followUpBadge}>
+                        <Text style={styles.followUpBadgeText}>#{followUp.sequence_number}</Text>
+                      </View>
+                      <View style={styles.followUpInfo}>
+                        <Text style={styles.followUpDate}>
+                          {formatDateOnly(followUp.follow_up_date)} at {followUp.follow_up_time}
+                        </Text>
+                        <View style={styles.followUpMeta}>
+                          <View style={[styles.statusBadge, { backgroundColor: followUp.status === 'completed' ? '#10b98120' : followUp.status === 'cancelled' ? '#ef444420' : '#d9770620' }]}>
+                            <Text style={[styles.statusText, { color: followUp.status === 'completed' ? '#10b981' : followUp.status === 'cancelled' ? '#ef4444' : '#d97706' }]}>
+                              {followUp.status.charAt(0).toUpperCase() + followUp.status.slice(1)}
+                            </Text>
+                          </View>
+                          <Text style={styles.notesCountText}>{notesCount} {notesCount === 1 ? 'note' : 'notes'}</Text>
+                        </View>
+                      </View>
+                    </View>
+                  </View>
+                  
+                  {followUp.follow_up_notes && (
+                    <Text style={styles.followUpNotesText}>{followUp.follow_up_notes}</Text>
+                  )}
+                  
+                  {isPast && notesCount === 0 && (
+                    <View style={styles.pastFollowUpWarning}>
+                      <Ionicons name="time-outline" size={16} color="#d97706" />
+                      <Text style={styles.pastFollowUpWarningText}>Past follow-up with no notes</Text>
+                    </View>
+                  )}
+                  
+                  <View style={styles.followUpActions}>
+                    <TouchableOpacity
+                      style={styles.followUpActionButton}
+                      onPress={() => handleAddNotesToFollowUp(followUp)}
+                    >
+                      <Ionicons name="document-text-outline" size={16} color="#8b5cf6" />
+                      <Text style={[styles.followUpActionText, { color: '#8b5cf6' }]}>Add Notes</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.followUpActionButton}
+                      onPress={() => handleEditFollowUp(followUp)}
+                    >
+                      <Ionicons name="create-outline" size={16} color="#6b7280" />
+                      <Text style={[styles.followUpActionText, { color: '#6b7280' }]}>Edit</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.followUpActionButton}
+                      onPress={() => handleDeleteFollowUp(followUp)}
+                    >
+                      <Ionicons name="trash-outline" size={16} color="#ef4444" />
+                      <Text style={[styles.followUpActionText, { color: '#ef4444' }]}>Delete</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )
+            })
+          ) : (
+            <View style={styles.emptyState}>
+              <Ionicons name="repeat-outline" size={48} color="#9ca3af" />
+              <Text style={styles.emptyStateText}>No follow-ups yet</Text>
+              <Text style={styles.emptyStateSubtext}>
+                Click &quot;Add&quot; to create a follow-up for this meeting
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* Slide Notes - Grouped by Follow-up */}
         <View style={styles.card}>
           <View style={styles.cardHeader}>
             <Ionicons name="document-text" size={24} color="#8b5cf6" />
@@ -409,9 +685,34 @@ const MeetingDetailsScreen = () => {
           </View>
           
           {slideNotes.length > 0 ? (
-            slideNotes
-              .sort((a, b) => a.slide_order - b.slide_order)
-              .map((slideNote) => (
+            (() => {
+              const notesByFollowUp = groupNotesByFollowUp()
+              const sections: Array<{ title: string; followUpId: string | null; notes: SlideNote[] }> = []
+              
+              // Add original meeting notes section
+              const originalNotes = notesByFollowUp.get(null) || []
+              if (originalNotes.length > 0) {
+                sections.push({ title: 'Original Meeting Notes', followUpId: null, notes: originalNotes })
+              }
+              
+              // Add follow-up sections
+              followUps.forEach(followUp => {
+                const followUpNotes = notesByFollowUp.get(followUp.id) || []
+                if (followUpNotes.length > 0) {
+                  sections.push({ 
+                    title: `Follow-up #${followUp.sequence_number} Notes`, 
+                    followUpId: followUp.id, 
+                    notes: followUpNotes 
+                  })
+                }
+              })
+              
+              return sections.map((section, sectionIndex) => (
+                <View key={section.followUpId || 'original'} style={sectionIndex > 0 ? styles.notesSectionDivider : null}>
+                  <Text style={styles.notesSectionTitle}>{section.title} ({section.notes.length})</Text>
+                  {section.notes
+                    .sort((a, b) => a.slide_order - b.slide_order)
+                    .map((slideNote) => (
                 <View
                   key={slideNote.note_id}
                   style={styles.slideNoteCard}
@@ -466,7 +767,11 @@ const MeetingDetailsScreen = () => {
                     </TouchableOpacity>
                   </View>
                 </View>
+                    ))
+                  }
+                </View>
               ))
+            })()
           ) : (
             <View style={styles.emptyState}>
               <Ionicons name="document-outline" size={48} color="#9ca3af" />
@@ -623,16 +928,33 @@ const MeetingDetailsScreen = () => {
         visible={showAddNoteModal}
         transparent
         animationType="slide"
-        onRequestClose={() => setShowAddNoteModal(false)}
+        onRequestClose={() => {
+          setShowAddNoteModal(false)
+          setSelectedFollowUp(null)
+        }}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Add Notes</Text>
-              <TouchableOpacity onPress={() => setShowAddNoteModal(false)}>
+              <Text style={styles.modalTitle}>
+                {selectedFollowUp ? `Add Notes to Follow-up #${selectedFollowUp.sequence_number}` : 'Add Notes'}
+              </Text>
+              <TouchableOpacity onPress={() => {
+                setShowAddNoteModal(false)
+                setSelectedFollowUp(null)
+              }}>
                 <Ionicons name="close" size={24} color="#6b7280" />
               </TouchableOpacity>
             </View>
+            
+            {selectedFollowUp && (
+              <View style={styles.followUpContext}>
+                <Ionicons name="calendar" size={16} color="#d97706" />
+                <Text style={styles.followUpContextText}>
+                  {formatDateOnly(selectedFollowUp.follow_up_date)} at {selectedFollowUp.follow_up_time}
+                </Text>
+              </View>
+            )}
             
             <View style={styles.modalBody}>
               <View style={styles.inputGroup}>
@@ -654,6 +976,7 @@ const MeetingDetailsScreen = () => {
                   onPress={() => {
                     setShowAddNoteModal(false)
                     setNewNoteText('')
+                    setSelectedFollowUp(null)
                   }}
                 >
                   <Text style={styles.cancelButtonText}>Cancel</Text>
@@ -669,6 +992,257 @@ const MeetingDetailsScreen = () => {
           </View>
         </View>
       </Modal>
+
+      {/* Create Follow-up Modal */}
+      <Modal
+        visible={showFollowUpModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowFollowUpModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Create Follow-up</Text>
+              <TouchableOpacity onPress={() => setShowFollowUpModal(false)}>
+                <Ionicons name="close" size={24} color="#6b7280" />
+              </TouchableOpacity>
+            </View>
+            
+            <ScrollView style={styles.modalBody}>
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Follow-up Date:</Text>
+                <TouchableOpacity
+                  style={styles.dateTimeButton}
+                  onPress={() => {
+                    const initialDate = followUpForm.follow_up_date 
+                      ? new Date(followUpForm.follow_up_date)
+                      : new Date()
+                    datePicker.showDate(initialDate, { mode: 'date' }, (result: DatePickerResult) => {
+                      if (!result.cancelled && result.date) {
+                        setFollowUpForm({ ...followUpForm, follow_up_date: result.date.toISOString().split('T')[0] })
+                      }
+                    })
+                  }}
+                >
+                  <Text style={styles.dateTimeButtonText}>
+                    {followUpForm.follow_up_date || 'Select Date'}
+                  </Text>
+                  <Ionicons name="calendar-outline" size={20} color="#8b5cf6" />
+                </TouchableOpacity>
+              </View>
+              
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Follow-up Time:</Text>
+                <TouchableOpacity
+                  style={styles.dateTimeButton}
+                  onPress={() => {
+                    const currentTime = followUpForm.follow_up_time 
+                      ? new Date(`2000-01-01T${followUpForm.follow_up_time}`)
+                      : new Date()
+                    datePicker.showTime(currentTime, { mode: 'time' }, (result: DatePickerResult) => {
+                      if (!result.cancelled && result.date) {
+                        setFollowUpForm({ ...followUpForm, follow_up_time: result.date.toTimeString().slice(0, 5) })
+                      }
+                    })
+                  }}
+                >
+                  <Text style={styles.dateTimeButtonText}>
+                    {followUpForm.follow_up_time || 'Select Time'}
+                  </Text>
+                  <Ionicons name="time-outline" size={20} color="#8b5cf6" />
+                </TouchableOpacity>
+              </View>
+              
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Follow-up Notes (Optional):</Text>
+                <TextInput
+                  style={[styles.textInput, styles.textArea]}
+                  placeholder="Enter follow-up notes..."
+                  placeholderTextColor="#9ca3af"
+                  value={followUpForm.follow_up_notes}
+                  onChangeText={(text) => setFollowUpForm({ ...followUpForm, follow_up_notes: text })}
+                  multiline
+                  numberOfLines={4}
+                />
+              </View>
+              
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Status:</Text>
+                <View style={styles.statusButtons}>
+                  {(['scheduled', 'completed', 'cancelled'] as const).map((status) => (
+                    <TouchableOpacity
+                      key={status}
+                      style={[
+                        styles.statusButton,
+                        followUpForm.status === status && styles.statusButtonActive
+                      ]}
+                      onPress={() => setFollowUpForm({ ...followUpForm, status })}
+                    >
+                      <Text style={[
+                        styles.statusButtonText,
+                        followUpForm.status === status && styles.statusButtonTextActive
+                      ]}>
+                        {status.charAt(0).toUpperCase() + status.slice(1)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+              
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={styles.cancelButton}
+                  onPress={() => setShowFollowUpModal(false)}
+                >
+                  <Text style={styles.cancelButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.saveButton}
+                  onPress={handleCreateFollowUp}
+                >
+                  <Text style={styles.saveButtonText}>Create Follow-up</Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Edit Follow-up Modal */}
+      <Modal
+        visible={showEditFollowUpModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => {
+          setShowEditFollowUpModal(false)
+          setSelectedFollowUp(null)
+        }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Edit Follow-up #{selectedFollowUp?.sequence_number}</Text>
+              <TouchableOpacity onPress={() => {
+                setShowEditFollowUpModal(false)
+                setSelectedFollowUp(null)
+              }}>
+                <Ionicons name="close" size={24} color="#6b7280" />
+              </TouchableOpacity>
+            </View>
+            
+            <ScrollView style={styles.modalBody}>
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Follow-up Date:</Text>
+                <TouchableOpacity
+                  style={styles.dateTimeButton}
+                  onPress={() => {
+                    const initialDate = followUpForm.follow_up_date 
+                      ? new Date(followUpForm.follow_up_date)
+                      : new Date()
+                    datePicker.showDate(initialDate, { mode: 'date' }, (result: DatePickerResult) => {
+                      if (!result.cancelled && result.date) {
+                        setFollowUpForm({ ...followUpForm, follow_up_date: result.date.toISOString().split('T')[0] })
+                      }
+                    })
+                  }}
+                >
+                  <Text style={styles.dateTimeButtonText}>
+                    {followUpForm.follow_up_date || 'Select Date'}
+                  </Text>
+                  <Ionicons name="calendar-outline" size={20} color="#8b5cf6" />
+                </TouchableOpacity>
+              </View>
+              
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Follow-up Time:</Text>
+                <TouchableOpacity
+                  style={styles.dateTimeButton}
+                  onPress={() => {
+                    const currentTime = followUpForm.follow_up_time 
+                      ? new Date(`2000-01-01T${followUpForm.follow_up_time}`)
+                      : new Date()
+                    datePicker.showTime(currentTime, { mode: 'time' }, (result: DatePickerResult) => {
+                      if (!result.cancelled && result.date) {
+                        setFollowUpForm({ ...followUpForm, follow_up_time: result.date.toTimeString().slice(0, 5) })
+                      }
+                    })
+                  }}
+                >
+                  <Text style={styles.dateTimeButtonText}>
+                    {followUpForm.follow_up_time || 'Select Time'}
+                  </Text>
+                  <Ionicons name="time-outline" size={20} color="#8b5cf6" />
+                </TouchableOpacity>
+              </View>
+              
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Follow-up Notes (Optional):</Text>
+                <TextInput
+                  style={[styles.textInput, styles.textArea]}
+                  placeholder="Enter follow-up notes..."
+                  placeholderTextColor="#9ca3af"
+                  value={followUpForm.follow_up_notes}
+                  onChangeText={(text) => setFollowUpForm({ ...followUpForm, follow_up_notes: text })}
+                  multiline
+                  numberOfLines={4}
+                />
+              </View>
+              
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Status:</Text>
+                <View style={styles.statusButtons}>
+                  {(['scheduled', 'completed', 'cancelled'] as const).map((status) => (
+                    <TouchableOpacity
+                      key={status}
+                      style={[
+                        styles.statusButton,
+                        followUpForm.status === status && styles.statusButtonActive
+                      ]}
+                      onPress={() => setFollowUpForm({ ...followUpForm, status })}
+                    >
+                      <Text style={[
+                        styles.statusButtonText,
+                        followUpForm.status === status && styles.statusButtonTextActive
+                      ]}>
+                        {status.charAt(0).toUpperCase() + status.slice(1)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
+              
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={styles.cancelButton}
+                  onPress={() => {
+                    setShowEditFollowUpModal(false)
+                    setSelectedFollowUp(null)
+                  }}
+                >
+                  <Text style={styles.cancelButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.saveButton}
+                  onPress={handleUpdateFollowUp}
+                >
+                  <Text style={styles.saveButtonText}>Update Follow-up</Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Bottom Sheet Date Picker */}
+      <BottomSheetDatePicker
+        visible={datePicker.visible}
+        value={datePicker.value}
+        mode={datePicker.config.mode}
+        onConfirm={datePicker.handleConfirm}
+        onCancel={datePicker.handleCancel}
+        title={datePicker.config.title}
+      />
     </SafeAreaView>
   )
 }
@@ -763,6 +1337,21 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#374151',
     marginLeft: 8,
+    flex: 1,
+  },
+  addButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#d9770620',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    gap: 4,
+  },
+  addButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#d97706',
   },
   infoRow: {
     flexDirection: 'row',
@@ -1067,6 +1656,177 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: '#ffffff',
+  },
+  followUpCard: {
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 12,
+    backgroundColor: '#ffffff',
+  },
+  followUpCardPast: {
+    backgroundColor: '#fef3c7',
+    borderColor: '#fbbf24',
+  },
+  followUpHeader: {
+    marginBottom: 8,
+  },
+  followUpTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+  },
+  followUpBadge: {
+    backgroundColor: '#d97706',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    minWidth: 40,
+    alignItems: 'center',
+  },
+  followUpBadgeText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+  followUpInfo: {
+    flex: 1,
+  },
+  followUpDate: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#374151',
+    marginBottom: 4,
+  },
+  followUpMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  statusBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  statusText: {
+    fontSize: 10,
+    fontWeight: '600',
+  },
+  notesCountText: {
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  followUpNotesText: {
+    fontSize: 13,
+    color: '#6b7280',
+    marginTop: 8,
+    marginBottom: 8,
+    fontStyle: 'italic',
+  },
+  pastFollowUpWarning: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fef3c7',
+    padding: 8,
+    borderRadius: 6,
+    marginTop: 8,
+    gap: 6,
+  },
+  pastFollowUpWarningText: {
+    fontSize: 12,
+    color: '#d97706',
+    fontWeight: '500',
+  },
+  followUpActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-start',
+    gap: 12,
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+  },
+  followUpActionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+    gap: 4,
+  },
+  followUpActionText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  followUpContext: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fef3c7',
+    padding: 12,
+    marginHorizontal: 16,
+    marginTop: 8,
+    borderRadius: 8,
+    gap: 8,
+  },
+  followUpContextText: {
+    fontSize: 13,
+    color: '#d97706',
+    fontWeight: '500',
+  },
+  dateTimeButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    padding: 12,
+    backgroundColor: '#ffffff',
+    marginTop: 8,
+  },
+  dateTimeButtonText: {
+    fontSize: 14,
+    color: '#374151',
+  },
+  statusButtons: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  statusButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+  },
+  statusButtonActive: {
+    backgroundColor: '#8b5cf6',
+    borderColor: '#8b5cf6',
+  },
+  statusButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#6b7280',
+  },
+  statusButtonTextActive: {
+    color: '#ffffff',
+  },
+  notesSectionDivider: {
+    marginTop: 24,
+    paddingTop: 24,
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+  },
+  notesSectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#374151',
+    marginBottom: 12,
   },
 })
 

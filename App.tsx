@@ -17,6 +17,7 @@ import { UnifiedSyncService } from './src/services/unifiedSyncService';
 import { InitialSyncService } from './src/services/initialSyncService';
 import { AppDataProvider, useAppData } from './src/context/AppDataContext';
 import { GlobalFormProvider } from './src/context/GlobalFormContext';
+import { LogFileWriter } from './src/utils/logFileWriter';
 import UnifiedSyncIndicator from './src/components/UnifiedSyncIndicator';
 import LoginScreen from './src/screens/LoginScreen';
 import AdminDashboardScreen from './src/screens/admin/AdminDashboardScreen';
@@ -156,15 +157,29 @@ function AppNavigator() {
     <NavigationContainer>
       <Stack.Navigator>
         {user ? (
-          // User is logged in
-          <>
-            <Stack.Screen name="MRTabs" component={MRTabs} options={{ headerShown: false }} />
-            <Stack.Screen name="SlideManagement" component={SlideManagementScreen} />
-            <Stack.Screen name="BrochureViewer" component={BrochureViewerScreen} />
-            <Stack.Screen name="DoctorBrochures" component={DoctorBrochuresScreen} />
-            <Stack.Screen name="DoctorGroupViewer" component={DoctorGroupViewerScreen} />
-            <Stack.Screen name="MeetingDetails" component={MeetingDetailsScreen} />
-          </>
+          // User is logged in - show appropriate dashboard based on role
+          user.role === 'admin' ? (
+            // Admin user - show AdminTabs
+            <>
+              <Stack.Screen name="AdminTabs" component={AdminTabs} options={{ headerShown: false }} />
+              <Stack.Screen name="AddMR" component={AddMRScreen} />
+              <Stack.Screen name="ViewAllMRs" component={ViewAllMRsScreen} />
+              <Stack.Screen name="AddBrochure" component={AddBrochureScreen} />
+              <Stack.Screen name="ViewAllBrochures" component={ViewAllBrochuresScreen} />
+              <Stack.Screen name="DocumentViewer" component={DocumentViewerScreen} />
+              <Stack.Screen name="SlideManagement" component={SlideManagementScreen} />
+            </>
+          ) : (
+            // MR user - show MRTabs
+            <>
+              <Stack.Screen name="MRTabs" component={MRTabs} options={{ headerShown: false }} />
+              <Stack.Screen name="SlideManagement" component={SlideManagementScreen} />
+              <Stack.Screen name="BrochureViewer" component={BrochureViewerScreen} />
+              <Stack.Screen name="DoctorBrochures" component={DoctorBrochuresScreen} />
+              <Stack.Screen name="DoctorGroupViewer" component={DoctorGroupViewerScreen} />
+              <Stack.Screen name="MeetingDetails" component={MeetingDetailsScreen} />
+            </>
+          )
         ) : (
           // No user is logged in
           <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
@@ -184,6 +199,9 @@ export default function App() {
   // useActivityTracker(); // DISABLED - causing sync issues
 
   useEffect(() => {
+    // Initialize log file writer for debugging sync operations
+    LogFileWriter.initialize().catch(console.error);
+    
     checkAuthState();
   }, []);
 
@@ -259,8 +277,10 @@ export default function App() {
             // Even if sync is skipped, clean up any duplicates that may exist
             try {
               const { ComprehensiveServerSyncService } = await import('./src/services/comprehensiveServerSyncService');
+              const { LocalDatabaseService } = await import('./src/services/localDatabaseService');
               await Promise.all([
-                ComprehensiveServerSyncService.cleanupDuplicateDoctorsByName(autoLoginResult.user.id),
+                // Note: cleanupDuplicateDoctorsByName was removed - use cleanupDuplicateDoctorsByServerId instead
+                // This is handled automatically by LocalDatabaseService during doctor operations
                 ComprehensiveServerSyncService.cleanupDuplicateMeetings(autoLoginResult.user.id),
                 ComprehensiveServerSyncService.cleanupDuplicateSavedBrochures(autoLoginResult.user.id),
                 ComprehensiveServerSyncService.cleanupDuplicateMeetingSlideNotes(autoLoginResult.user.id)

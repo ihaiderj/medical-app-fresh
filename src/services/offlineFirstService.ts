@@ -3,10 +3,10 @@
  * Provides offline-first CRUD operations for all entities
  * Automatically syncs with server when online
  */
-import { LocalDatabaseService, LocalDoctor, LocalMeeting, LocalMeetingNote, LocalDoctorAssignment, LocalSavedBrochure } from './localDatabaseService';
+import { LocalDatabaseService, LocalDoctor, LocalMeeting, LocalMeetingNote, LocalMeetingFollowUp, LocalDoctorAssignment, LocalSavedBrochure } from './localDatabaseService';
 import { NetworkService } from './networkService';
 import { AuthService } from './AuthService';
-import { MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from './MRService';
+import type { MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from './MRService';
 
 // Request/Response interfaces
 export interface CreateDoctorRequest {
@@ -109,6 +109,22 @@ export interface UpdateMeetingNoteRequest {
   slide_order?: number;
   note_text?: string;
   slide_image_uri?: string;
+  follow_up_id?: string;
+}
+
+export interface CreateMeetingFollowUpRequest {
+  meeting_id: string;
+  follow_up_date: string;
+  follow_up_time: string;
+  follow_up_notes?: string;
+  status?: 'scheduled' | 'completed' | 'cancelled';
+}
+
+export interface UpdateMeetingFollowUpRequest {
+  follow_up_date?: string;
+  follow_up_time?: string;
+  follow_up_notes?: string;
+  status?: 'scheduled' | 'completed' | 'cancelled';
 }
 
 export interface CreateBrochureSyncRequest {
@@ -196,16 +212,33 @@ export class OfflineFirstService {
     }
   }
 
-  static async deleteDoctor(id: string): Promise<ServiceResponse<void>> {
+  static async deleteDoctor(id: string, deleteRelatedMeetings: boolean = false): Promise<ServiceResponse<{ hasMeetings: boolean; meetingCount: number }>> {
     try {
-      await LocalDatabaseService.deleteDoctor(id);
+      const result = await LocalDatabaseService.deleteDoctor(id, deleteRelatedMeetings);
+      
+      if (!result.success) {
+        return { 
+          success: false, 
+          error: result.error || 'Failed to delete doctor',
+          data: { hasMeetings: result.hasMeetings, meetingCount: result.meetingCount }
+        };
+      }
+      
       const isOnline = await NetworkService.isOnline();
       if (isOnline) {
         this.enqueueDoctorSyncById(id).catch(console.warn);
       }
-      return { success: true, isOffline: !isOnline };
+      return { 
+        success: true, 
+        isOffline: !isOnline,
+        data: { hasMeetings: result.hasMeetings, meetingCount: result.meetingCount }
+      };
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete doctor' };
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Failed to delete doctor',
+        data: { hasMeetings: false, meetingCount: 0 }
+      };
     }
   }
 
@@ -495,6 +528,115 @@ export class OfflineFirstService {
     }
   }
 
+  // ==================== MEETING FOLLOW-UPS ====================
+
+  static async createMeetingFollowUp(payload: CreateMeetingFollowUpRequest): Promise<ServiceResponse<{ id: string }>> {
+    try {
+      const id = await LocalDatabaseService.createMeetingFollowUp({
+        meeting_id: payload.meeting_id,
+        follow_up_date: payload.follow_up_date,
+        follow_up_time: payload.follow_up_time,
+        follow_up_notes: payload.follow_up_notes,
+        status: payload.status || 'scheduled'
+      });
+
+      const isOnline = await NetworkService.isOnline();
+      if (isOnline) {
+        this.enqueueMeetingFollowUpSyncByMeeting(payload.meeting_id).catch(console.warn);
+      }
+
+      return { success: true, data: { id }, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to create meeting follow-up' };
+    }
+  }
+
+  static async updateMeetingFollowUp(id: string, updates: UpdateMeetingFollowUpRequest): Promise<ServiceResponse<void>> {
+    try {
+      await LocalDatabaseService.updateMeetingFollowUp(id, updates as Partial<LocalMeetingFollowUp>);
+
+      const isOnline = await NetworkService.isOnline();
+      if (isOnline) {
+        this.enqueueMeetingFollowUpSyncById(id).catch(console.warn);
+      }
+
+      return { success: true, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to update meeting follow-up' };
+    }
+  }
+
+  static async deleteMeetingFollowUp(id: string): Promise<ServiceResponse<void>> {
+    try {
+      await LocalDatabaseService.deleteMeetingFollowUp(id);
+
+      const isOnline = await NetworkService.isOnline();
+      if (isOnline) {
+        // Note: Deletion sync is handled by sync queue
+      }
+
+      return { success: true, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete meeting follow-up' };
+    }
+  }
+
+  static async getMeetingFollowUps(meetingId: string): Promise<ServiceResponse<LocalMeetingFollowUp[]>> {
+    try {
+      await LocalDatabaseService.ensureReady();
+      const followUps = await LocalDatabaseService.getMeetingFollowUps(meetingId);
+      const isOnline = await NetworkService.isOnline();
+      if (isOnline) {
+        this.enqueueMeetingFollowUpSyncByMeeting(meetingId).catch(console.warn);
+      }
+      return { success: true, data: followUps, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to load meeting follow-ups' };
+    }
+  }
+
+  static async getLatestMeetingFollowUp(meetingId: string): Promise<ServiceResponse<LocalMeetingFollowUp | null>> {
+    try {
+      await LocalDatabaseService.ensureReady();
+      const followUp = await LocalDatabaseService.getLatestMeetingFollowUp(meetingId);
+      return { success: true, data: followUp };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to load latest follow-up' };
+    }
+  }
+
+  static async getFollowUpCount(meetingId: string): Promise<ServiceResponse<number>> {
+    try {
+      await LocalDatabaseService.ensureReady();
+      const count = await LocalDatabaseService.getFollowUpCount(meetingId);
+      return { success: true, data: count };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to get follow-up count' };
+    }
+  }
+
+  private static async enqueueMeetingFollowUpSyncByMeeting(meetingId: string) {
+    try {
+      const followUps = await LocalDatabaseService.getMeetingFollowUps(meetingId);
+      // Follow-ups are already queued via addToSyncQueue in createMeetingFollowUp
+      // This method is kept for future server merge logic if needed
+      console.log(`OfflineFirst: Found ${followUps.length} follow-ups for meeting ${meetingId} (already queued for sync)`);
+    } catch (error) {
+      console.warn('OfflineFirst: meeting follow-up sync failed', error);
+    }
+  }
+
+  private static async enqueueMeetingFollowUpSyncById(id: string) {
+    try {
+      const followUp = await LocalDatabaseService.getMeetingFollowUpById(id);
+      if (!followUp) return;
+      // Follow-ups are already queued via addToSyncQueue in createMeetingFollowUp
+      console.log(`OfflineFirst: Found follow-up ${id} for meeting ${followUp.meeting_id} (already queued for sync)`);
+    } catch (error) {
+      console.warn('OfflineFirst: meeting follow-up sync by id failed', error);
+    }
+  }
+
   // ==================== BROCHURE CACHE ====================
 
   static async saveBrochure(payload: CreateSavedBrochureRequest): Promise<ServiceResponse<{ id: string }>> {
@@ -616,12 +758,12 @@ export class OfflineFirstService {
         success: true, 
         data: {
           doctors_connected: localStats.doctors_connected,
-          scheduled_meetings: localStats.meetings_scheduled,
+          scheduled_meetings: localStats.scheduled_meetings,
           brochures_available: brochuresAvailable,
-          active_presentations: 0, // TODO: Calculate from active meetings
-          monthly_meetings: 0, // TODO: Calculate from meetings this month
-          completed_meetings: 0, // TODO: Calculate from completed meetings
-          brochures_uploaded: localStats.brochures_downloaded,
+          active_presentations: localStats.active_presentations,
+          monthly_meetings: localStats.monthly_meetings,
+          completed_meetings: localStats.completed_meetings,
+          brochures_uploaded: localStats.brochures_uploaded,
         },
         isOffline: true 
       };

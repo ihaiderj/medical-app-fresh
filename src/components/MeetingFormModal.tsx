@@ -203,6 +203,13 @@ export default function MeetingFormModal({
     }
 
     setIsLoading(true);
+    
+    // Prevent double-submission
+    if (isLoading) {
+      console.warn('⚠️ MEETING_FORM: Submission already in progress, ignoring duplicate submit');
+      return;
+    }
+    
     try {
       const meetingData = {
         doctor_id: formData.doctor_id,
@@ -221,6 +228,25 @@ export default function MeetingFormModal({
         Alert.alert('Error', 'User information not available. Please try again.');
         setIsLoading(false);
         return;
+      }
+
+      // Validate doctor_id exists before creating meeting
+      if (!existingMeeting?.id && meetingData.doctor_id) {
+        try {
+          const doctorsResult = await UnifiedDataService.getDoctors(userId);
+          if (doctorsResult.success && doctorsResult.data) {
+            const doctorExists = doctorsResult.data.find(d => 
+              d.id === meetingData.doctor_id || d.server_id === meetingData.doctor_id
+            );
+            if (!doctorExists) {
+              Alert.alert('Error', 'Selected doctor not found. Please select a valid doctor.');
+              setIsLoading(false);
+              return;
+            }
+          }
+        } catch (error) {
+          console.warn('⚠️ MEETING_FORM: Could not validate doctor, proceeding:', error);
+        }
       }
 
       let result;

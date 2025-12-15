@@ -13,14 +13,16 @@ import { LocalDatabaseService } from '../../services/localDatabaseService';
 import { ComprehensiveServerSyncService } from '../../services/comprehensiveServerSyncService';
 import { AdvancedSyncService } from '../../services/advancedSyncService';
 import { FirstTimeLoginService } from '../../services/firstTimeLoginService';
+import { SyncVerificationService } from '../../services/syncVerificationService';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import SyncTestPanel from '../../components/SyncTestPanel';
 
 interface MRDashboardScreenProps {
   navigation: any
 }
 
 export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps) {
-  const { user, onMeetingChange, onDoctorChange, onBrochureChange, onActivityChange } = useAppData();
+  const { user, onMeetingChange, onDoctorChange, onBrochureChange, onActivityChange, logoutUser } = useAppData();
   const [dashboardStats, setDashboardStats] = useState<MRDashboardStats | null>(null)
   const [recentActivities, setRecentActivities] = useState<MRRecentActivity[]>([])
   const [upcomingMeetings, setUpcomingMeetings] = useState<MRUpcomingMeeting[]>([])
@@ -29,6 +31,27 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [availableBrochuresCount, setAvailableBrochuresCount] = useState(0)
   const [isSyncing, setIsSyncing] = useState(false)
   const [syncProgress, setSyncProgress] = useState<{ step: string; message: string; progress: number } | null>(null)
+  const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0 })
+  const [showTestPanel, setShowTestPanel] = useState(false)
+
+  // Load sync stats periodically
+  useEffect(() => {
+    const loadSyncStats = async () => {
+      try {
+        const result = await OfflineFirstService.getSyncStats();
+        if (result.success && result.data) {
+          setSyncStats(result.data);
+        }
+      } catch (error) {
+        console.error('Failed to load sync stats:', error);
+      }
+    };
+    
+    loadSyncStats();
+    const interval = setInterval(loadSyncStats, 30000); // Refresh every 30 seconds
+    
+    return () => clearInterval(interval);
+  }, []);
 
   // Set user profile from context immediately
   useEffect(() => {
@@ -177,7 +200,11 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   useEffect(() => {
     const unsubscribe = onDoctorChange(() => {
       console.log('MRDashboard: Received doctor change notification, refreshing dashboard...');
-      loadDashboardData();
+      // Defer the state update to avoid setState during render
+      const { InteractionManager } = require('react-native');
+      InteractionManager.runAfterInteractions(() => {
+        loadDashboardData();
+      });
     });
     return unsubscribe;
   }, [onDoctorChange, loadDashboardData])
@@ -228,13 +255,23 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       setSyncProgress({ step: 'Uploading', message: 'Uploading local changes to server...', progress: 50 });
       console.log('🚀 MANUAL SYNC DEBUG: Uploading local changes...');
       
-      // Perform upload-only sync (no download - faster and matches offline-first principle)
-      const syncResult = await AdvancedSyncService.uploadPendingChangesOnly(user.id);
+      // Perform comprehensive sync to ensure server matches local exactly
+      const syncResult = await AdvancedSyncService.syncLocalToServer(user.id);
       
       if (syncResult.success) {
         console.log('✅ MANUAL SYNC DEBUG: Manual sync completed successfully');
         console.log('📊 MANUAL SYNC DEBUG: Synced operations:', syncResult.syncedOperations);
         console.log('📊 MANUAL SYNC DEBUG: Failed operations:', syncResult.failedOperations);
+        
+        // Verify sync status after sync completes
+        try {
+          console.log('🔍 SYNC VERIFICATION: Verifying sync status...');
+          const verificationResult = await SyncVerificationService.verifySyncStatus(user.id);
+          console.log('📊 SYNC VERIFICATION: Summary:', verificationResult.summary);
+          SyncVerificationService.printSyncLogs();
+        } catch (verifyError) {
+          console.warn('⚠️ SYNC VERIFICATION: Failed to verify sync status:', verifyError);
+        }
         
         // Update last sync timestamp
         await FirstTimeLoginService.updateLastSyncTimestamp();
@@ -273,6 +310,43 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     }
   };
 
+  const handleVerifySync = async () => {
+    if (!user?.id) return;
+    
+    try {
+      Alert.alert(
+        'Sync Verification',
+        'This will verify what data was synced to the server. Check the console logs for detailed results.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Verify',
+            onPress: async () => {
+              console.log('🔍 SYNC VERIFICATION: Starting verification...');
+              const result = await SyncVerificationService.verifySyncStatus(user.id);
+              console.log('📊 SYNC VERIFICATION: Results:', JSON.stringify(result.results, null, 2));
+              SyncVerificationService.printSyncLogs();
+              
+              // Show summary in alert
+              const summaryLines = result.results.map(r => 
+                `${r.entity}: Local=${r.localCount}, Server=${r.serverCount}, Synced=${r.syncedToServerCount}, Queued=${r.queuedCount}`
+              ).join('\n');
+              
+              Alert.alert(
+                'Sync Verification Complete',
+                `Check console logs for details.\n\nSummary:\n${summaryLines}`,
+                [{ text: 'OK' }]
+              );
+            }
+          }
+        ]
+      );
+    } catch (error) {
+      console.error('❌ SYNC VERIFICATION: Error:', error);
+      Alert.alert('Error', 'Failed to verify sync status. Check console logs.');
+    }
+  };
+
   const handleLogout = async () => {
     Alert.alert(
       "Logout",
@@ -297,10 +371,10 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
               
               const result = await AuthService.logout()
               if (result.success) {
-                navigation.reset({
-                  index: 0,
-                  routes: [{ name: 'Login' }],
-                })
+                // Use AppDataContext logoutUser which will automatically trigger navigation change
+                // when user state becomes null, the AppNavigator will show Login screen
+                // No need to manually reset navigation - AppNavigator handles it automatically
+                logoutUser();
               } else {
                 Alert.alert("Error", "Failed to logout. Please try again.")
               }
@@ -327,7 +401,8 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   }
 
   // Helper function to get activity icon
-  const getActivityIcon = (activityType: string) => {
+  const getActivityIcon = (activityType?: string) => {
+    if (!activityType) return 'information-circle';
     switch (activityType.toLowerCase()) {
       case 'login': return 'log-in'
       case 'logout': return 'log-out'
@@ -461,17 +536,35 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
             <TouchableOpacity style={styles.debugButton} onPress={debugReloadData}>
               <Ionicons name="refresh" size={24} color="#3b82f6" />
             </TouchableOpacity>
-            <TouchableOpacity 
-              style={[styles.syncButton, isSyncing && styles.syncButtonActive]} 
-              onPress={handleManualSync}
-              disabled={isSyncing}
-            >
-              <Ionicons 
-                name={isSyncing ? "sync" : "cloud-upload-outline"} 
-                size={24} 
-                color={isSyncing ? "#f59e0b" : "#10b981"} 
-              />
-            </TouchableOpacity>
+            <View style={{ position: 'relative' }}>
+              <TouchableOpacity 
+                style={[styles.syncButton, isSyncing && styles.syncButtonActive]} 
+                onPress={handleManualSync}
+                onLongPress={() => {
+                  Alert.alert(
+                    'Sync Options',
+                    'Choose an option',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      { text: 'Verify Sync', onPress: handleVerifySync },
+                      { text: 'Test Panel', onPress: () => setShowTestPanel(true) }
+                    ]
+                  );
+                }}
+                disabled={isSyncing}
+              >
+                <Ionicons 
+                  name={isSyncing ? "sync" : "cloud-upload-outline"} 
+                  size={24} 
+                  color={isSyncing ? "#f59e0b" : "#10b981"} 
+                />
+              </TouchableOpacity>
+              {syncStats.pending > 0 && (
+                <View style={styles.pendingBadge}>
+                  <Text style={styles.pendingBadgeText}>{syncStats.pending}</Text>
+                </View>
+              )}
+            </View>
             <TouchableOpacity style={styles.profileButton}>
               <Ionicons name="person-circle" size={40} color="#8b5cf6" />
             </TouchableOpacity>
@@ -563,7 +656,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
                     <Ionicons name={getActivityIcon(activity.activity_type) as any} size={20} color="#8b5cf6" />
                   </View>
                   <View style={styles.activityContent}>
-                    <Text style={styles.activityTitle}>{activity.description}</Text>
+                    <Text style={styles.activityTitle}>{activity.description || 'Activity'}</Text>
                     <Text style={styles.activitySubtitle}>
                       {formatTimeAgo(activity.created_at)}
                     </Text>
@@ -605,6 +698,15 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         )}
         </ScrollView>
       </SafeAreaView>
+
+      {/* Sync Test Panel Modal */}
+      {showTestPanel && (
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <SyncTestPanel onClose={() => setShowTestPanel(false)} />
+          </View>
+        </View>
+      )}
     </View>
   )
 }
@@ -662,6 +764,24 @@ const styles = StyleSheet.create({
     backgroundColor: "#fef3c7",
     borderColor: "#f59e0b",
   },
+  modalOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  modalContent: {
+    width: '90%',
+    height: '80%',
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
   syncProgressContainer: {
     marginHorizontal: 20,
     marginVertical: 10,
@@ -700,6 +820,25 @@ const styles = StyleSheet.create({
   },
   profileButton: {
     padding: 4,
+  },
+  pendingBadge: {
+    position: 'absolute',
+    top: -6,
+    right: -6,
+    backgroundColor: '#ffa726',
+    borderRadius: 10,
+    minWidth: 20,
+    height: 20,
+    paddingHorizontal: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#ffffff',
+  },
+  pendingBadgeText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: 'bold',
   },
   logoutButton: {
     padding: 8,

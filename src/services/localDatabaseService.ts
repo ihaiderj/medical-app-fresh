@@ -83,6 +83,25 @@ export interface LocalMeetingNote {
   brochure_id: string;
   note_text: string;
   slide_image_uri?: string;
+  follow_up_id?: string;
+  created_at: string;
+  updated_at: string;
+  last_modified?: string;
+  version: number;
+  sync_status: 'pending' | 'synced' | 'conflict' | 'error';
+  is_deleted: boolean;
+  local_changes?: string;
+}
+
+export interface LocalMeetingFollowUp {
+  id: string;
+  server_id?: string;
+  meeting_id: string;
+  follow_up_date: string;
+  follow_up_time: string;
+  follow_up_notes?: string;
+  status: 'scheduled' | 'completed' | 'cancelled';
+  sequence_number: number;
   created_at: string;
   updated_at: string;
   last_modified?: string;
@@ -918,6 +937,26 @@ export class LocalDatabaseService {
         brochure_id TEXT NOT NULL,
         note_text TEXT NOT NULL,
         slide_image_uri TEXT,
+        follow_up_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_modified TEXT,
+        version INTEGER DEFAULT 1,
+        sync_status TEXT DEFAULT 'pending',
+        is_deleted INTEGER DEFAULT 0,
+        local_changes TEXT
+      );
+
+      -- Meeting follow-ups table
+      CREATE TABLE IF NOT EXISTS meeting_followups (
+        id TEXT PRIMARY KEY,
+        server_id TEXT,
+        meeting_id TEXT NOT NULL,
+        follow_up_date TEXT NOT NULL,
+        follow_up_time TEXT NOT NULL,
+        follow_up_notes TEXT,
+        status TEXT DEFAULT 'scheduled',
+        sequence_number INTEGER DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_modified TEXT,
@@ -1156,8 +1195,14 @@ export class LocalDatabaseService {
       CREATE INDEX IF NOT EXISTS idx_meeting_notes_meeting_id ON meeting_notes(meeting_id);
       CREATE INDEX IF NOT EXISTS idx_meeting_notes_slide_id ON meeting_notes(slide_id);
       CREATE INDEX IF NOT EXISTS idx_meeting_notes_brochure_id ON meeting_notes(brochure_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS unique_meeting_slide_note ON meeting_notes(meeting_id, slide_id);
+      CREATE INDEX IF NOT EXISTS idx_meeting_notes_follow_up_id ON meeting_notes(follow_up_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS unique_meeting_slide_note ON meeting_notes(meeting_id, slide_id, COALESCE(follow_up_id, ''));
       CREATE INDEX IF NOT EXISTS idx_meeting_notes_sync_status ON meeting_notes(sync_status);
+
+      CREATE INDEX IF NOT EXISTS idx_meeting_followups_meeting_id ON meeting_followups(meeting_id);
+      CREATE INDEX IF NOT EXISTS idx_meeting_followups_server_id ON meeting_followups(server_id);
+      CREATE INDEX IF NOT EXISTS idx_meeting_followups_sync_status ON meeting_followups(sync_status);
+      CREATE INDEX IF NOT EXISTS idx_meeting_followups_sequence ON meeting_followups(meeting_id, sequence_number);
 
       CREATE UNIQUE INDEX IF NOT EXISTS brochure_sync_unique ON brochure_sync(mr_id, brochure_id);
       CREATE INDEX IF NOT EXISTS idx_brochure_sync_mr_id ON brochure_sync(mr_id);
@@ -1328,6 +1373,44 @@ export class LocalDatabaseService {
         } catch (error) {
           console.log('LocalDB: Could not verify saved_brochures schema, assuming migration needed');
           await this.runMigration_004();
+        }
+      }
+      
+      // Migration 5: Create meeting_followups table and add follow_up_id to meeting_notes
+      if (currentVersion < 5) {
+        try {
+          await this.runMigration_005();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 005 failed, but continuing:', migrationError);
+          // Don't throw - allow app to continue even if migration fails
+        }
+      } else {
+        // Verify the table exists
+        try {
+          const tableCheck = await this.db.prepareAsync(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='meeting_followups'"
+          );
+          const tableResult = await tableCheck.executeAsync();
+          const tables = await tableResult.getAllAsync();
+          await tableCheck.finalizeAsync();
+          
+          if (tables.length === 0) {
+            console.log('LocalDB: Schema version is 5 but meeting_followups table is missing, running migration 005...');
+            try {
+              await this.runMigration_005();
+            } catch (migrationError) {
+              console.error('LocalDB: Migration 005 failed during verification, but continuing:', migrationError);
+              // Don't throw - allow app to continue
+            }
+          }
+        } catch (error) {
+          console.log('LocalDB: Could not verify meeting_followups table, trying migration:', error);
+          try {
+            await this.runMigration_005();
+          } catch (migrationError) {
+            console.error('LocalDB: Migration 005 failed during error recovery, but continuing:', migrationError);
+            // Don't throw - allow app to continue
+          }
         }
       }
       
@@ -1565,6 +1648,141 @@ export class LocalDatabaseService {
     } catch (error) {
       console.error('LocalDB: Migration 004 failed:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Migration 005: Create meeting_followups table and add follow_up_id to meeting_notes
+   */
+  private static async runMigration_005(): Promise<void> {
+    console.log('LocalDB: Running migration 005 - Creating meeting_followups table and adding follow_up_id to meeting_notes...');
+    
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+    
+    try {
+      // Create meeting_followups table if it doesn't exist
+      try {
+        await this.db.execAsync(`
+          CREATE TABLE IF NOT EXISTS meeting_followups (
+            id TEXT PRIMARY KEY,
+            server_id TEXT,
+            meeting_id TEXT NOT NULL,
+            follow_up_date TEXT NOT NULL,
+            follow_up_time TEXT NOT NULL,
+            follow_up_notes TEXT,
+            status TEXT DEFAULT 'scheduled',
+            sequence_number INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_modified TEXT,
+            version INTEGER DEFAULT 1,
+            sync_status TEXT DEFAULT 'pending',
+            is_deleted INTEGER DEFAULT 0,
+            local_changes TEXT
+          )
+        `);
+        console.log('LocalDB: Created meeting_followups table');
+      } catch (error: any) {
+        if (error?.message?.includes('already exists')) {
+          console.log('LocalDB: meeting_followups table already exists');
+        } else {
+          console.warn('LocalDB: Could not create meeting_followups table:', error);
+          throw error;
+        }
+      }
+
+      // Create indexes for meeting_followups
+      try {
+        await this.db.execAsync(`
+          CREATE INDEX IF NOT EXISTS idx_meeting_followups_meeting_id ON meeting_followups(meeting_id);
+          CREATE INDEX IF NOT EXISTS idx_meeting_followups_server_id ON meeting_followups(server_id);
+          CREATE INDEX IF NOT EXISTS idx_meeting_followups_sync_status ON meeting_followups(sync_status);
+          CREATE INDEX IF NOT EXISTS idx_meeting_followups_sequence ON meeting_followups(meeting_id, sequence_number);
+        `);
+        console.log('LocalDB: Created indexes for meeting_followups table');
+      } catch (error: any) {
+        console.warn('LocalDB: Could not create indexes for meeting_followups:', error);
+        // Don't throw - indexes are optional
+      }
+
+      // Add follow_up_id column to meeting_notes if it doesn't exist
+      try {
+        const tableInfo = await this.db.prepareAsync('PRAGMA table_info(meeting_notes)');
+        const result = await tableInfo.executeAsync();
+        const columns = await result.getAllAsync();
+        await tableInfo.finalizeAsync();
+        
+        const columnNames = columns.map((col: any) => col.name);
+        if (!columnNames.includes('follow_up_id')) {
+          await this.db.execAsync('ALTER TABLE meeting_notes ADD COLUMN follow_up_id TEXT');
+          console.log('LocalDB: Added follow_up_id column to meeting_notes table');
+        } else {
+          console.log('LocalDB: follow_up_id already exists in meeting_notes table');
+        }
+      } catch (error: any) {
+        if (error?.message?.includes('duplicate column name') || error?.message?.includes('already exists')) {
+          console.log('LocalDB: follow_up_id already exists in meeting_notes table');
+        } else {
+          console.warn('LocalDB: Could not add follow_up_id to meeting_notes:', error);
+        }
+      }
+
+      // Update unique index on meeting_notes to include follow_up_id
+      try {
+        // Drop old unique index if it exists
+        await this.db.execAsync('DROP INDEX IF EXISTS unique_meeting_slide_note');
+        // Create new unique index with follow_up_id
+        await this.db.execAsync(`
+          CREATE UNIQUE INDEX IF NOT EXISTS unique_meeting_slide_note 
+          ON meeting_notes(meeting_id, slide_id, COALESCE(follow_up_id, ''))
+        `);
+        console.log('LocalDB: Updated unique index on meeting_notes');
+      } catch (error: any) {
+        console.warn('LocalDB: Could not update unique index on meeting_notes:', error);
+        // Don't throw - index update is optional
+      }
+
+      // Create index for follow_up_id if it doesn't exist
+      try {
+        await this.db.execAsync('CREATE INDEX IF NOT EXISTS idx_meeting_notes_follow_up_id ON meeting_notes(follow_up_id)');
+        console.log('LocalDB: Created index for follow_up_id on meeting_notes');
+      } catch (error: any) {
+        console.warn('LocalDB: Could not create index for follow_up_id:', error);
+        // Don't throw - index is optional
+      }
+      
+      // Update schema version to 5
+      try {
+        const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 5');
+        const versionResult = await versionCheck.executeAsync();
+        const versionRow = await versionResult.getFirstAsync();
+        await versionCheck.finalizeAsync();
+        
+        if (!versionRow) {
+          await this.db.execAsync('INSERT INTO schema_version (version) VALUES (5)');
+          console.log('LocalDB: Schema version updated to 5');
+        } else {
+          console.log('LocalDB: Schema version 5 already exists');
+        }
+      } catch (error) {
+        // If check fails, try to insert (might fail if duplicate, that's okay)
+        try {
+          await this.db.execAsync('INSERT INTO schema_version (version) VALUES (5)');
+          console.log('LocalDB: Schema version updated to 5');
+        } catch (insertError) {
+          // Ignore duplicate entry errors
+          console.log('LocalDB: Schema version 5 already exists');
+        }
+      }
+      
+      console.log('LocalDB: Migration 005 completed');
+    } catch (error) {
+      console.error('LocalDB: Migration 005 failed:', error);
+      // Don't throw - log error but allow app to continue
+      // The getMeetingFollowUps method will handle missing table gracefully
+      console.warn('LocalDB: App will continue without meeting_followups table. Method will return empty array.');
     }
   }
 
@@ -1881,8 +2099,16 @@ export class LocalDatabaseService {
 
   /**
    * Delete doctor (soft delete)
+   * @param id - Doctor ID to delete
+   * @param deleteRelatedMeetings - Whether to delete related meetings
+   * @returns Object with success status, hasMeetings flag, and meetingCount
    */
-  static async deleteDoctor(id: string): Promise<void> {
+  static async deleteDoctor(id: string, deleteRelatedMeetings: boolean = false): Promise<{ 
+    success: boolean; 
+    hasMeetings: boolean; 
+    meetingCount: number; 
+    error?: string 
+  }> {
     await this.initialize();
     
     try {
@@ -1891,7 +2117,27 @@ export class LocalDatabaseService {
         console.warn(`LocalDB: Attempted to delete non-existent doctor with id: ${id}`);
         // If it doesn't exist locally, ensure it's not in the sync queue either
         await this.executeQuery(`DELETE FROM sync_queue WHERE record_id = ? AND table_name = 'doctors'`, [id]);
-        return;
+        return { success: false, hasMeetings: false, meetingCount: 0, error: 'Doctor not found' };
+      }
+
+      // Check for related meetings - get all meetings for the MR and filter by doctor_id
+      const allMeetings = await this.getMeetings(doctorToDelete.mr_id);
+      const relatedMeetings = allMeetings.filter(m => 
+        (m.doctor_id === id || m.doctor_server_id === id) && !m.is_deleted
+      );
+      const hasMeetings = relatedMeetings.length > 0;
+      const meetingCount = relatedMeetings.length;
+
+      // If doctor has meetings and deleteRelatedMeetings is false, return early
+      if (hasMeetings && !deleteRelatedMeetings) {
+        return { success: false, hasMeetings: true, meetingCount, error: 'Doctor has related meetings' };
+      }
+
+      // Delete related meetings if requested
+      if (hasMeetings && deleteRelatedMeetings) {
+        for (const meeting of relatedMeetings) {
+          await this.deleteMeeting(meeting.id);
+        }
       }
 
       const now = new Date().toISOString();
@@ -1906,9 +2152,15 @@ export class LocalDatabaseService {
       await this.addToSyncQueue('delete', 'doctors', id, doctorToDelete);
       
       console.log('LocalDB: Doctor soft deleted:', id);
+      return { success: true, hasMeetings, meetingCount };
     } catch (error) {
       console.error('LocalDB: Failed to delete doctor:', error);
-      throw error;
+      return { 
+        success: false, 
+        hasMeetings: false, 
+        meetingCount: 0, 
+        error: error instanceof Error ? error.message : 'Failed to delete doctor' 
+      };
     }
   }
 
@@ -2261,6 +2513,46 @@ export class LocalDatabaseService {
    */
   static async createMeeting(meetingData: Omit<LocalMeeting, 'id' | 'created_at' | 'updated_at' | 'version' | 'sync_status' | 'is_deleted'>): Promise<string> {
     await this.initialize();
+    
+    // CRITICAL: Check for duplicate meetings before creating
+    // Check for existing meeting with same title + scheduled_date + doctor_id (within 1 minute tolerance)
+    try {
+      const normalizedTitle = (meetingData.title || '').toLowerCase().trim();
+      const normalizedDate = meetingData.scheduled_date ? new Date(meetingData.scheduled_date).toISOString() : '';
+      
+      const existingMeetings = await this.getMeetings(meetingData.mr_id);
+      const duplicate = existingMeetings.find(m => {
+        if (m.is_deleted) return false;
+        
+        // Check if same doctor (by doctor_id or doctor_server_id)
+        const doctorMatch = m.doctor_id === meetingData.doctor_id || 
+                           m.doctor_server_id === meetingData.doctor_id ||
+                           m.doctor_id === meetingData.doctor_server_id;
+        if (!doctorMatch) return false;
+        
+        // Check if same scheduled date (within 1 minute tolerance)
+        const mDate = m.scheduled_date ? new Date(m.scheduled_date).toISOString() : '';
+        const dateMatch = mDate === normalizedDate || 
+                         (mDate && normalizedDate && 
+                          Math.abs(new Date(mDate).getTime() - new Date(normalizedDate).getTime()) < 60000);
+        if (!dateMatch) return false;
+        
+        // Check if same title (case-insensitive)
+        const mTitle = (m.title || '').toLowerCase().trim();
+        const titleMatch = mTitle === normalizedTitle;
+        
+        return titleMatch;
+      });
+      
+      if (duplicate) {
+        console.warn(`⚠️ MEETING_CREATE: Duplicate meeting detected - "${meetingData.title}" on ${meetingData.scheduled_date} with doctor ${meetingData.doctor_id}. Returning existing meeting ID: ${duplicate.id}`);
+        // Return existing meeting ID instead of creating duplicate
+        return duplicate.id;
+      }
+    } catch (error) {
+      console.warn('⚠️ MEETING_CREATE: Error checking for duplicates, proceeding with creation:', error);
+      // Continue with creation if duplicate check fails
+    }
     
     const id = generateUUID();
     const now = new Date().toISOString();
@@ -2636,8 +2928,7 @@ export class LocalDatabaseService {
         const matchingLocal = await this.findMatchingLocalMeeting(meeting.mr_id, meeting, undefined);
         
         if (matchingLocal) {
-          console.log(`🔴 MEETING_SYNC: Found matching local meeting without server_id: ${matchingLocal.id}, linking to server_id: ${meeting.server_id}`);
-          console.log(`🔴 MEETING_SYNC: Preventing duplicate by updating existing meeting instead of creating new one`);
+          console.log(`🔗 MEETINGS SYNC DEBUG: Found matching local meeting without server_id: ${matchingLocal.id}, linking to server_id: ${meeting.server_id}`);
           
           // Update the local meeting with server_id and server data
           // IMPORTANT: Preserve is_deleted flag if meeting was locally deleted
@@ -2653,7 +2944,6 @@ export class LocalDatabaseService {
             is_deleted: shouldPreserveDeleted ? true : (meeting.is_deleted ?? matchingLocal.is_deleted),
             skipSyncQueue: true // Server sync, don't queue
           });
-          console.log(`🔴 MEETING_SYNC: Successfully linked local meeting to server_id, duplicate prevented`);
           return;
         }
       }
@@ -2897,30 +3187,36 @@ export class LocalDatabaseService {
   /**
    * Update meeting note
    */
-  static async updateMeetingNote(id: string, updates: Partial<LocalMeetingNote>): Promise<void> {
+  static async updateMeetingNote(id: string, updates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean }): Promise<void> {
     await this.initialize();
     
     try {
+      const skipSyncQueue = updates.skipSyncQueue || false;
       const now = new Date().toISOString();
       const updateFields = [];
       const values = [];
 
+      // Create a mutable copy of updates to modify
+      let finalUpdates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean } = { ...updates };
+
       // Build dynamic update query
-      Object.entries(updates).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at') {
+      Object.entries(finalUpdates).forEach(([key, value]) => {
+        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue') {
           updateFields.push(`${key} = ?`);
           values.push(value);
         }
       });
 
+      const syncStatus = skipSyncQueue ? (finalUpdates.sync_status || 'synced') : 'pending';
       updateFields.push('updated_at = ?', 'version = version + 1', 'sync_status = ?');
-      values.push(now, 'pending', id);
+      values.push(now, syncStatus, id);
 
       await this.db.runAsync(`
         UPDATE meeting_notes SET ${updateFields.join(', ')} WHERE id = ?
       `, values);
 
-      // Add to sync queue only if note has server_id (was previously synced)
+      // Add to sync queue only if not skipping
+      if (!skipSyncQueue) {
       const updatedNote = await this.getMeetingNoteById(id);
       if (updatedNote) {
         if (updatedNote.server_id) {
@@ -2929,6 +3225,7 @@ export class LocalDatabaseService {
           console.log(`LocalDB: Skipping sync queue for note update - note ${id} has no server_id (local-only)`);
           // Mark as synced since there's nothing to sync
           await this.db.runAsync(`UPDATE meeting_notes SET sync_status = 'synced' WHERE id = ?`, [id]);
+          }
         }
       }
 
@@ -2976,6 +3273,330 @@ export class LocalDatabaseService {
       console.log('LocalDB: Meeting note deleted:', id);
     } catch (error) {
       console.error('LocalDB: Failed to delete meeting note:', error);
+      throw error;
+    }
+  }
+
+  // ==================== MEETING FOLLOW-UPS CRUD ====================
+
+  /**
+   * Get meeting follow-ups by meeting ID
+   */
+  static async getMeetingFollowUps(meetingId: string): Promise<LocalMeetingFollowUp[]> {
+    await this.initialize();
+    
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('meeting_followups');
+        const followUps: LocalMeetingFollowUp[] = data ? JSON.parse(data) : [];
+        return followUps
+          .filter(fu => fu.meeting_id === meetingId && !fu.is_deleted)
+          .sort((a, b) => (a.sequence_number || 0) - (b.sequence_number || 0));
+      }
+
+      const result = await this.db.getAllAsync(`
+        SELECT * FROM meeting_followups 
+        WHERE meeting_id = ? AND is_deleted = 0 
+        ORDER BY sequence_number, created_at
+      `, [meetingId]);
+
+      return result.map((row: any) => ({
+        ...row,
+        is_deleted: Boolean(row.is_deleted)
+      })) as LocalMeetingFollowUp[];
+    } catch (error) {
+      console.error('LocalDB: Failed to get meeting follow-ups:', error);
+      // If table doesn't exist, return empty array (for backward compatibility)
+      return [];
+    }
+  }
+
+  /**
+   * Get meeting follow-up by ID
+   */
+  static async getMeetingFollowUpById(id: string): Promise<LocalMeetingFollowUp | null> {
+    await this.initialize();
+    
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('meeting_followups');
+        const followUps: LocalMeetingFollowUp[] = data ? JSON.parse(data) : [];
+        return followUps.find(fu => fu.id === id && !fu.is_deleted) || null;
+      }
+
+      const result = await this.db.getFirstAsync(`
+        SELECT * FROM meeting_followups WHERE id = ? AND is_deleted = 0
+      `, [id]);
+
+      if (!result) return null;
+
+      return {
+        ...result,
+        is_deleted: Boolean(result.is_deleted)
+      } as LocalMeetingFollowUp;
+    } catch (error) {
+      console.error('LocalDB: Failed to get meeting follow-up by ID:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get latest meeting follow-up for a meeting
+   */
+  static async getLatestMeetingFollowUp(meetingId: string): Promise<LocalMeetingFollowUp | null> {
+    await this.initialize();
+    
+    try {
+      const followUps = await this.getMeetingFollowUps(meetingId);
+      if (followUps.length === 0) return null;
+      
+      // Sort by sequence_number descending and return the first one
+      return followUps.sort((a, b) => (b.sequence_number || 0) - (a.sequence_number || 0))[0];
+    } catch (error) {
+      console.error('LocalDB: Failed to get latest meeting follow-up:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get follow-up count for a meeting
+   */
+  static async getFollowUpCount(meetingId: string): Promise<number> {
+    await this.initialize();
+    
+    try {
+      const followUps = await this.getMeetingFollowUps(meetingId);
+      return followUps.length;
+    } catch (error) {
+      console.error('LocalDB: Failed to get follow-up count:', error);
+      return 0;
+    }
+  }
+
+  /**
+   * Create a new meeting follow-up locally
+   */
+  static async createMeetingFollowUp(followUpData: Omit<LocalMeetingFollowUp, 'id' | 'created_at' | 'updated_at' | 'version' | 'sync_status' | 'is_deleted' | 'sequence_number'> & { skipSyncQueue?: boolean }): Promise<string> {
+    await this.initialize();
+    
+    const id = generateUUID();
+    const now = new Date().toISOString();
+    
+    // Get current max sequence number for this meeting
+    const existingFollowUps = await this.getMeetingFollowUps(followUpData.meeting_id);
+    const maxSequence = existingFollowUps.length > 0 
+      ? Math.max(...existingFollowUps.map(fu => fu.sequence_number || 0))
+      : 0;
+    
+    const followUp: LocalMeetingFollowUp = {
+      id,
+      ...followUpData,
+      sequence_number: maxSequence + 1,
+      created_at: now,
+      updated_at: now,
+      version: 1,
+      sync_status: 'pending',
+      is_deleted: false
+    };
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('meeting_followups');
+        const followUps: LocalMeetingFollowUp[] = data ? JSON.parse(data) : [];
+        followUps.push(followUp);
+        await AsyncStorage.setItem('meeting_followups', JSON.stringify(followUps));
+      } else {
+        await this.db.runAsync(`
+          INSERT INTO meeting_followups (
+            id, server_id, meeting_id, follow_up_date, follow_up_time, follow_up_notes,
+            status, sequence_number, created_at, updated_at, last_modified, version, sync_status, is_deleted, local_changes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          followUp.id, followUp.server_id || null, followUp.meeting_id,
+          followUp.follow_up_date, followUp.follow_up_time, followUp.follow_up_notes || null,
+          followUp.status, followUp.sequence_number, followUp.created_at, followUp.updated_at,
+          followUp.last_modified || null, followUp.version, followUp.sync_status,
+          followUp.is_deleted ? 1 : 0, followUp.local_changes || null
+        ]);
+      }
+
+      // Add to sync queue only if not skipping
+      const skipSyncQueue = followUpData.skipSyncQueue || false;
+      if (!skipSyncQueue) {
+        await this.addToSyncQueue('create', 'meeting_followups', id, followUp);
+      }
+      
+      console.log('LocalDB: Meeting follow-up created locally:', id);
+      return id;
+    } catch (error) {
+      console.error('LocalDB: Failed to create meeting follow-up:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update meeting follow-up
+   */
+  static async updateMeetingFollowUp(id: string, updates: Partial<LocalMeetingFollowUp> & { skipSyncQueue?: boolean }): Promise<void> {
+    await this.initialize();
+    
+    const skipSyncQueue = updates.skipSyncQueue || false;
+    const { skipSyncQueue: _, ...updateData } = updates;
+    
+    try {
+      const now = new Date().toISOString();
+      const updateFields = [];
+      const values = [];
+
+      // Build dynamic update query
+      Object.entries(updateData).forEach(([key, value]) => {
+        if (key !== 'id' && key !== 'created_at') {
+          updateFields.push(`${key} = ?`);
+          if (key === 'is_deleted') {
+            values.push(value ? 1 : 0);
+          } else {
+            values.push(value);
+          }
+        }
+      });
+
+      updateFields.push('updated_at = ?', 'version = version + 1');
+      if (updates.sync_status) {
+        updateFields.push('sync_status = ?');
+        values.push(updates.sync_status, now, id);
+      } else {
+        updateFields.push('sync_status = ?');
+        values.push('pending', now, id);
+      }
+
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('meeting_followups');
+        const followUps: LocalMeetingFollowUp[] = data ? JSON.parse(data) : [];
+        const index = followUps.findIndex(fu => fu.id === id);
+        if (index >= 0) {
+          followUps[index] = { ...followUps[index], ...updateData, updated_at: now };
+          await AsyncStorage.setItem('meeting_followups', JSON.stringify(followUps));
+        }
+      } else {
+        await this.db.runAsync(`
+          UPDATE meeting_followups SET ${updateFields.join(', ')} WHERE id = ?
+        `, values);
+      }
+
+      // Add to sync queue only if not skipping
+      if (!skipSyncQueue) {
+        const updatedFollowUp = await this.getMeetingFollowUpById(id);
+        if (updatedFollowUp) {
+          await this.addToSyncQueue('update', 'meeting_followups', id, updatedFollowUp);
+        }
+      }
+
+      console.log('LocalDB: Meeting follow-up updated:', id);
+    } catch (error) {
+      console.error('LocalDB: Failed to update meeting follow-up:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete meeting follow-up (soft delete)
+   */
+  static async deleteMeetingFollowUp(id: string): Promise<void> {
+    await this.initialize();
+    
+    try {
+      const followUp = await this.getMeetingFollowUpById(id);
+      if (!followUp) {
+        throw new Error(`Follow-up ${id} not found`);
+      }
+
+      const now = new Date().toISOString();
+      
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('meeting_followups');
+        const followUps: LocalMeetingFollowUp[] = data ? JSON.parse(data) : [];
+        const index = followUps.findIndex(fu => fu.id === id);
+        if (index >= 0) {
+          followUps[index] = { ...followUps[index], is_deleted: true, updated_at: now };
+          await AsyncStorage.setItem('meeting_followups', JSON.stringify(followUps));
+        }
+      } else {
+        await this.db.runAsync(`
+          UPDATE meeting_followups 
+          SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ? 
+          WHERE id = ?
+        `, [now, 'pending', id]);
+      }
+
+      // Add to sync queue only if follow-up has server_id (was previously synced)
+      if (followUp.server_id) {
+        await this.addToSyncQueue('delete', 'meeting_followups', id, {
+          id: followUp.id,
+          server_id: followUp.server_id,
+          meeting_id: followUp.meeting_id,
+          is_deleted: true
+        });
+      }
+      
+      // Also delete associated notes
+      const notes = await this.getMeetingNotes(followUp.meeting_id);
+      for (const note of notes) {
+        if (note.follow_up_id === id) {
+          await this.updateMeetingNote(note.id, { is_deleted: true, skipSyncQueue: true });
+        }
+      }
+      
+      console.log('LocalDB: Meeting follow-up deleted:', id);
+    } catch (error) {
+      console.error('LocalDB: Failed to delete meeting follow-up:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Upsert meeting follow-up (for server sync)
+   */
+  static async upsertMeetingFollowUp(followUp: LocalMeetingFollowUp): Promise<void> {
+    await this.initialize();
+    
+    try {
+      const existing = await this.getMeetingFollowUpById(followUp.id);
+      
+      if (existing) {
+        // Update existing
+        await this.updateMeetingFollowUp(followUp.id, {
+          ...followUp,
+          skipSyncQueue: true
+        });
+      } else {
+        // Check if exists by server_id
+        if (followUp.server_id) {
+          try {
+            const byServerId = await this.db.getFirstAsync(`
+              SELECT * FROM meeting_followups WHERE server_id = ? AND is_deleted = 0
+            `, [followUp.server_id]);
+            
+            if (byServerId) {
+              await this.updateMeetingFollowUp(byServerId.id, {
+                ...followUp,
+                id: byServerId.id,
+                skipSyncQueue: true
+              });
+              return;
+            }
+          } catch (error) {
+            // Table might not exist, continue to create
+          }
+        }
+        
+        // Create new
+        await this.createMeetingFollowUp({
+          ...followUp,
+          skipSyncQueue: true
+        });
+      }
+    } catch (error) {
+      console.error('LocalDB: Failed to upsert meeting follow-up:', error);
       throw error;
     }
   }
@@ -3827,6 +4448,188 @@ export class LocalDatabaseService {
   }
 
   /**
+   * Get dashboard statistics for an MR
+   */
+  static async getDashboardStats(mrId: string): Promise<{
+    doctors_connected: number;
+    scheduled_meetings: number;
+    brochures_available: number;
+    active_presentations: number;
+    monthly_meetings: number;
+    completed_meetings: number;
+    brochures_uploaded: number;
+  }> {
+    await this.initialize();
+    
+    try {
+      if (this.isUsingAsyncStorage()) {
+        // AsyncStorage fallback - return zeros
+        return {
+          doctors_connected: 0,
+          scheduled_meetings: 0,
+          brochures_available: 0,
+          active_presentations: 0,
+          monthly_meetings: 0,
+          completed_meetings: 0,
+          brochures_uploaded: 0
+        };
+      }
+
+      // Get doctors count
+      const doctorsResult = await this.db.getFirstAsync(`
+        SELECT COUNT(*) as count FROM doctors WHERE mr_id = ? AND is_deleted = 0
+      `, [mrId]);
+      const doctors_connected = doctorsResult?.count || 0;
+
+      // Get scheduled meetings count (meetings scheduled for today or future)
+      // Count meetings that are scheduled for today or future dates, excluding cancelled ones
+      // Note: scheduled_date is stored as ISO datetime string (e.g., "2025-11-20T08:55:00+00:00")
+      // We need to extract just the date part for comparison
+      const scheduledResult = await this.db.getFirstAsync(`
+        SELECT COUNT(*) as count FROM meetings 
+        WHERE mr_id = ? 
+        AND status != 'cancelled' 
+        AND date(substr(scheduled_date, 1, 10)) >= date('now') 
+        AND is_deleted = 0
+      `, [mrId]);
+      const scheduled_meetings = scheduledResult?.count || 0;
+
+      // Get monthly meetings count (this month)
+      const monthlyResult = await this.db.getFirstAsync(`
+        SELECT COUNT(*) as count FROM meetings 
+        WHERE mr_id = ? AND scheduled_date >= date('now', 'start of month') AND is_deleted = 0
+      `, [mrId]);
+      const monthly_meetings = monthlyResult?.count || 0;
+
+      // Get completed meetings count (this month)
+      const completedResult = await this.db.getFirstAsync(`
+        SELECT COUNT(*) as count FROM meetings 
+        WHERE mr_id = ? AND status = 'completed' 
+        AND scheduled_date >= date('now', 'start of month') AND is_deleted = 0
+      `, [mrId]);
+      const completed_meetings = completedResult?.count || 0;
+
+      // Get saved brochures count (brochures_uploaded)
+      const brochuresResult = await this.db.getFirstAsync(`
+        SELECT COUNT(*) as count FROM saved_brochures WHERE mr_id = ? AND is_deleted = 0
+      `, [mrId]);
+      const brochures_uploaded = brochuresResult?.count || 0;
+
+      // Get available brochures count (from brochure_sync table)
+      const availableResult = await this.db.getFirstAsync(`
+        SELECT COUNT(*) as count FROM brochure_sync WHERE mr_id = ? AND is_deleted = 0
+      `, [mrId]);
+      const brochures_available = availableResult?.count || 0;
+
+      return {
+        doctors_connected,
+        scheduled_meetings,
+        brochures_available,
+        active_presentations: brochures_uploaded, // Use saved brochures as active presentations
+        monthly_meetings,
+        completed_meetings,
+        brochures_uploaded
+      };
+    } catch (error) {
+      console.error('LocalDB: Failed to get dashboard stats:', error);
+      return {
+        doctors_connected: 0,
+        scheduled_meetings: 0,
+        brochures_available: 0,
+        active_presentations: 0,
+        monthly_meetings: 0,
+        completed_meetings: 0,
+        brochures_uploaded: 0
+      };
+    }
+  }
+
+  /**
+   * Get recent activities for an MR
+   */
+  static async getRecentActivities(mrId: string, limit: number = 5): Promise<Array<{
+    id: string;
+    activity_type: string;
+    description: string;
+    created_at: string;
+  }>> {
+    await this.initialize();
+    
+    try {
+      if (this.isUsingAsyncStorage()) {
+        // AsyncStorage fallback - return empty array
+        return [];
+      }
+
+      const result = await this.db.getAllAsync(`
+        SELECT id, action as activity_type, details as description, created_at 
+        FROM activity_logs 
+        WHERE mr_id = ? AND is_deleted = 0 
+        ORDER BY created_at DESC 
+        LIMIT ?
+      `, [mrId, limit]);
+
+      return result.map((row: any) => ({
+        id: row.id,
+        activity_type: row.activity_type || row.action || 'activity',
+        description: row.description || row.details || 'Activity',
+        created_at: row.created_at
+      }));
+    } catch (error) {
+      console.error('LocalDB: Failed to get recent activities:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Get upcoming meetings for an MR
+   */
+  static async getUpcomingMeetings(mrId: string, limit: number = 3): Promise<Array<{
+    meeting_id: string;
+    doctor_name: string;
+    hospital: string;
+    scheduled_date: string;
+    status: string;
+    notes?: string;
+  }>> {
+    await this.initialize();
+    
+    try {
+      if (this.isUsingAsyncStorage()) {
+        // AsyncStorage fallback - return empty array
+        return [];
+      }
+
+      const result = await this.db.getAllAsync(`
+        SELECT 
+          m.id as meeting_id,
+          COALESCE(d.first_name || ' ' || d.last_name, 'Unknown Doctor') as doctor_name,
+          COALESCE(d.hospital, 'Unknown Hospital') as hospital,
+          m.scheduled_date,
+          m.status,
+          m.notes
+        FROM meetings m
+        LEFT JOIN doctors d ON m.doctor_id = d.id
+        WHERE m.mr_id = ? AND m.status != 'cancelled' AND date(substr(m.scheduled_date, 1, 10)) >= date('now') AND m.is_deleted = 0
+        ORDER BY m.scheduled_date ASC
+        LIMIT ?
+      `, [mrId, limit]);
+
+      return result.map((row: any) => ({
+        meeting_id: row.meeting_id,
+        doctor_name: row.doctor_name || 'Unknown Doctor',
+        hospital: row.hospital || 'Unknown Hospital',
+        scheduled_date: row.scheduled_date,
+        status: row.status,
+        notes: row.notes || undefined
+      }));
+    } catch (error) {
+      console.error('LocalDB: Failed to get upcoming meetings:', error);
+      return [];
+    }
+  }
+
+  /**
    * Clean up stale sync queue entries for records that came from server
    * These shouldn't be in the queue since they weren't created/updated by the user
    */
@@ -4308,7 +5111,7 @@ export class LocalDatabaseService {
     try {
       await this.db.runAsync(`
         INSERT INTO users (id, email, role, first_name, last_name, phone, profile_image_url, is_active, created_at, updated_at, sync_status, local_changes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           email = excluded.email,
           role = excluded.role,
@@ -4574,688 +5377,8 @@ export class LocalDatabaseService {
         local_changes = excluded.local_changes,
         is_deleted = excluded.is_deleted
     `, [
-      sync.id, sync.server_id || null, sync.mr_id, sync.brochure_id, 
-      sync.brochure_title || null, sync.brochure_data, sync.last_modified || null,
-      sync.created_at || null, sync.version, sync.sync_status, sync.local_changes || null,
-      sync.is_deleted ? 1 : 0
+      sync.id, sync.server_id || null, sync.mr_id, sync.brochure_id, sync.brochure_title || null, sync.brochure_data,
+      sync.last_modified || null, sync.created_at, sync.version, sync.sync_status, sync.local_changes || null, sync.is_deleted ? 1 : 0
     ]);
-  }
-
-  /**
-   * Find matching local saved brochure without server_id (to avoid duplicates)
-   */
-  static async findMatchingLocalSavedBrochure(mrId: string, brochureId: string, excludeId?: string): Promise<LocalSavedBrochure | null> {
-    await this.initialize();
-    
-    try {
-      if (this.isUsingAsyncStorage()) {
-        const data = await AsyncStorage.getItem('saved_brochures');
-        const brochures: LocalSavedBrochure[] = data ? JSON.parse(data) : [];
-        return brochures.find(b => 
-          b.mr_id === mrId &&
-          !b.server_id &&
-          b.brochure_id === brochureId &&
-          (!excludeId || b.id !== excludeId) &&
-          !b.is_deleted
-        ) || null;
-      }
-
-      const result = await this.db.getFirstAsync(`
-        SELECT * FROM saved_brochures 
-        WHERE mr_id = ? 
-          AND server_id IS NULL 
-          AND brochure_id = ?
-          AND is_deleted = 0
-          ${excludeId ? 'AND id != ?' : ''}
-        LIMIT 1
-      `, excludeId ? [mrId, brochureId, excludeId] : [mrId, brochureId]);
-
-      if (!result) return null;
-
-      return {
-        ...result,
-        is_deleted: Boolean(result.is_deleted)
-      } as LocalSavedBrochure;
-    } catch (error) {
-      console.error('LocalDB: Failed to find matching local saved brochure:', error);
-      return null;
-    }
-  }
-
-  static async upsertSavedBrochure(savedBrochure: LocalSavedBrochure): Promise<void> {
-    await this.initialize();
-    
-    try {
-      // Check if saved brochure exists by id
-      const existingById = await this.getSavedBrochureById(savedBrochure.id);
-      
-      if (existingById) {
-        // Update existing saved brochure
-        await this.executeQuery(`
-          UPDATE saved_brochures SET
-            server_id = ?,
-            mr_id = ?,
-            brochure_id = ?,
-            brochure_title = ?,
-            custom_title = ?,
-            original_brochure_data = ?,
-            saved_at = ?,
-            last_accessed = ?,
-            version = ?,
-            sync_status = ?,
-            local_changes = ?
-          WHERE id = ?
-        `, [
-          savedBrochure.server_id || null,
-          savedBrochure.mr_id,
-          savedBrochure.brochure_id,
-          savedBrochure.brochure_title,
-          savedBrochure.custom_title,
-          savedBrochure.original_brochure_data,
-          savedBrochure.saved_at || null,
-          savedBrochure.last_accessed || null,
-          savedBrochure.version,
-          savedBrochure.sync_status,
-          savedBrochure.local_changes || null,
-          savedBrochure.id
-        ]);
-        return;
-      }
-
-      // Check if saved brochure exists by server_id
-      if (savedBrochure.server_id) {
-        const allSavedBrochures = await this.getSavedBrochures(savedBrochure.mr_id);
-        const existingByServerId = allSavedBrochures.find(b => b.server_id === savedBrochure.server_id);
-        
-        if (existingByServerId) {
-          // Update existing saved brochure with server_id
-          await this.executeQuery(`
-            UPDATE saved_brochures SET
-              server_id = ?,
-              mr_id = ?,
-              brochure_id = ?,
-              brochure_title = ?,
-              custom_title = ?,
-              original_brochure_data = ?,
-              saved_at = ?,
-              last_accessed = ?,
-              version = ?,
-              sync_status = ?,
-              local_changes = ?
-            WHERE id = ?
-          `, [
-            savedBrochure.server_id,
-            savedBrochure.mr_id,
-            savedBrochure.brochure_id,
-            savedBrochure.brochure_title,
-            savedBrochure.custom_title,
-            savedBrochure.original_brochure_data,
-            savedBrochure.saved_at || null,
-            savedBrochure.last_accessed || null,
-            savedBrochure.version,
-            savedBrochure.sync_status,
-            savedBrochure.local_changes || null,
-            existingByServerId.id
-          ]);
-          return;
-        }
-
-        // Check for matching local saved brochure without server_id
-        const matchingLocal = await this.findMatchingLocalSavedBrochure(savedBrochure.mr_id, savedBrochure.brochure_id, undefined);
-        
-        if (matchingLocal) {
-          console.log(`🔗 SAVED BROCHURES SYNC DEBUG: Found matching local saved brochure without server_id: ${matchingLocal.id}, linking to server_id: ${savedBrochure.server_id}`);
-          
-          // Update the local saved brochure with server_id and server data
-          await this.executeQuery(`
-            UPDATE saved_brochures SET
-              server_id = ?,
-              mr_id = ?,
-              brochure_id = ?,
-              brochure_title = ?,
-              custom_title = ?,
-              original_brochure_data = ?,
-              saved_at = ?,
-              last_accessed = ?,
-              version = ?,
-              sync_status = ?,
-              local_changes = ?
-            WHERE id = ?
-          `, [
-            savedBrochure.server_id,
-            savedBrochure.mr_id,
-            savedBrochure.brochure_id,
-            savedBrochure.brochure_title,
-            savedBrochure.custom_title,
-            savedBrochure.original_brochure_data,
-            savedBrochure.saved_at || null,
-            savedBrochure.last_accessed || null,
-            savedBrochure.version,
-            savedBrochure.sync_status,
-            savedBrochure.local_changes || null,
-            matchingLocal.id
-          ]);
-          return;
-        }
-      }
-
-      // Create new saved brochure
-      if (this.isUsingAsyncStorage()) {
-        const key = 'saved_brochures';
-        const data = await AsyncStorage.getItem(key);
-        const brochures: LocalSavedBrochure[] = data ? JSON.parse(data) : [];
-        brochures.push(savedBrochure);
-        await AsyncStorage.setItem(key, JSON.stringify(brochures));
-        return;
-      }
-      
-      await this.executeQuery(`
-        INSERT INTO saved_brochures (id, server_id, mr_id, brochure_id, brochure_title, custom_title, original_brochure_data, saved_at, last_accessed, version, sync_status, local_changes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        savedBrochure.id, savedBrochure.server_id || null, savedBrochure.mr_id, savedBrochure.brochure_id,
-        savedBrochure.brochure_title, savedBrochure.custom_title, savedBrochure.original_brochure_data,
-        savedBrochure.saved_at || null, savedBrochure.last_accessed || null, savedBrochure.version,
-        savedBrochure.sync_status, savedBrochure.local_changes || null
-      ]);
-    } catch (error) {
-      console.error('LocalDB: Failed to upsert saved brochure:', error);
-      throw error;
-    }
-  }
-
-
-
-  static async getDashboardStats(mrId: string): Promise<{
-    doctors_connected: number;
-    meetings_scheduled: number;
-    brochures_downloaded: number;
-    brochures_viewed: number;
-    brochures_available: number;
-  }> {
-    await this.initialize();
-    console.log('🔍 DASHBOARD STATS DEBUG: Getting dashboard stats for MR:', mrId);
-    
-    try {
-      if (this.isUsingAsyncStorage()) {
-        console.log('🔍 DASHBOARD STATS DEBUG: Using AsyncStorage for stats calculation');
-        const doctorsData = await AsyncStorage.getItem('doctors');
-        const meetingsData = await AsyncStorage.getItem('meetings');
-        const savedBrochuresData = await AsyncStorage.getItem('saved_brochures');
-        
-        const doctors: LocalDoctor[] = doctorsData ? JSON.parse(doctorsData) : [];
-        const meetings: LocalMeeting[] = meetingsData ? JSON.parse(meetingsData) : [];
-        const savedBrochures: LocalSavedBrochure[] = savedBrochuresData ? JSON.parse(savedBrochuresData) : [];
-        
-        console.log('🔍 DASHBOARD STATS DEBUG: Raw data counts:');
-        console.log('  - Total doctors in storage:', doctors.length);
-        console.log('  - Total meetings in storage:', meetings.length);
-        console.log('  - Total saved brochures in storage:', savedBrochures.length);
-        
-        console.log('🔍 DASHBOARD STATS DEBUG: Doctor details:');
-        doctors.forEach((d, index) => {
-          console.log(`  - Doctor ${index}: id=${d.id}, mr_id=${d.mr_id}, is_deleted=${d.is_deleted}, name=${d.first_name} ${d.last_name}`);
-        });
-        
-        const doctorsConnected = doctors.filter(d => d.mr_id === mrId && !d.is_deleted).length;
-        const meetingsScheduled = meetings.filter(m => m.mr_id === mrId && !m.is_deleted && m.status === 'scheduled').length;
-        const brochuresDownloaded = savedBrochures.filter(b => b.mr_id === mrId).length;
-        
-        // Get available brochures count from AsyncStorage using same logic as getBrochures():
-        // - Brochures assigned via brochure_sync (where mr_id matches)
-        // - OR public brochures (is_public = 1)
-        // Both must be active (status = 'active')
-        const brochureSyncData = await AsyncStorage.getItem('brochure_sync');
-        const brochureSyncs: any[] = brochureSyncData ? JSON.parse(brochureSyncData) : [];
-        const assignedBrochureIds = new Set(
-          brochureSyncs
-            .filter((sync: any) => sync.mr_id === mrId && !sync.is_deleted)
-            .map((sync: any) => sync.brochure_id)
-        );
-        
-        const brochuresData = await AsyncStorage.getItem('brochures');
-        const availableBrochures: any[] = brochuresData ? JSON.parse(brochuresData) : [];
-        
-        // Count brochures that are either assigned OR public (and active)
-        const brochuresAvailable = availableBrochures.filter((b: any) => 
-          b.status === 'active' && 
-          (assignedBrochureIds.has(b.id) || b.is_public === 1 || b.is_public === true)
-        ).length;
-        
-        // Get brochures viewed from activity logs
-        const activityLogsData = await AsyncStorage.getItem('activity_logs');
-        const activityLogs: any[] = activityLogsData ? JSON.parse(activityLogsData) : [];
-        const viewedBrochureIds = new Set(
-          activityLogs
-            .filter((log: any) => log.mr_id === mrId && (log.action === 'view_brochure' || log.activity_type === 'view_brochure'))
-            .map((log: any) => log.brochure_id)
-            .filter((id: string) => id)
-        );
-        const brochuresViewed = viewedBrochureIds.size;
-        
-        console.log('🔍 DASHBOARD STATS DEBUG: Filtered counts:');
-        console.log('  - Doctors connected (mr_id match):', doctorsConnected);
-        console.log('  - Meetings scheduled (mr_id match):', meetingsScheduled);
-        console.log('  - Brochures downloaded (saved) count:', brochuresDownloaded);
-        console.log('  - Brochures available (assigned) count:', brochuresAvailable);
-        console.log('  - Brochures viewed count:', brochuresViewed);
-
-        const result = {
-          doctors_connected: doctorsConnected,
-          meetings_scheduled: meetingsScheduled,
-          brochures_downloaded: brochuresDownloaded,
-          brochures_viewed: brochuresViewed,
-          brochures_available: brochuresAvailable, // Add this for dashboard
-        };
-        
-        console.log('✅ DASHBOARD STATS DEBUG: Final stats result:', result);
-        return result;
-      } else {
-        console.log('🔍 DASHBOARD STATS DEBUG: Using SQLite for stats calculation');
-        
-        // Debug: Check all doctors for this MR
-        const allDoctorsDebug = await this.db.getAllAsync(
-          `SELECT id, first_name, last_name, mr_id, is_deleted, sync_status FROM doctors WHERE mr_id = ? OR mr_id IS NULL`,
-          [mrId]
-        );
-        console.log('🔍 DASHBOARD STATS DEBUG: All doctors with matching mr_id:', allDoctorsDebug?.length || 0, allDoctorsDebug);
-        
-        // Debug: Check all doctors regardless of mr_id
-        const allDoctorsAll = await this.db.getAllAsync(
-          `SELECT id, first_name, last_name, mr_id, is_deleted, sync_status FROM doctors LIMIT 10`
-        );
-        console.log('🔍 DASHBOARD STATS DEBUG: All doctors in DB (first 10):', allDoctorsAll?.length || 0, allDoctorsAll);
-        
-        // Use SQLite with helper methods
-        // Count doctors that match mr_id and are not deleted
-        // Handle NULL is_deleted as 0 (not deleted)
-        const doctorResult = await this.executeSelectFirst(
-          `SELECT COUNT(id) as count FROM doctors WHERE mr_id = ? AND (is_deleted = 0 OR is_deleted IS NULL)`,
-          [mrId]
-        );
-        
-        // Also verify the count matches getDoctors() result
-        const doctorsList = await this.getDoctors(mrId);
-        console.log('🔍 DASHBOARD STATS DEBUG: getDoctors() returned:', doctorsList.length, 'doctors');
-        console.log('🔍 DASHBOARD STATS DEBUG: getDoctors() doctor details:', doctorsList.map(d => ({ id: d.id, server_id: d.server_id, name: `${d.first_name} ${d.last_name}`, mr_id: d.mr_id, is_deleted: d.is_deleted })));
-        
-        // Deduplicate doctors by server_id (fix duplicate issue)
-        const uniqueDoctors = new Map<string, LocalDoctor>();
-        doctorsList.forEach(doctor => {
-          const key = doctor.server_id || doctor.id; // Use server_id as key, fallback to id
-          if (key && !uniqueDoctors.has(key)) {
-            uniqueDoctors.set(key, doctor);
-          } else if (key) {
-            // Duplicate found - keep the one with a valid id (not null)
-            const existing = uniqueDoctors.get(key);
-            if (existing && !existing.id && doctor.id) {
-              uniqueDoctors.set(key, doctor); // Replace null id with valid id
-            }
-          }
-        });
-        
-        const actualDoctorCount = uniqueDoctors.size;
-        const countQueryResult = doctorResult?.count || 0;
-        
-        console.log('🔍 DASHBOARD STATS DEBUG: Unique doctors count (deduplicated):', actualDoctorCount);
-        
-        if (actualDoctorCount !== countQueryResult) {
-          console.warn(`⚠️ DASHBOARD STATS DEBUG: Doctor count mismatch! COUNT query: ${countQueryResult}, unique doctors: ${actualDoctorCount}. Using unique count.`);
-          // Use the actual unique count (deduplicated)
-          doctorResult.count = actualDoctorCount;
-        }
-
-        // Get all meetings and deduplicate them (same logic as Meeting Records screen)
-        const allMeetings = await this.getMeetings(mrId);
-        console.log('🔍 DASHBOARD STATS DEBUG: Total meetings from getMeetings:', allMeetings.length);
-        const scheduledMeetings = allMeetings.filter(m => m.status === 'scheduled');
-        console.log('🔍 DASHBOARD STATS DEBUG: Scheduled meetings (before dedup):', scheduledMeetings.length);
-        console.log('🔍 DASHBOARD STATS DEBUG: Scheduled meetings details:', scheduledMeetings.map(m => ({
-          id: m.id,
-          server_id: m.server_id,
-          doctor_id: m.doctor_id,
-          scheduled_date: m.scheduled_date,
-          title: m.title,
-          is_deleted: m.is_deleted
-        })));
-        
-        // Deduplicate meetings using same logic as UnifiedDataService and MeetingsScreen
-        const meetingsByKey = new Map<string, LocalMeeting>();
-        scheduledMeetings.forEach(meeting => {
-          const key = meeting.server_id 
-            ? `server_${meeting.server_id}` 
-            : `local_${meeting.doctor_id}_${meeting.scheduled_date}_${meeting.title}`;
-          
-          if (!meetingsByKey.has(key)) {
-            meetingsByKey.set(key, meeting);
-          } else {
-            // Keep the one with server_id, or the most recent
-            const existing = meetingsByKey.get(key)!;
-            if (meeting.server_id && !existing.server_id) {
-              meetingsByKey.set(key, meeting);
-            } else if (!meeting.server_id && existing.server_id) {
-              // Keep existing
-            } else {
-              // Both have or don't have server_id - keep most recent
-              const meetingDate = new Date(meeting.updated_at).getTime();
-              const existingDate = new Date(existing.updated_at).getTime();
-              if (meetingDate > existingDate) {
-                meetingsByKey.set(key, meeting);
-              }
-            }
-          }
-        });
-        
-        console.log('🔍 DASHBOARD STATS DEBUG: Unique meetings after deduplication:', meetingsByKey.size);
-        console.log('🔍 DASHBOARD STATS DEBUG: Deduplication keys:', Array.from(meetingsByKey.keys()));
-        
-        const meetingResult = { count: meetingsByKey.size };
-
-        const brochureDownloadedResult = await this.executeSelectFirst(
-          `SELECT COUNT(id) as count FROM saved_brochures WHERE mr_id = ?`,
-          [mrId]
-        );
-
-        // Note: Viewed count can be complex offline. A simple count of distinct viewed brochures is used here.
-        // A more detailed implementation might track view events in a separate table.
-        // Count available brochures using the same logic as getBrochures():
-        // - Brochures assigned via brochure_sync (where mr_id matches)
-        // - OR public brochures (is_public = 1)
-        // Both must be active (status = 'active')
-        let brochuresAvailableResult;
-        try {
-          // First, let's check what brochures exist in the database
-          const allBrochuresCheck = await this.db.getAllAsync(`SELECT id, title, status, is_public FROM brochures LIMIT 10`);
-          console.log('🔍 DASHBOARD STATS DEBUG: All brochures in DB:', allBrochuresCheck?.length || 0, allBrochuresCheck);
-          
-          // Check brochure_sync table
-          const brochureSyncCheck = await this.db.getAllAsync(`SELECT brochure_id, mr_id, is_deleted FROM brochure_sync WHERE mr_id = ? LIMIT 10`, [mrId]);
-          console.log('🔍 DASHBOARD STATS DEBUG: Brochure sync entries for MR:', brochureSyncCheck?.length || 0, brochureSyncCheck);
-          
-          // Use same logic as getBrochures: assigned OR public brochures
-          // Query 1: Get assigned brochures (via brochure_sync)
-          let assignedBrochuresResult;
-          try {
-            assignedBrochuresResult = await this.executeSelectFirst(
-              `SELECT COUNT(DISTINCT bs.brochure_id) as count 
-               FROM brochure_sync bs
-               INNER JOIN brochures b ON bs.brochure_id = b.id
-               WHERE bs.mr_id = ? AND (bs.is_deleted = 0 OR bs.is_deleted IS NULL) AND b.status = 'active'`,
-              [mrId]
-            );
-          } catch (error: any) {
-            if (error?.message?.includes('no such column: is_deleted')) {
-              assignedBrochuresResult = await this.executeSelectFirst(
-                `SELECT COUNT(DISTINCT bs.brochure_id) as count 
-                 FROM brochure_sync bs
-                 INNER JOIN brochures b ON bs.brochure_id = b.id
-                 WHERE bs.mr_id = ? AND b.status = 'active'`,
-                [mrId]
-              );
-            } else {
-              assignedBrochuresResult = { count: 0 };
-            }
-          }
-          
-          // Query 2: Get public brochures (not already counted in assigned)
-          const assignedBrochureIds = brochureSyncCheck?.map((sync: any) => sync.brochure_id) || [];
-          const assignedIdsPlaceholder = assignedBrochureIds.length > 0 
-            ? `AND b.id NOT IN (${assignedBrochureIds.map(() => '?').join(',')})`
-            : '';
-          
-          let publicBrochuresResult = { count: 0 };
-          if (assignedIdsPlaceholder) {
-            publicBrochuresResult = await this.executeSelectFirst(
-              `SELECT COUNT(b.id) as count 
-               FROM brochures b
-               WHERE b.status = 'active' AND (b.is_public = 1 OR b.is_public = true) ${assignedIdsPlaceholder}`,
-              [...assignedBrochureIds]
-            );
-          } else {
-            publicBrochuresResult = await this.executeSelectFirst(
-              `SELECT COUNT(b.id) as count 
-               FROM brochures b
-               WHERE b.status = 'active' AND (b.is_public = 1 OR b.is_public = true)`,
-              []
-            );
-          }
-          
-          const assignedCount = assignedBrochuresResult?.count || 0;
-          const publicCount = publicBrochuresResult?.count || 0;
-          const totalCount = assignedCount + publicCount;
-          
-          console.log('🔍 DASHBOARD STATS DEBUG: Assigned brochures count:', assignedCount);
-          console.log('🔍 DASHBOARD STATS DEBUG: Public brochures count:', publicCount);
-          console.log('🔍 DASHBOARD STATS DEBUG: Total brochures available:', totalCount);
-          
-          brochuresAvailableResult = { count: totalCount };
-        } catch (error: any) {
-          console.error('LocalDB: Error counting brochures available:', error);
-          // Final fallback: count all active brochures
-          const allBrochuresResult = await this.executeSelectFirst(
-            `SELECT COUNT(id) as count FROM brochures WHERE status = 'active'`,
-            []
-          );
-          brochuresAvailableResult = allBrochuresResult;
-        }
-        
-        const brochuresAvailable = brochuresAvailableResult?.count || 0;
-
-        // Note: Viewed count can be complex offline. A simple count of distinct viewed brochures is used here.
-        const brochureViewedResult = await this.executeSelectFirst(
-          `SELECT COUNT(DISTINCT brochure_id) as count FROM activity_logs WHERE mr_id = ? AND action = 'view_brochure'`,
-          [mrId]
-        );
-
-        console.log('🔍 DASHBOARD STATS DEBUG: SQLite query results:');
-        console.log('  - Doctors count:', doctorResult?.count || 0);
-        console.log('  - Meetings count:', meetingResult?.count || 0);
-        console.log('  - Brochures downloaded (saved) count:', brochureDownloadedResult?.count || 0);
-        console.log('  - Brochures available (assigned) count:', brochuresAvailableResult?.count || 0);
-        console.log('  - Brochures viewed count:', brochureViewedResult?.count || 0);
-
-        const result = {
-          doctors_connected: doctorResult?.count || 0,
-          meetings_scheduled: meetingResult?.count || 0,
-          brochures_downloaded: brochureDownloadedResult?.count || 0,
-          brochures_viewed: brochureViewedResult?.count || 0,
-          brochures_available: brochuresAvailable, // Use calculated value
-        };
-        
-        console.log('✅ DASHBOARD STATS DEBUG: Final SQLite stats result:', result);
-        return result;
-      }
-    } catch (error) {
-      console.error('LocalDB: Failed to get dashboard stats:', error);
-      return {
-        doctors_connected: 0,
-        meetings_scheduled: 0,
-        brochures_downloaded: 0,
-        brochures_viewed: 0,
-        brochures_available: 0,
-      };
-    }
-  }
-
-  static async getRecentActivities(mrId: string, limit: number): Promise<MRRecentActivity[]> {
-    await this.initialize();
-    try {
-      if (this.isUsingAsyncStorage()) {
-        const data = await AsyncStorage.getItem('activity_logs');
-        const logs: LocalActivityLog[] = data ? JSON.parse(data) : [];
-        return logs
-          .filter(l => l.mr_id === mrId)
-          .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
-          .slice(0, limit)
-          .map(activity => ({
-            id: activity.id,
-            activity_type: activity.activity_type,
-            description: activity.description,
-            created_at: activity.created_at || new Date().toISOString(),
-          }));
-      }
-
-      const activities = await this.executeSelect(
-        `SELECT * FROM activity_logs WHERE mr_id = ? ORDER BY created_at DESC LIMIT ?`,
-        [mrId, limit]
-      );
-      return activities.map((activity: any) => ({
-        id: activity.id || activity.activity_id,
-        activity_type: activity.activity_type || activity.action,
-        description: activity.description || activity.details,
-        created_at: activity.created_at || activity.timestamp || new Date().toISOString(),
-      }));
-    } catch (error) {
-      console.error('LocalDB: Failed to get recent activities:', error);
-      return [];
-    }
-  }
-
-  static async getUpcomingMeetings(mrId: string, limit: number): Promise<MRUpcomingMeeting[]> {
-    await this.initialize();
-    try {
-       if (this.isUsingAsyncStorage()) {
-        const today = new Date().toISOString().split('T')[0];
-        const meetingsData = await AsyncStorage.getItem('meetings');
-        const meetings: LocalMeeting[] = meetingsData ? JSON.parse(meetingsData) : [];
-        const doctorsData = await AsyncStorage.getItem('doctors');
-        const doctors: LocalDoctor[] = doctorsData ? JSON.parse(doctorsData) : [];
-        
-        return meetings
-          .filter(m => m.mr_id === mrId && !m.is_deleted && m.scheduled_date >= today)
-          .sort((a, b) => a.scheduled_date.localeCompare(b.scheduled_date))
-          .slice(0, limit)
-          .map(meeting => {
-            const doctor = doctors.find(d => d.id === meeting.doctor_id);
-            return {
-              meeting_id: meeting.id,
-              doctor_name: doctor ? `${doctor.first_name} ${doctor.last_name}` : 'Unknown Doctor',
-              hospital: doctor ? (doctor.hospital || 'Unknown') : 'Unknown',
-              scheduled_date: meeting.scheduled_date,
-              status: meeting.status || 'scheduled',
-              notes: meeting.notes,
-            };
-          });
-      }
-
-      const today = new Date().toISOString().split('T')[0];
-      const meetings = await this.executeSelect(
-        `SELECT m.*, d.first_name, d.last_name, d.specialty
-         FROM meetings m
-         JOIN doctors d ON m.doctor_id = d.id
-         WHERE m.mr_id = ? AND m.is_deleted = 0 AND m.scheduled_date >= ?
-         ORDER BY m.scheduled_date ASC, m.duration_minutes ASC
-         LIMIT ?`,
-        [mrId, today, limit]
-      );
-
-      return meetings.map((meeting: any) => ({
-        meeting_id: meeting.id,
-        doctor_name: `${meeting.first_name} ${meeting.last_name}`,
-        hospital: meeting.hospital || 'Unknown',
-        scheduled_date: meeting.scheduled_date,
-        status: meeting.status || 'scheduled',
-        notes: meeting.notes,
-      }));
-    } catch (error) {
-      console.error('LocalDB: Failed to get upcoming meetings:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Verify brochure storage in local DB
-   * Returns counts and details of available brochures and saved brochures
-   */
-  static async verifyBrochureStorage(mrId: string): Promise<{
-    availableBrochures: { count: number; details: any[] };
-    savedBrochures: { count: number; details: any[] };
-    brochureSyncEntries: { count: number; details: any[] };
-    brochuresTableEntries: { count: number; details: any[] };
-  }> {
-    await this.initialize();
-    
-    try {
-      if (this.isUsingAsyncStorage()) {
-        // AsyncStorage path
-        const brochuresData = await AsyncStorage.getItem('brochures');
-        const brochureSyncData = await AsyncStorage.getItem('brochure_sync');
-        const savedBrochuresData = await AsyncStorage.getItem('saved_brochures');
-        
-        const brochures: LocalBrochure[] = brochuresData ? JSON.parse(brochuresData) : [];
-        const syncs: LocalBrochureSync[] = brochureSyncData ? JSON.parse(brochureSyncData) : [];
-        const saved: LocalSavedBrochure[] = savedBrochuresData ? JSON.parse(savedBrochuresData) : [];
-        
-        const assignedSyncs = syncs.filter(s => s.mr_id === mrId && !s.is_deleted);
-        const availableBrochures = brochures.filter(b => {
-          const isAssigned = assignedSyncs.some(s => s.brochure_id === b.id);
-          return isAssigned || b.is_public;
-        });
-        
-        return {
-          availableBrochures: {
-            count: availableBrochures.length,
-            details: availableBrochures.map(b => ({ id: b.id, title: b.title, status: b.status }))
-          },
-          savedBrochures: {
-            count: saved.filter(s => s.mr_id === mrId).length,
-            details: saved.filter(s => s.mr_id === mrId).map(s => ({ id: s.id, brochure_id: s.brochure_id, custom_title: s.custom_title }))
-          },
-          brochureSyncEntries: {
-            count: assignedSyncs.length,
-            details: assignedSyncs.map(s => ({ id: s.id, brochure_id: s.brochure_id, brochure_title: s.brochure_title }))
-          },
-          brochuresTableEntries: {
-            count: brochures.filter(b => b.status === 'active').length,
-            details: brochures.filter(b => b.status === 'active').map(b => ({ id: b.id, title: b.title, is_public: b.is_public }))
-          }
-        };
-      }
-      
-      // SQLite path
-      const brochuresResult = await this.db.getAllAsync(`
-        SELECT id, title, status, is_public FROM brochures WHERE status = 'active'
-      `);
-      
-      const syncResult = await this.db.getAllAsync(`
-        SELECT id, mr_id, brochure_id, brochure_title, is_deleted FROM brochure_sync WHERE mr_id = ? AND is_deleted = 0
-      `, [mrId]);
-      
-      const savedResult = await this.db.getAllAsync(`
-        SELECT id, mr_id, brochure_id, custom_title FROM saved_brochures WHERE mr_id = ?
-      `, [mrId]);
-      
-      const assignedBrochureIds = new Set(syncResult.map((s: any) => s.brochure_id));
-      const availableBrochures = brochuresResult.filter((b: any) => {
-        return assignedBrochureIds.has(b.id) || b.is_public === 1;
-      });
-      
-      return {
-        availableBrochures: {
-          count: availableBrochures.length,
-          details: availableBrochures.map((b: any) => ({ id: b.id, title: b.title, status: b.status }))
-        },
-        savedBrochures: {
-          count: savedResult.length,
-          details: savedResult.map((s: any) => ({ id: s.id, brochure_id: s.brochure_id, custom_title: s.custom_title }))
-        },
-        brochureSyncEntries: {
-          count: syncResult.length,
-          details: syncResult.map((s: any) => ({ id: s.id, brochure_id: s.brochure_id, brochure_title: s.brochure_title }))
-        },
-        brochuresTableEntries: {
-          count: brochuresResult.length,
-          details: brochuresResult.map((b: any) => ({ id: b.id, title: b.title, is_public: b.is_public === 1 }))
-        }
-      };
-    } catch (error) {
-      console.error('LocalDB: Failed to verify brochure storage:', error);
-      return {
-        availableBrochures: { count: 0, details: [] },
-        savedBrochures: { count: 0, details: [] },
-        brochureSyncEntries: { count: 0, details: [] },
-        brochuresTableEntries: { count: 0, details: [] }
-      };
-    }
   }
 }

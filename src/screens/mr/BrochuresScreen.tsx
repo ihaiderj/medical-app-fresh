@@ -28,6 +28,7 @@ import { useAppData } from "../../context/AppDataContext"
 import { useNavigation } from '@react-navigation/native'
 import { generateUUID } from "../../utils/uuid"
 import { getModalBorderRadius, getModalPadding, isTablet } from "../../utils/responsive"
+import { NetworkService } from "../../services/networkService"
 
 interface BrochuresScreenProps {
   navigation?: any
@@ -417,14 +418,83 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       }
       
       if (!fileExists) {
-        // File doesn't exist locally - show error (file should be synced first)
-        Alert.alert("Error", "File not available. Please sync brochures first.")
-        setDownloadingBrochures(prev => {
-          const updated = new Set(prev)
-          updated.delete(downloadKey)
-          return updated
-        })
-        return
+        // File doesn't exist locally - check if online and download from server
+        const isOnline = await NetworkService.isOnline();
+        
+        if (!isOnline) {
+          // Offline and file not available - show error
+          Alert.alert("Error", "File not available. Please connect to internet to download this brochure.")
+          setDownloadingBrochures(prev => {
+            const updated = new Set(prev)
+            updated.delete(downloadKey)
+            return updated
+          })
+          return
+        }
+        
+        // Online - download from server
+        if (!brochure.file_url) {
+          // Try to get brochure details from server if file_url is not available
+          try {
+            const brochuresResult = await MRService.getAssignedBrochures(userId);
+            if (brochuresResult.success && brochuresResult.data) {
+              const brochureData = brochuresResult.data.find((b: any) => b.id === originalBrochureId);
+              if (brochureData && brochureData.file_url) {
+                brochure.file_url = brochureData.file_url;
+              }
+            }
+          } catch (error) {
+            console.warn('Failed to fetch brochure details:', error);
+          }
+        }
+        
+        if (!brochure.file_url) {
+          Alert.alert("Error", "Brochure file URL not available. Please try again later.")
+          setDownloadingBrochures(prev => {
+            const updated = new Set(prev)
+            updated.delete(downloadKey)
+            return updated
+          })
+          return
+        }
+        
+        // Download from server
+        console.log('Downloading brochure from server:', brochure.title)
+        try {
+          const downloadResult = await BrochureManagementService.downloadBrochureFile(
+            originalBrochureId,
+            brochure.file_url,
+            userId,
+            brochure.title,
+            (progress) => {
+              // Could show progress here if needed
+              console.log(`Download progress: ${progress.percentage}%`)
+            }
+          )
+          
+          if (downloadResult.success && downloadResult.localPath) {
+            console.log('Brochure downloaded successfully from server:', downloadResult.localPath)
+            localPath = downloadResult.localPath
+            fileExists = true
+          } else {
+            Alert.alert("Error", downloadResult.error || "Failed to download brochure. Please try again.")
+            setDownloadingBrochures(prev => {
+              const updated = new Set(prev)
+              updated.delete(downloadKey)
+              return updated
+            })
+            return
+          }
+        } catch (error) {
+          console.error('Error downloading brochure from server:', error)
+          Alert.alert("Error", "Failed to download brochure. Please try again.")
+          setDownloadingBrochures(prev => {
+            const updated = new Set(prev)
+            updated.delete(downloadKey)
+            return updated
+          })
+          return
+        }
       }
       
       // File exists locally - use it
@@ -1015,19 +1085,43 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         return;
       }
 
-      // Update server first (only if brochureId is valid)
+      // Update database entry if it exists (for sync queue)
+      try {
+        const { LocalDatabaseService } = await import('../../services/localDatabaseService');
+        const savedBrochure = await LocalDatabaseService.getSavedBrochureById(renameBrochure.localId);
+        if (savedBrochure) {
+          // Update in database and queue for sync (don't skip sync queue)
+          await LocalDatabaseService.updateSavedBrochure(renameBrochure.localId, {
+            custom_title: newTitle.trim(),
+            sync_status: 'pending'
+          }, false); // false = don't skip sync queue
+        }
+      } catch (dbError) {
+        console.warn('Failed to update saved brochure in database:', dbError);
+        // Continue with AsyncStorage update
+      }
+
+      // Update server if online (only if brochureId is valid)
       if (brochureId) {
         const serverResult = await savedBrochuresSyncService.updateSavedBrochureTitle(
           userId,
           brochureId,
           newTitle.trim()
         )
-
+        // If server update succeeds, mark as synced
+        if (serverResult.success) {
+          try {
+            const { LocalDatabaseService } = await import('../../services/localDatabaseService');
+            await LocalDatabaseService.updateSavedBrochure(renameBrochure.localId, {
+              sync_status: 'synced'
+            }, true); // true = skip sync queue since already synced
+          } catch (dbError) {
+            console.warn('Failed to mark brochure as synced:', dbError);
+          }
+        }
       }
 
-      // Server update was handled above
-
-      // Update the brochure title locally
+      // Update the brochure title locally (for UI)
       const updatedSaved = savedBrochures.map(b => 
         b.localId === renameBrochure.localId 
           ? { ...b, customTitle: newTitle.trim() }
@@ -1036,7 +1130,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       
       setSavedBrochures(updatedSaved)
       
-      // Save to AsyncStorage
+      // Save to AsyncStorage (for backward compatibility)
       const key = `mr_saved_brochures_${userId}`
       await AsyncStorage.setItem(key, JSON.stringify(updatedSaved))
       
@@ -1166,7 +1260,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
     if (searchQuery.trim()) {
       filtered = filtered.filter(brochure => {
         const title = activeTab === 'available' ? brochure.title : (brochure as SavedBrochure).customTitle
-        return title.toLowerCase().includes(searchQuery.toLowerCase())
+        return title && title.toLowerCase().includes(searchQuery.toLowerCase())
       })
     }
 

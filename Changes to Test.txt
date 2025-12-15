@@ -1,0 +1,76 @@
+Changes to Test
+1. Doctors
+Create: Add new doctor
+Update: Edit doctor name, hospital, specialty, contact info
+Delete: Delete doctor
+2. Meetings
+Create: Schedule new meeting
+Update: Edit meeting title, date, time, location, notes, status
+Delete: Delete meeting
+3. Meeting Follow-ups
+Create: Add follow-up to meeting
+Update: Edit follow-up date, time, notes, status
+Delete: Delete follow-up
+4. Meeting Notes
+Create: Add slide note (from DoctorGroupViewer or MeetingDetailsScreen)
+Create: Add simple note (from MeetingDetailsScreen)
+Update: Edit note text
+Delete: Delete note
+5. Saved Brochures
+Create: Download brochure from Available tab
+Update: Rename brochure (custom_title)
+Delete: Delete saved brochure
+6. Brochure Modifications (for saved brochures)
+Slide rename: Rename slide title
+Slide delete: Delete slide
+Slide add: Add new slide
+Group create: Create group with slides
+Group update: Rename group, add/remove slides
+Group delete: Delete group
+Slide notes: Add/edit/delete notes while viewing slide (from DoctorGroupViewer or SlideManagementScreen)
+7. Activity Logs
+Create: Activity log entries (may not sync to server, but should be queued)
+Test Scenarios
+Queuing Test
+For each operation above:
+Perform the action (create/update/delete)
+Verify it's added to sync_operations table
+Verify sync_status is set to 'pending'
+Verify sync debug log shows: MADE → QUEUED
+Verify queue entry has correct operation_type, table_name, record_id, data
+Sync-to-Server Test
+For each queued operation:
+Get pending operations from sync_operations table
+Attempt to sync each operation
+Verify operation succeeds on server
+Verify server_id is set in local database
+Verify sync_status changes to 'synced'
+Verify operation is removed from queue (or marked completed)
+Verify sync debug log shows: QUEUED → SYNCED_TO_SERVER
+Sync-from-Server Test
+After syncing on Device 1:
+Login on Device 2 (new device)
+Verify all doctors from server download to local
+Verify all meetings from server download to local
+Verify all follow-ups from server download to local
+Verify all notes from server download to local
+Verify all saved brochures from server download to local
+Verify brochure modifications (groups, renamed slides, etc.) download
+Verify sync debug log shows: SYNCED_FROM_SERVER for each record
+Compare counts: Local = Server = Synced logs
+Specific Test Cases
+Test Case 1: Doctor Creation Flow
+1. Create doctor "Dr. John Smith"   → Verify: Queued as 'create' operation   → Verify: sync_status = 'pending'   → Verify: Log shows MADE → QUEUED2. Sync to server   → Verify: Doctor created on server   → Verify: server_id set in local DB   → Verify: sync_status = 'synced'   → Verify: Log shows QUEUED → SYNCED_TO_SERVER3. Login on new device   → Verify: Doctor "Dr. John Smith" downloads   → Verify: Log shows SYNCED_FROM_SERVER
+Test Case 2: Meeting with Follow-up and Notes
+1. Create meeting "Follow-up Meeting"   → Verify: Queued2. Add follow-up to meeting   → Verify: Follow-up queued3. Add slide note to meeting   → Verify: Note queued4. Sync to server   → Verify: Meeting synced first   → Verify: Follow-up synced (after meeting)   → Verify: Note synced (after meeting)5. Login on new device   → Verify: Meeting downloads   → Verify: Follow-up downloads   → Verify: Note downloads
+Test Case 3: Brochure Modifications
+1. Download brochure "Test Brochure"   → Verify: Saved brochure queued2. Rename slide "Slide 1" → "Updated Slide"   → Verify: Brochure change queued3. Create group "Group A" with slides   → Verify: Brochure change queued4. Sync to server   → Verify: Saved brochure synced   → Verify: Brochure modifications synced5. Login on new device   → Verify: Brochure downloads   → Verify: Slide renamed correctly   → Verify: Group created correctly
+Verification Points
+For each change, verify:
+Queuing: Is it in the sync queue?
+Sync Status: Is sync_status = 'pending'?
+Debug Logs: Does log show MADE → QUEUED?
+Server Sync: Does it sync successfully?
+Server ID: Is server_id set after sync?
+Download: Does it download on new device?
+Data Integrity: Is data correct on new device?
