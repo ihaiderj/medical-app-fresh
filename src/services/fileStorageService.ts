@@ -1,4 +1,4 @@
-import { supabase } from './supabase'
+import { supabase, supabaseAdmin } from './supabase'
 import * as FileSystem from 'expo-file-system'
 
 export interface UploadProgress {
@@ -117,35 +117,10 @@ export class FileStorageService {
       }
 
       console.log('Reading file for upload, size:', fileInfo.size, `(${fileSizeMB.toFixed(1)}MB)`)
-      
-      // We'll use XMLHttpRequest for real progress tracking
-      // Note: Simulated progress removed - will implement real progress below
 
       // Generate unique file path
       const timestamp = Date.now()
       const filePath = `uploads/${timestamp}_${fileName}`
-
-      // Use XMLHttpRequest for real progress tracking
-      let { data: { session }, error: sessionError } = await supabase.auth.getSession()
-      console.log('Session check:', { session: !!session, error: sessionError })
-      
-      // If no session, try to refresh
-      if (!session || !session.access_token) {
-        console.log('No session found, attempting to refresh...')
-        const { data: refreshData, error: refreshError } = await supabase.auth.refreshSession()
-        if (refreshData?.session) {
-          session = refreshData.session
-          console.log('Session refreshed successfully')
-        } else {
-          console.error('Session refresh failed:', refreshError)
-          return { success: false, error: 'User not authenticated' }
-        }
-      }
-      
-      if (!session || !session.access_token) {
-        console.error('No valid session found after refresh')
-        return { success: false, error: 'User not authenticated' }
-      }
 
       // Determine file type based on extension
       let mimeType = 'application/octet-stream'
@@ -164,88 +139,52 @@ export class FileStorageService {
         case 'pdf':
           mimeType = 'application/pdf'
           break
+        case 'json':
+          mimeType = 'application/json'
+          break
       }
 
       console.log('File type detected:', { fileName, extension, mimeType })
 
-      // Create FormData for React Native
-      const formData = new FormData()
-      formData.append('file', {
-        uri: localFilePath,
-        type: mimeType,
-        name: fileName,
-      } as any)
-
-      // Get Supabase project URL from config
-      const supabaseUrl = 'https://ijgevkvdlevkcdjcgmyg.supabase.co'
-      const uploadUrl = `${supabaseUrl}/storage/v1/object/${this.BUCKET_NAME}/${filePath}`
-
-      // Upload with real progress using XMLHttpRequest
-      const uploadData = await new Promise<any>((resolve, reject) => {
-        const xhr = new XMLHttpRequest()
-
-        // Track upload progress
-        xhr.upload.onprogress = (event) => {
-          if (event.lengthComputable && onProgress) {
-            // Cap percentage at 100% to avoid showing over 100%
-            const percentage = Math.min(Math.round((event.loaded / event.total) * 100), 100)
-            // Use actual file size instead of event.total which might be inflated
-            const actualFileSize = fileInfo.size || event.total
-            onProgress({
-              loaded: Math.min(event.loaded, actualFileSize),
-              total: actualFileSize,
-              percentage: percentage
-            })
-            console.log(`Real upload progress: ${percentage}%`)
-          }
-        }
-
-        xhr.onload = () => {
-          console.log('Upload completed with status:', xhr.status)
-          console.log('Upload response:', xhr.responseText)
-          
-          if (xhr.status >= 200 && xhr.status < 300) {
-            try {
-              const response = xhr.responseText ? JSON.parse(xhr.responseText) : {}
-              console.log('Upload response parsed:', response)
-              resolve(response)
-            } catch (e) {
-              console.log('Upload response not JSON, treating as success')
-              resolve({}) // Some uploads don't return JSON
-            }
-          } else {
-            console.error('Upload failed with status:', xhr.status)
-            console.error('Upload error response:', xhr.responseText)
-            
-            // Try to parse error message from response
-            let errorMessage = `Upload failed: ${xhr.status}`
-            try {
-              const errorResponse = JSON.parse(xhr.responseText)
-              if (errorResponse.error) {
-                errorMessage = errorResponse.error
-              } else if (errorResponse.message) {
-                errorMessage = errorResponse.message
-              }
-            } catch (e) {
-              errorMessage += ` ${xhr.responseText}`
-            }
-            
-            reject(new Error(errorMessage))
-          }
-        }
-
-        xhr.onerror = () => {
-          console.error('Upload network error')
-          reject(new Error('Upload failed: Network error'))
-        }
-
-        console.log('Starting XMLHttpRequest upload to:', uploadUrl)
-        xhr.open('POST', uploadUrl)
-        xhr.setRequestHeader('Authorization', `Bearer ${session.access_token}`)
-        xhr.send(formData)
+      // Read file as base64 and convert to ArrayBuffer for Supabase Storage
+      console.log('Reading file content as base64...')
+      const base64Content = await FileSystem.readAsStringAsync(localFilePath, {
+        encoding: FileSystem.EncodingType.Base64,
       })
 
-      // uploadError is handled above in the fetch response check
+      // Convert base64 to Uint8Array, then get ArrayBuffer
+      const byteCharacters = atob(base64Content)
+      const byteNumbers = new Array(byteCharacters.length)
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i)
+      }
+      const byteArray = new Uint8Array(byteNumbers)
+      const arrayBuffer = byteArray.buffer
+
+      console.log('Uploading file via supabaseAdmin.storage.upload to path:', filePath)
+
+      // Report initial progress
+      if (onProgress) {
+        onProgress({ loaded: 0, total: fileInfo.size || 0, percentage: 0 })
+      }
+
+      // Upload using admin client (bypasses user authentication)
+      const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+        .from(this.BUCKET_NAME)
+        .upload(filePath, arrayBuffer, {
+          contentType: mimeType,
+          upsert: true, // allow re-uploads for the same path
+        })
+
+      if (uploadError) {
+        console.error('Supabase Storage upload error:', uploadError)
+        return { success: false, error: uploadError.message }
+      }
+
+      // Report completion progress
+      if (onProgress) {
+        onProgress({ loaded: fileInfo.size || 0, total: fileInfo.size || 0, percentage: 100 })
+      }
 
       // Generate signed URL (valid for 1 year) since bucket is not truly public
       const { data: signedUrlData, error: signedUrlError } = await supabase.storage

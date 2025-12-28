@@ -158,7 +158,8 @@ export class PersistentAuthService {
         }
 
         await SessionManagementService.recordLocalSession(userProfile.id)
-        const { AuthService } = await import('./AuthService')
+        // Import AuthService statically to avoid Metro bundler issues
+        const { AuthService } = require('./AuthService')
         AuthService.setCurrentUser(userProfile)
 
         console.log('Auto-login succeeded using local credentials')
@@ -167,8 +168,8 @@ export class PersistentAuthService {
 
       // Attempt login with saved credentials
       console.log('Attempting auto-login for:', credentials.email)
-      // Import AuthService here to avoid circular dependency
-      const { AuthService } = await import('./AuthService')
+      // Import AuthService statically to avoid Metro bundler issues
+      const { AuthService } = require('./AuthService')
       const loginResult = await AuthService.signIn(credentials.email, credentials.password)
       
       if (loginResult.success) {

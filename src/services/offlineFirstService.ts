@@ -272,7 +272,8 @@ export class OfflineFirstService {
 
   private static async enqueueDoctorSync(mrId: string) {
     try {
-      const { MRService } = await import('./MRService');
+      // Use static import to avoid Metro bundler issues
+      const { MRService } = require('./MRService');
       const serverDoctors = await MRService.getDoctors(mrId);
       if (serverDoctors.success && serverDoctors.data) {
         await LocalDatabaseService.mergeDoctors(mrId, serverDoctors.data);
@@ -420,7 +421,8 @@ export class OfflineFirstService {
 
   private static async enqueueMeetingSync(mrId: string) {
     try {
-      const { MRService } = await import('./MRService');
+      // Use static import to avoid Metro bundler issues
+      const { MRService } = require('./MRService');
       const serverMeetings = await MRService.getMeetings(mrId);
       if (serverMeetings.success && serverMeetings.data) {
         await LocalDatabaseService.mergeMeetings(mrId, serverMeetings.data);

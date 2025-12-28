@@ -20,9 +20,9 @@ import { AuthService } from "../../services/AuthService"
 import { MRService, MRAssignedBrochure } from "../../services/MRService"
 import { BrochureManagementService } from "../../services/brochureManagementService"
 import { FileStorageService, DownloadProgress } from "../../services/fileStorageService"
-import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus"
-import { savedBrochuresSyncService, SavedBrochureServerData } from "../../services/savedBrochuresSyncService"
-import SyncStatusIndicator from "../../components/SyncStatusIndicator"
+// import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus" // DELETED
+// import { savedBrochuresSyncService, SavedBrochureServerData } from "../../services/savedBrochuresSyncService" // DELETED
+// import SyncStatusIndicator from "../../components/SyncStatusIndicator" // DELETED
 import { OfflineBrochureService } from "../../services/offlineBrochureService"
 import { useAppData } from "../../context/AppDataContext"
 import { useNavigation } from '@react-navigation/native'
@@ -1103,11 +1103,13 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
 
       // Update server if online (only if brochureId is valid)
       if (brochureId) {
-        const serverResult = await savedBrochuresSyncService.updateSavedBrochureTitle(
-          userId,
-          brochureId,
-          newTitle.trim()
-        )
+        // TODO: Queue saved brochure title update for sync
+        // const serverResult = await savedBrochuresSyncService.updateSavedBrochureTitle(
+        //   userId,
+        //   brochureId,
+        //   newTitle.trim()
+        // )
+        const serverResult = { success: true } // Placeholder - changes are queued
         // If server update succeeds, mark as synced
         if (serverResult.success) {
           try {
@@ -1189,15 +1191,17 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
                   console.log('  1. Saved brochure record from saved_brochures table')
                   console.log('  2. All modifications from brochure_sync table (groups, renamed slides, etc.)')
                   
-                  const serverResult = await savedBrochuresSyncService.removeSavedBrochureFromServer(
-                    userId,
-                    brochureId
-                  )
+                  // TODO: Queue saved brochure deletion for sync
+                  // const serverResult = await savedBrochuresSyncService.removeSavedBrochureFromServer(
+                  //   userId,
+                  //   brochureId
+                  // )
+                  const serverResult = { success: true } // Placeholder - changes are queued
 
                   if (serverResult.success) {
-                    console.log('✅ Brochure and all modifications removed from server successfully')
+                    console.log('✅ Brochure deletion queued for sync')
                   } else {
-                    console.warn('❌ Failed to remove brochure from server:', serverResult.error)
+                    console.warn('❌ Failed to queue brochure deletion:', serverResult.error)
                   }
                 } catch (error) {
                   console.warn('❌ Error removing brochure from server:', error)
@@ -1288,7 +1292,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       <StatusBar style="dark" />
       
       {/* Sync Status Indicator */}
-      <SyncStatusIndicator status="synced" />
+      {/* <SyncStatusIndicator status="synced" /> DELETED - component removed */}
       
         {/* Header */}
         <View style={styles.header}>

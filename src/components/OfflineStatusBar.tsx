@@ -7,9 +7,10 @@ import { View, Text, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { NetworkService, NetworkState } from '../services/networkService';
 import { OfflineFirstService } from '../services/offlineFirstService';
-import { AdvancedSyncService } from '../services/advancedSyncService';
+// import { AdvancedSyncService } from '../services/advancedSyncService'; // DELETED
 import { useAppData } from '../context/AppDataContext';
 import { AuthService } from '../services/AuthService';
+import { SyncService } from '../services/SyncService';
 
 interface OfflineStatusBarProps {
   onSyncPress?: () => void;
@@ -50,10 +51,10 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
       }
       
       console.log('OfflineStatusBar: Starting sync with userId:', userId);
-      const result = await AdvancedSyncService.forceSyncNow(userId);
+      const result = await SyncService.syncUp();
       console.log('OfflineStatusBar: Sync result:', result);
       
-      if (!result.success && result.errors.length > 0) {
+      if (!result.success && result.errors && result.errors.length > 0) {
         console.error('OfflineStatusBar: Sync errors:', result.errors);
       }
     } catch (error) {

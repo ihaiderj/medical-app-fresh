@@ -109,8 +109,10 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
       // Clean up duplicates first
       if (user?.id) {
         try {
-          const { ComprehensiveServerSyncService } = await import('../../services/comprehensiveServerSyncService');
-          await ComprehensiveServerSyncService.cleanupDuplicateMeetings(user.id);
+          // TODO: Implement cleanup in SyncService or DataCleanupService
+          // const { ComprehensiveServerSyncService } = await import('../../services/comprehensiveServerSyncService'); // DELETED
+          // await ComprehensiveServerSyncService.cleanupDuplicateMeetings(user.id);
+          console.warn('MeetingsScreen: Cleanup duplicate meetings not yet implemented');
         } catch (error) {
           console.warn('MeetingsScreen: Error cleaning up duplicate meetings:', error);
         }

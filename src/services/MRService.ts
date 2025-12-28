@@ -172,7 +172,7 @@ export class MRService {
       }
 
       console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} assigned brochures on server:`, 
-        data?.map(b => ({ id: b.id, title: b.title, category: b.category })));
+        data?.map((b: any) => ({ id: b.id, title: b.title, category: b.category })));
       return { success: true, data }
     } catch (rpcError) {
       console.warn('⚠️ SERVER DEBUG: MRService.getAssignedBrochures falling back to direct query:', rpcError)
@@ -267,7 +267,7 @@ export class MRService {
         file_name: data.file_name,
         file_type: data.file_type,
         created_at: data.created_at,
-        uploaded_by_name: data.uploaded_by?.full_name || 'Unknown'
+        uploaded_by_name: (data.uploaded_by as any)?.full_name || 'Unknown'
       }
     } catch (error) {
       console.error('Exception in getBrochureById:', error)
@@ -787,7 +787,7 @@ export class MRService {
       }
 
       console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} meetings on server:`, 
-        data?.map(m => ({ id: m.id, title: m.title, scheduled_date: m.scheduled_date, status: m.status })));
+        data?.map((m: any) => ({ id: m.id, title: m.title, scheduled_date: m.scheduled_date, status: m.status })));
       return { success: true, data: data || [] }
     } catch (error) {
       console.error('❌ SERVER DEBUG: Failed to get meetings:', error)
@@ -1055,10 +1055,22 @@ export class MRService {
   // Track brochure view
   static async trackBrochureView(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
+      // First get current view_count
+      const { data: currentData, error: fetchError } = await supabase
+        .from('brochures')
+        .select('view_count')
+        .eq('id', brochureId)
+        .single()
+      
+      if (fetchError) {
+        console.error('View count fetch error:', fetchError)
+        return { success: false, error: fetchError.message }
+      }
+      
       const { data, error } = await supabase
         .from('brochures')
         .update({ 
-          view_count: supabase.sql`view_count + 1`,
+          view_count: (currentData?.view_count || 0) + 1,
           updated_at: new Date().toISOString()
         })
         .eq('id', brochureId)
@@ -1090,10 +1102,22 @@ export class MRService {
   // Track brochure download
   static async trackBrochureDownload(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
     try {
+      // First get current download_count
+      const { data: currentData, error: fetchError } = await supabase
+        .from('brochures')
+        .select('download_count')
+        .eq('id', brochureId)
+        .single()
+      
+      if (fetchError) {
+        console.error('Download count fetch error:', fetchError)
+        return { success: false, error: fetchError.message }
+      }
+      
       const { data, error } = await supabase
         .from('brochures')
         .update({ 
-          download_count: supabase.sql`download_count + 1`,
+          download_count: (currentData?.download_count || 0) + 1,
           updated_at: new Date().toISOString()
         })
         .eq('id', brochureId)
@@ -1246,6 +1270,306 @@ export class MRService {
       return { success: true };
     } catch (error) {
       return { success: false, error: 'Failed to delete doctor' };
+    }
+  }
+
+  // ==================== SAVED BROCHURES RPCs ====================
+
+  /**
+   * Save a brochure for an MR user
+   */
+  static async saveBrochureForMr(
+    mrId: string,
+    brochureId: string,
+    customTitle: string
+  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      // Get brochure details first
+      const brochure = await this.getBrochureById(brochureId)
+      if (!brochure) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      const { data, error } = await supabase.rpc('save_brochure_for_mr', {
+        p_mr_id: mrId,
+        p_brochure_id: brochureId,
+        p_brochure_title: brochure.title,
+        p_custom_title: customTitle,
+        p_original_brochure_data: {
+          id: brochure.id,
+          title: brochure.title,
+          category: brochure.category,
+          description: brochure.description,
+          thumbnail_url: brochure.thumbnail_url
+        }
+      })
+
+      if (error) {
+        console.error('Save brochure for MR error:', error)
+        return { success: false, error: error.message }
+      }
+
+      // Get the saved brochure ID by querying the table
+      const { data: savedBrochure, error: queryError } = await supabase
+        .from('saved_brochures')
+        .select('id')
+        .eq('mr_id', mrId)
+        .eq('brochure_id', brochureId)
+        .single()
+
+      if (queryError) {
+        console.warn('Could not get saved brochure ID:', queryError)
+      }
+
+      return {
+        success: true,
+        data: savedBrochure ? { id: savedBrochure.id } : data
+      }
+    } catch (error) {
+      console.error('Save brochure for MR error:', error)
+      return { success: false, error: 'Failed to save brochure' }
+    }
+  }
+
+  /**
+   * Get all saved brochures for an MR user
+   */
+  static async getSavedBrochuresForMr(
+    mrId: string
+  ): Promise<{ success: boolean; data?: any[]; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_saved_brochures_for_mr', {
+        p_mr_id: mrId
+      })
+
+      if (error) {
+        console.error('Get saved brochures error:', error)
+        return { success: false, error: error.message }
+      }
+
+      // Transform the data to include id field
+      const transformedData = data?.map((item: any, index: number) => ({
+        id: `saved_${mrId}_${item.brochure_id}_${index}`, // Generate local ID
+        brochure_id: item.brochure_id,
+        brochure_title: item.brochure_title,
+        custom_title: item.custom_title,
+        original_brochure_data: item.original_brochure_data,
+        saved_at: item.saved_at,
+        last_accessed: item.last_accessed
+      })) || []
+
+      return { success: true, data: transformedData }
+    } catch (error) {
+      console.error('Get saved brochures error:', error)
+      return { success: false, error: 'Failed to fetch saved brochures' }
+    }
+  }
+
+  /**
+   * Update custom title of a saved brochure
+   */
+  static async updateSavedBrochureTitle(
+    mrId: string,
+    brochureId: string,
+    customTitle: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('update_saved_brochure_title', {
+        p_mr_id: mrId,
+        p_brochure_id: brochureId,
+        p_new_custom_title: customTitle
+      })
+
+      if (error) {
+        console.error('Update saved brochure title error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (data && !data.success) {
+        return { success: false, error: data.error || 'Failed to update title' }
+      }
+
+      return { success: true }
+    } catch (error) {
+      console.error('Update saved brochure title error:', error)
+      return { success: false, error: 'Failed to update saved brochure title' }
+    }
+  }
+
+  /**
+   * Remove a saved brochure for an MR user
+   */
+  static async removeSavedBrochureForMr(
+    mrId: string,
+    brochureId: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('remove_saved_brochure_for_mr', {
+        p_mr_id: mrId,
+        p_brochure_id: brochureId
+      })
+
+      if (error) {
+        console.error('Remove saved brochure error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (data && !data.success) {
+        return { success: false, error: data.error || 'Failed to remove saved brochure' }
+      }
+
+      return { success: true }
+    } catch (error) {
+      console.error('Remove saved brochure error:', error)
+      return { success: false, error: 'Failed to remove saved brochure' }
+    }
+  }
+
+  // ==================== BROCHURE SYNC RPCs ====================
+
+  /**
+   * Save brochure changes (slides, groups, etc.) to server
+   */
+  static async saveBrochureChanges(params: {
+    mr_id: string
+    brochure_id: string
+    brochure_title: string
+    brochure_data_url: string
+    last_modified: string
+  }): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      // Get brochure data from local file to extract slides and groups
+      const brochureDataPath = `${require('expo-file-system').documentDirectory}brochures/${params.brochure_id}/brochure_data.json`
+      const FileSystem = require('expo-file-system')
+      
+      let brochureData: any = { slides: [], groups: [] }
+      try {
+        const fileInfo = await FileSystem.getInfoAsync(brochureDataPath)
+        if (fileInfo.exists) {
+          const fileContent = await FileSystem.readAsStringAsync(brochureDataPath)
+          brochureData = JSON.parse(fileContent)
+        }
+      } catch (fileError) {
+        console.warn('Could not read local brochure data file:', fileError)
+      }
+
+      const { data, error } = await supabase.rpc('save_brochure_changes', {
+        p_mr_id: params.mr_id,
+        p_brochure_id: params.brochure_id,
+        p_brochure_title: params.brochure_title,
+        p_brochure_data: {
+          brochure_data_url: params.brochure_data_url,
+          slides: brochureData.slides || [],
+          groups: brochureData.groups || [],
+          last_modified: params.last_modified,
+          total_slides: brochureData.totalSlides || brochureData.slides?.length || 0
+        }
+      })
+
+      if (error) {
+        console.error('Save brochure changes error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (data && !data.success) {
+        return { success: false, error: data.error || 'Failed to save brochure changes' }
+      }
+
+      return {
+        success: true,
+        data: {
+          id: data?.brochure_sync_id,
+          last_modified: data?.last_modified
+        }
+      }
+    } catch (error) {
+      console.error('Save brochure changes error:', error)
+      return { success: false, error: 'Failed to save brochure changes' }
+    }
+  }
+
+  /**
+   * Get all brochure changes for an MR user
+   */
+  static async getBrochureChangesForMr(
+    mrId: string
+  ): Promise<{ success: boolean; data?: any[]; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_brochure_changes', {
+        p_mr_id: mrId
+      })
+
+      if (error) {
+        console.error('Get brochure changes error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (data && !data.success) {
+        return { success: false, error: data.error || 'Failed to get brochure changes' }
+      }
+
+      return { success: true, data: data?.data || [] }
+    } catch (error) {
+      console.error('Get brochure changes error:', error)
+      return { success: false, error: 'Failed to fetch brochure changes' }
+    }
+  }
+
+  /**
+   * Get specific brochure sync data for download
+   */
+  static async getBrochureSyncData(
+    mrId: string,
+    brochureId: string
+  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('get_brochure_sync_data', {
+        p_mr_id: mrId,
+        p_brochure_id: brochureId
+      })
+
+      if (error) {
+        console.error('Get brochure sync data error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (data && !data.success) {
+        return { success: false, error: data.error || 'Brochure sync data not found' }
+      }
+
+      return { success: true, data: data?.data }
+    } catch (error) {
+      console.error('Get brochure sync data error:', error)
+      return { success: false, error: 'Failed to fetch brochure sync data' }
+    }
+  }
+
+  /**
+   * Delete brochure sync data
+   */
+  static async deleteBrochureSync(
+    mrId: string,
+    brochureId: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data, error } = await supabase.rpc('delete_brochure_sync', {
+        p_mr_id: mrId,
+        p_brochure_id: brochureId
+      })
+
+      if (error) {
+        console.error('Delete brochure sync error:', error)
+        return { success: false, error: error.message }
+      }
+
+      if (data && !data.success) {
+        return { success: false, error: data.error || 'Failed to delete brochure sync' }
+      }
+
+      return { success: true }
+    } catch (error) {
+      console.error('Delete brochure sync error:', error)
+      return { success: false, error: 'Failed to delete brochure sync' }
     }
   }
 }

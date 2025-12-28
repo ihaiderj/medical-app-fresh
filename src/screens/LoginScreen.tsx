@@ -4,22 +4,23 @@ import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { AuthService } from "../services/AuthService"
-import { SmartSyncService } from "../services/smartSyncService"
-import { LoginSyncService, LoginSyncProgress } from "../services/loginSyncService"
-import LoginSyncScreen from "../components/LoginSyncScreen"
+// import { SmartSyncService } from "../services/smartSyncService" // DELETED
+// import { LoginSyncService, LoginSyncProgress } from "../services/loginSyncService" // DELETED
+// import LoginSyncScreen from "../components/LoginSyncScreen" // DELETED
 import { ExtendedAuthService } from "../services/extendedAuthService"
 import { NetworkService } from "../services/networkService"
 import { OfflineBrochureService } from "../services/offlineBrochureService"
-import { CompleteDataSyncService, BrochureSyncResult } from "../services/completeDataSyncService"
-import { ComprehensiveServerSyncService } from "../services/comprehensiveServerSyncService"
+// import { CompleteDataSyncService, BrochureSyncResult } from "../services/completeDataSyncService" // DELETED
+// import { ComprehensiveServerSyncService } from "../services/comprehensiveServerSyncService" // DELETED
 import { FirstTimeLoginService } from "../services/firstTimeLoginService"
 import { LocalDatabaseService } from "../services/localDatabaseService"
 import { useNavigation } from '@react-navigation/native';
 import { useAppData } from '../context/AppDataContext';
 import { UserProfile } from "../services/AuthService";
-import BrochureSyncPrompt from "../components/BrochureSyncPrompt";
+// import BrochureSyncPrompt from "../components/BrochureSyncPrompt"; // DELETED
 import { BrochureManagementService } from "../services/brochureManagementService";
 import { MRService } from "../services/MRService";
+import { SyncService } from "../services/SyncService";
 
 interface LoginScreenProps {
   navigation: any
@@ -352,7 +353,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
         }
 
         // Initialize smart sync service (will handle offline gracefully)
-        await SmartSyncService.initialize()
+        // await SmartSyncService.initialize() // DELETED - service removed
         
         // For MR users: Show sync screen and perform sync BEFORE setting user (to block navigation)
         // For admin users: Set user immediately (no sync needed)
@@ -371,31 +372,49 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
           if (firstTimeInfo.isFirstTime) {
             console.log('🚀 LOGIN DEBUG: First time login detected - performing comprehensive sync');
             
+            // TODO: Replace with SyncService.syncDown()
             // Set up progress callback for comprehensive sync
-            ComprehensiveServerSyncService.setProgressCallback((progress) => {
-              console.log('🔍 LOGIN DEBUG: Comprehensive sync progress:', progress);
-              setSyncProgress({
-                step: progress.step,
-                message: progress.message,
-                progress: progress.progress
-              });
-              
-              // When sync reaches 100%, complete login
-              if (progress.progress >= 100 && !syncCompleted) {
-                syncCompleted = true
-                console.log('✅ LOGIN DEBUG: Sync completed, setting user and allowing navigation');
-                loginUser(userProfile)
-                setTimeout(() => {
-                  setShowSyncScreen(false)
-                  setIsFirstLogin(false)
-                }, 1000)
-              }
-            });
+            // ComprehensiveServerSyncService.setProgressCallback((progress) => {
+            //   console.log('🔍 LOGIN DEBUG: Comprehensive sync progress:', progress);
+            //   setSyncProgress({
+            //     step: progress.step,
+            //     message: progress.message,
+            //     progress: progress.progress
+            //   });
+            //   
+            //   // When sync reaches 100%, complete login
+            //   if (progress.progress >= 100 && !syncCompleted) {
+            //     syncCompleted = true
+            //     console.log('✅ LOGIN DEBUG: Sync completed, setting user and allowing navigation');
+            //     loginUser(userProfile)
+            //     setTimeout(() => {
+            //       setShowSyncScreen(false)
+            //       setIsFirstLogin(false)
+            //     }, 1000)
+            //   }
+            // });
             
-            // Perform comprehensive data sync
+            // Perform comprehensive data sync using SyncService
             try {
-              console.log('🚀 LOGIN DEBUG: Starting comprehensive server sync for user:', result.user.id);
-              const syncResult = await ComprehensiveServerSyncService.performComprehensiveSync(result.user.id);
+              console.log('🚀 LOGIN DEBUG: Starting sync down for user:', result.user.id);
+              SyncService.onProgress((progress) => {
+                setSyncProgress({
+                  step: progress.step,
+                  message: progress.message,
+                  progress: progress.progress
+                });
+                
+                if (progress.progress >= 100 && !syncCompleted) {
+                  syncCompleted = true
+                  console.log('✅ LOGIN DEBUG: Sync completed, setting user and allowing navigation');
+                  loginUser(userProfile)
+                  setTimeout(() => {
+                    setShowSyncScreen(false)
+                    setIsFirstLogin(false)
+                  }, 1000)
+                }
+              });
+              const syncResult = await SyncService.syncDown(result.user.id);
               if (syncResult.success) {
                 console.log('✅ LOGIN DEBUG: Comprehensive sync completed successfully');
                 console.log('📊 LOGIN DEBUG: Synced tables:', syncResult.syncedTables);
@@ -446,75 +465,102 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
           } else {
             console.log('🔍 LOGIN DEBUG: Not first time login - performing regular sync');
             
+            // TODO: Replace with SyncService.syncDown()
             // Set up progress callback for regular sync
-            CompleteDataSyncService.setProgressCallback((progress) => {
-              console.log('🔍 LOGIN DEBUG: Regular sync progress:', progress);
-              setSyncProgress({
-                step: progress.step,
-                message: progress.message,
-                progress: progress.progress
-              });
-              
-              // When sync reaches 100%, complete login
-              if (progress.progress >= 100 && !syncCompleted) {
-                syncCompleted = true
-                console.log('✅ LOGIN DEBUG: Regular sync completed, setting user and allowing navigation');
-                loginUser(userProfile)
-                setTimeout(() => {
-                  setShowSyncScreen(false)
-                  setIsFirstLogin(false)
-                }, 1000)
-              }
-            });
+            // CompleteDataSyncService.setProgressCallback((progress) => {
+            //   console.log('🔍 LOGIN DEBUG: Regular sync progress:', progress);
+            //   setSyncProgress({
+            //     step: progress.step,
+            //     message: progress.message,
+            //     progress: progress.progress
+            //   });
+            //   
+            //   // When sync reaches 100%, complete login
+            //   if (progress.progress >= 100 && !syncCompleted) {
+            //     syncCompleted = true
+            //     console.log('✅ LOGIN DEBUG: Regular sync completed, setting user and allowing navigation');
+            //     loginUser(userProfile)
+            //     setTimeout(() => {
+            //       setShowSyncScreen(false)
+            //       setIsFirstLogin(false)
+            //     }, 1000)
+            //   }
+            // });
             
-            // Perform regular data sync
+            // Perform regular data sync using SyncService
             try {
               console.log('🚀 LOGIN DEBUG: Starting regular data sync for user:', result.user.id);
-              // Clear previous sync results
-              CompleteDataSyncService.clearBrochureSyncResult();
               
-              const syncResult = await CompleteDataSyncService.performCompleteSync(result.user.id);
+              SyncService.onProgress((progress) => {
+                setSyncProgress({
+                  step: progress.step,
+                  message: progress.message,
+                  progress: progress.progress
+                });
+                
+                if (progress.progress >= 100 && !syncCompleted) {
+                  syncCompleted = true
+                  console.log('✅ LOGIN DEBUG: Regular sync completed, setting user and allowing navigation');
+                  loginUser(userProfile)
+                  setTimeout(() => {
+                    setShowSyncScreen(false)
+                    setIsFirstLogin(false)
+                  }, 1000)
+                }
+              });
+              
+              const syncResult = await SyncService.syncDown(result.user.id);
               if (syncResult.success) {
                 console.log('✅ LOGIN DEBUG: Regular sync completed successfully');
                 
                 // Store sync timestamp
                 await AsyncStorage.setItem(`last_sync_time_${result.user.id}`, Date.now().toString())
                 
-                // Get brochure sync results
-                const brochureSyncResult = CompleteDataSyncService.getBrochureSyncResult();
-                console.log('🔍 LOGIN DEBUG: Brochure sync results:', brochureSyncResult);
+                // TODO: Get brochure sync results when RPCs are available
+                // const brochureSyncResult = CompleteDataSyncService.getBrochureSyncResult();
+                // console.log('🔍 LOGIN DEBUG: Brochure sync results:', brochureSyncResult);
                 
                 // Check if there are prompts to show
-                if (brochureSyncResult.savedBrochuresToDownload.length > 0 ||
-                    brochureSyncResult.savedBrochuresToUpdate.length > 0 ||
-                    brochureSyncResult.newAvailableBrochures.length > 0) {
-                  console.log('🔍 LOGIN DEBUG: Found brochures to prompt:', {
-                    toDownload: brochureSyncResult.savedBrochuresToDownload.length,
-                    toUpdate: brochureSyncResult.savedBrochuresToUpdate.length,
-                    newAvailable: brochureSyncResult.newAvailableBrochures.length
-                  });
-                  
-                  // Store prompts for sequential display
-                  setBrochurePrompts(brochureSyncResult);
-                  
-                  // Start showing prompts (but don't hide sync screen yet)
-                  showNextPrompt(brochureSyncResult, result.user.id);
-                  
-                  // Complete login after prompts are handled
-                  if (!syncCompleted) {
-                    syncCompleted = true
-                    loginUser(userProfile)
-                  }
-                } else {
-                  // No prompts, complete login
-                  if (!syncCompleted) {
-                    syncCompleted = true
-                    loginUser(userProfile)
-                    setTimeout(() => {
-                      setShowSyncScreen(false);
-                      setIsFirstLogin(false);
-                    }, 1000);
-                  }
+                // if (brochureSyncResult.savedBrochuresToDownload.length > 0 ||
+                //     brochureSyncResult.savedBrochuresToUpdate.length > 0 ||
+                //     brochureSyncResult.newAvailableBrochures.length > 0) {
+                //   console.log('🔍 LOGIN DEBUG: Found brochures to prompt:', {
+                //     toDownload: brochureSyncResult.savedBrochuresToDownload.length,
+                //     toUpdate: brochureSyncResult.savedBrochuresToUpdate.length,
+                //     newAvailable: brochureSyncResult.newAvailableBrochures.length
+                //   });
+                //   
+                //   // Store prompts for sequential display
+                //   setBrochurePrompts(brochureSyncResult);
+                //   
+                //   // Start showing prompts (but don't hide sync screen yet)
+                //   showNextPrompt(brochureSyncResult, result.user.id);
+                //   
+                //   // Complete login after prompts are handled
+                //   if (!syncCompleted) {
+                //     syncCompleted = true
+                //     loginUser(userProfile)
+                //   }
+                // } else {
+                //   // No prompts, complete login
+                //   if (!syncCompleted) {
+                //     syncCompleted = true
+                //     loginUser(userProfile)
+                //     setTimeout(() => {
+                //       setShowSyncScreen(false);
+                //       setIsFirstLogin(false);
+                //     }, 1000);
+                //   }
+                // }
+                
+                // No prompts, complete login
+                if (!syncCompleted) {
+                  syncCompleted = true
+                  loginUser(userProfile)
+                  setTimeout(() => {
+                    setShowSyncScreen(false);
+                    setIsFirstLogin(false);
+                  }, 1000);
                 }
               } else {
                 console.warn('❌ LOGIN DEBUG: Regular sync failed:', syncResult.error);
@@ -662,7 +708,8 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
       </SafeAreaView>
       
       {/* Login Sync Screen */}
-      <LoginSyncScreen
+      {/* TODO: Implement sync screen UI if needed */}
+      {/* <LoginSyncScreen
         visible={showSyncScreen && !currentPromptIndex}
         syncProgress={syncProgress}
         onSyncComplete={() => setShowSyncScreen(false)}
@@ -670,13 +717,14 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
           setShowSyncScreen(false)
           Alert.alert('Sync Error', error)
         }}
-      />
+      /> */}
 
       {/* Brochure Sync Prompts */}
-      {brochurePrompts && currentPromptIndex && (
+      {/* TODO: Implement brochure sync prompts if needed */}
+      {/* {brochurePrompts && currentPromptIndex && (
         <>
           {/* Saved Brochure Download Prompt */}
-          {currentPromptIndex.type === 'download' && 
+          {/* {currentPromptIndex.type === 'download' && 
            brochurePrompts.savedBrochuresToDownload[currentPromptIndex.index] && (() => {
             const brochure = brochurePrompts.savedBrochuresToDownload[currentPromptIndex.index];
             return (
@@ -698,7 +746,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
           })()}
 
           {/* Saved Brochure Update Prompt */}
-          {currentPromptIndex.type === 'update' && 
+          {/* {currentPromptIndex.type === 'update' && 
            brochurePrompts.savedBrochuresToUpdate[currentPromptIndex.index] && (() => {
             const brochure = brochurePrompts.savedBrochuresToUpdate[currentPromptIndex.index];
             return (
@@ -721,7 +769,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
           })()}
 
           {/* New Available Brochure Prompt */}
-          {currentPromptIndex.type === 'new' && 
+          {/* {currentPromptIndex.type === 'new' && 
            brochurePrompts.newAvailableBrochures[currentPromptIndex.index] && (() => {
             const brochure = brochurePrompts.newAvailableBrochures[currentPromptIndex.index];
             return (
@@ -749,7 +797,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
             );
           })()}
         </>
-      )}
+      )} */}
     </View>
   )
 }

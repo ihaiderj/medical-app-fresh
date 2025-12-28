@@ -3919,6 +3919,64 @@ export class LocalDatabaseService {
     }
   }
 
+  /**
+   * Add brochure changes to sync queue
+   * Creates or updates a brochure_sync record and queues it
+   */
+  static async addBrochureToSyncQueue(
+    brochureId: string,
+    mrId: string,
+    brochureData: {
+      brochureId: string;
+      title: string;
+      slides: any[];
+      groups: any[];
+      lastModified: string;
+    }
+  ): Promise<void> {
+    await this.initialize();
+    
+    try {
+      // Check if brochure_sync record already exists
+      const existing = await this.db.getFirstAsync(`
+        SELECT id FROM brochure_sync 
+        WHERE brochure_id = ? AND mr_id = ? AND is_deleted = 0
+      `, [brochureId, mrId]);
+
+      const now = new Date().toISOString();
+      
+      if (existing) {
+        // Update existing record
+        await this.updateBrochureSync(existing.id, {
+          brochure_title: brochureData.title,
+          brochure_data: JSON.stringify({
+            slides: brochureData.slides,
+            groups: brochureData.groups
+          }),
+          last_modified: brochureData.lastModified,
+          updated_at: now
+        });
+        console.log('LocalDB: Brochure sync updated and queued:', existing.id);
+      } else {
+        // Create new record
+        const id = await this.createBrochureSync({
+          mr_id: mrId,
+          brochure_id: brochureId,
+          brochure_title: brochureData.title,
+          brochure_data: JSON.stringify({
+            slides: brochureData.slides,
+            groups: brochureData.groups
+          }),
+          last_modified: brochureData.lastModified
+        });
+        console.log('LocalDB: Brochure sync created and queued:', id);
+      }
+    } catch (error) {
+      console.error('LocalDB: Failed to add brochure to sync queue:', error);
+      throw error;
+    }
+  }
+
   // ==================== SAVED BROCHURES CRUD ====================
 
   /**
@@ -4041,16 +4099,19 @@ export class LocalDatabaseService {
   /**
    * Update saved brochure
    */
-  static async updateSavedBrochure(id: string, updates: Partial<LocalSavedBrochure>): Promise<void> {
+  static async updateSavedBrochure(id: string, updates: Partial<LocalSavedBrochure> & { skipSyncQueue?: boolean }): Promise<void> {
     await this.initialize();
     
     try {
+      const skipSyncQueue = updates.skipSyncQueue || false;
+      const { skipSyncQueue: _, ...updateData } = updates;
+      
       const now = new Date().toISOString();
       const updateFields = [];
       const values = [];
 
       // Build dynamic update query
-      Object.entries(updates).forEach(([key, value]) => {
+      Object.entries(updateData).forEach(([key, value]) => {
         if (key !== 'id' && key !== 'created_at') {
           updateFields.push(`${key} = ?`);
           values.push(value);
@@ -4064,15 +4125,77 @@ export class LocalDatabaseService {
         UPDATE saved_brochures SET ${updateFields.join(', ')} WHERE id = ?
       `, values);
 
-      // Add to sync queue
-      const updatedSavedBrochure = await this.getSavedBrochureById(id);
-      if (updatedSavedBrochure) {
-        await this.addToSyncQueue('update', 'saved_brochures', id, updatedSavedBrochure);
+      // Add to sync queue unless skipped
+      if (!skipSyncQueue) {
+        const updatedSavedBrochure = await this.getSavedBrochureById(id);
+        if (updatedSavedBrochure) {
+          await this.addToSyncQueue('update', 'saved_brochures', id, updatedSavedBrochure);
+        }
       }
 
       console.log('LocalDB: Saved brochure updated:', id);
     } catch (error) {
       console.error('LocalDB: Failed to update saved brochure:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Upsert saved brochure (insert or update) - used during sync down
+   */
+  static async upsertSavedBrochure(savedBrochure: LocalSavedBrochure): Promise<void> {
+    await this.initialize();
+    
+    try {
+      const existing = await this.getSavedBrochureById(savedBrochure.id);
+      
+      if (existing) {
+        // Update existing record without queuing
+        const now = new Date().toISOString();
+        const updateFields = [];
+        const values = [];
+
+        Object.entries(savedBrochure).forEach(([key, value]) => {
+          if (key !== 'id' && key !== 'created_at' && key !== 'local_changes') {
+            updateFields.push(`${key} = ?`);
+            values.push(value);
+          }
+        });
+
+        updateFields.push('updated_at = ?', 'version = version + 1');
+        values.push(now, savedBrochure.id);
+
+        await this.db.runAsync(`
+          UPDATE saved_brochures SET ${updateFields.join(', ')} WHERE id = ?
+        `, values);
+      } else {
+        // Create new record directly without queuing
+        const now = new Date().toISOString();
+        await this.db.runAsync(`
+          INSERT INTO saved_brochures (
+            id, server_id, mr_id, brochure_id, brochure_title, custom_title, 
+            original_brochure_data, saved_at, last_accessed, version, sync_status, is_deleted, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          savedBrochure.id,
+          savedBrochure.server_id || null,
+          savedBrochure.mr_id,
+          savedBrochure.brochure_id,
+          savedBrochure.brochure_title,
+          savedBrochure.custom_title,
+          savedBrochure.original_brochure_data,
+          savedBrochure.saved_at || now,
+          savedBrochure.last_accessed || now,
+          savedBrochure.version || 1,
+          savedBrochure.sync_status || 'synced',
+          savedBrochure.is_deleted ? 1 : 0,
+          savedBrochure.created_at || now
+        ]);
+      }
+      
+      console.log('LocalDB: Saved brochure upserted:', savedBrochure.id);
+    } catch (error) {
+      console.error('LocalDB: Failed to upsert saved brochure:', error);
       throw error;
     }
   }

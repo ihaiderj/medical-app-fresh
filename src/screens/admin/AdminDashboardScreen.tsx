@@ -5,7 +5,7 @@ import React, { useState, useEffect } from "react"
 import { useFocusEffect } from '@react-navigation/native'
 import { AdminService, DashboardStats, RecentActivity, MRPerformance, BrochureAnalytics } from "../../services/AdminService"
 import { AuthService } from "../../services/AuthService"
-import { SmartSyncService } from "../../services/smartSyncService"
+// import { SmartSyncService } from "../../services/smartSyncService" // DELETED
 import { SessionManagementService } from "../../services/sessionManagementService"
 import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius } from "../../utils/responsive"
 import { useAppData } from '../../context/AppDataContext'
@@ -133,7 +133,7 @@ export default function AdminDashboardScreen({ navigation }: AdminDashboardScree
               const userResult = await AuthService.getCurrentUser()
               
               // Stop sync service before logout
-              SmartSyncService.stop()
+              // SmartSyncService.stop() // DELETED - service removed
               
               // End session if user exists
               if (userResult.success && userResult.user) {

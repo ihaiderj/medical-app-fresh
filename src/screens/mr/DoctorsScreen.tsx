@@ -16,7 +16,7 @@ import { UnifiedDataService } from "../../services/UnifiedDataService"
 import { useGlobalForms } from "../../context/GlobalFormContext"
 import { safeString, safeToLowerCase, safeIncludes } from "../../utils/errorHandler"
 import OfflineStatusBar from "../../components/OfflineStatusBar"
-import SyncStatusIndicator from "../../components/SyncStatusIndicator"
+// import SyncStatusIndicator from "../../components/SyncStatusIndicator" // DELETED
 import OfflineSessionWarning from "../../components/OfflineSessionWarning"
 import { useAppData } from "../../context/AppDataContext"
 import { SafeAreaView } from "react-native-safe-area-context"
@@ -338,12 +338,13 @@ export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps)
               </View>
               <View style={styles.cardHeaderRight}>
                 {/* Only show sync icon if doctor has pending changes (not for server-synced doctors) */}
-                {doctor.sync_status === 'pending' && !doctor.server_id && (
+                {/* TODO: Replace with sync indicator if needed */}
+                {/* {doctor.sync_status === 'pending' && !doctor.server_id && (
                   <SyncStatusIndicator 
                     status={doctor.sync_status} 
                     size={14}
                   />
-                )}
+                )} */}
                 <View style={[styles.statusBadge, { backgroundColor: `${getStatusColor(safeString(doctor.relationship_status || 'active'))}20` }]}>
                   <Text style={[styles.statusText, { color: getStatusColor(safeString(doctor.relationship_status || 'active')) }]}>
                     {safeString(doctor.relationship_status || 'active').charAt(0).toUpperCase() + safeString(doctor.relationship_status || 'active').slice(1)}

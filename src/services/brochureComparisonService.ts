@@ -1,5 +1,15 @@
 import { BrochureData, BrochureSlide, SlideGroup } from './brochureManagementService'
-import { BrochureSyncData } from './brochureSyncService'
+// import { BrochureSyncData } from './brochureSyncService' // DELETED
+// Define BrochureSyncData locally
+interface BrochureSyncData {
+  brochureId: string;
+  brochureTitle?: string;
+  title?: string;
+  slides: any[];
+  groups: any[];
+  totalSlides?: number;
+  lastModified: string;
+}
 
 export interface BrochureDifference {
   slides: {

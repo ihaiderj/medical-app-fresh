@@ -1,7 +1,17 @@
 import * as FileSystem from 'expo-file-system'
 import { Platform } from 'react-native'
 import { supabase } from './supabase'
-import { brochureSyncService, BrochureSyncData } from './brochureSyncService'
+// import { brochureSyncService, BrochureSyncData } from './brochureSyncService' // DELETED
+// Define BrochureSyncData locally
+interface BrochureSyncData {
+  brochureId: string;
+  brochureTitle?: string;
+  title?: string;
+  slides: any[];
+  groups: any[];
+  totalSlides?: number;
+  lastModified: string;
+}
 import { FilePathUtils } from '../utils/filePathUtils'
 import { FileStorageService } from './fileStorageService'
 
@@ -219,7 +229,7 @@ export class BrochureManagementService {
         try {
           await unzip(localZipPath, slidesDir)
           console.log('ZIP extracted to:', slidesDir)
-        } catch (zipError) {
+        } catch (zipError: unknown) {
           console.error('ZIP extraction failed:', zipError)
           // Check if the file is actually a ZIP by reading its header
           const fileData = await FileSystem.readAsStringAsync(localZipPath, { 
@@ -227,7 +237,8 @@ export class BrochureManagementService {
             length: 4 
           })
           console.log('File header (base64):', fileData)
-          throw new Error(`ZIP extraction failed: ${zipError.message}. File may be corrupted or not a valid ZIP file.`)
+          const errorMessage = zipError instanceof Error ? zipError.message : 'Unknown error'
+          throw new Error(`ZIP extraction failed: ${errorMessage}. File may be corrupted or not a valid ZIP file.`)
         }
         
         // Read extracted files
@@ -367,7 +378,14 @@ export class BrochureManagementService {
         const downloadResult = await FileStorageService.downloadFile(
           fileUrl,
           localPath,
-          onProgress
+          onProgress ? (progress) => {
+            // Convert DownloadProgress to expected format
+            onProgress({
+              percentage: progress.percentage,
+              loaded: progress.totalBytesWritten,
+              total: progress.totalBytesExpectedToWrite
+            });
+          } : undefined
         );
 
         if (!downloadResult.success) {
@@ -580,7 +598,8 @@ export class BrochureManagementService {
       // Queue changes for sync if userId provided
       if (userId) {
         try {
-          const { LocalDatabaseService } = await import('./localDatabaseService');
+          // Use static import to avoid Metro bundler issues
+          const { LocalDatabaseService } = require('./localDatabaseService');
           await LocalDatabaseService.addBrochureToSyncQueue(brochureId, userId, {
             brochureId,
             title: brochureData.title,
@@ -1083,7 +1102,8 @@ export class BrochureManagementService {
       let finalUserId = userId;
       if (!finalUserId) {
         try {
-          const { AuthService } = await import('./AuthService');
+          // Use static import to avoid Metro bundler issues
+          const { AuthService } = require('./AuthService');
           const userResult = await AuthService.getCurrentUser();
           if (userResult.success && userResult.user) {
             finalUserId = userResult.user.id;
@@ -1123,10 +1143,12 @@ export class BrochureManagementService {
         JSON.stringify(result.data, null, 2)
       )
 
-      // Add to sync queue if not already queued and userId available
-      if (!wasNeedsSync && finalUserId) {
+      // Add to sync queue if userId available (always queue, even if already marked as needsSync)
+      // This ensures all modifications are queued, including rapid successive changes
+      if (finalUserId) {
         try {
-          const { LocalDatabaseService } = await import('./localDatabaseService');
+          // Use static import to avoid Metro bundler issues
+          const { LocalDatabaseService } = require('./localDatabaseService');
           await LocalDatabaseService.addBrochureToSyncQueue(brochureId, finalUserId, {
             brochureId,
             title: result.data.title,
@@ -1257,13 +1279,14 @@ export class BrochureManagementService {
         slideCount: g.slideIds.length
       })))
       
-      const result = await brochureSyncService.syncBrochureToServer(
-        mrId,
-        brochureId,
-        brochureTitle,
-        slides,
-        groups
-      )
+      // TODO: Replace with SyncService when brochure sync RPCs are available
+      // For now, brochure changes are queued and will be synced by SyncService.syncUp()
+      console.warn('🔵 BROCHURE_SYNC: brochureSyncService deleted, changes are queued and will be synced by SyncService')
+      const result = {
+        success: false,
+        error: 'Brochure sync service deleted. Changes are queued and will be synced by SyncService.syncUp()',
+        lastModified: undefined
+      }
       
       if (result.success) {
         console.log('🔵 BROCHURE_SYNC: Successfully uploaded brochure data')
@@ -1302,11 +1325,12 @@ export class BrochureManagementService {
     error?: string 
   }> {
     try {
-      return await brochureSyncService.checkBrochureSyncStatus(
-        mrId,
-        brochureId,
-        localLastModified
-      )
+      // TODO: Implement in SyncService when RPCs are available
+      console.warn('🔵 BROCHURE_SYNC: checkBrochureSyncStatus not yet implemented in SyncService')
+      return {
+        success: false,
+        error: 'Brochure sync status check not yet implemented'
+      }
     } catch (error) {
       console.error('Brochure sync status check error:', error)
       return {
@@ -1328,7 +1352,12 @@ export class BrochureManagementService {
     error?: string 
   }> {
     try {
-      return await brochureSyncService.downloadBrochureChanges(mrId, brochureId)
+      // TODO: Implement in SyncService when RPCs are available
+      console.warn('🔵 BROCHURE_SYNC: downloadBrochureChanges not yet implemented in SyncService')
+      return {
+        success: false,
+        error: 'Brochure download not yet implemented'
+      }
     } catch (error) {
       console.error('Brochure download error:', error)
       return {
@@ -1383,12 +1412,12 @@ export class BrochureManagementService {
       // Create updated brochure data with sync metadata
       const brochureData: BrochureData = {
         id: brochureId,
-        title: syncData.brochureTitle,
+        title: syncData.brochureTitle || syncData.title || 'Brochure',
         category: 'General',
         slides: syncData.slides,
         groups: syncData.groups,
         thumbnailUri: syncData.slides[0]?.imageUri,
-        totalSlides: syncData.totalSlides,
+        totalSlides: syncData.totalSlides || syncData.slides.length,
         createdAt: existingResult.data?.createdAt || now,
         updatedAt: syncData.lastModified,
         // Sync metadata

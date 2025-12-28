@@ -4,18 +4,19 @@ import { Ionicons } from "@expo/vector-icons"
 import { useState, useEffect, useCallback } from "react"
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from "../../services/MRService"
-import { SmartSyncService } from "../../services/smartSyncService"
+// import { SmartSyncService } from "../../services/smartSyncService" // DELETED
 import { SessionManagementService } from "../../services/sessionManagementService"
-import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus"
+// import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus" // DELETED
 import { useAppData } from '../../context/AppDataContext';
 import { OfflineFirstService } from '../../services/offlineFirstService';
 import { LocalDatabaseService } from '../../services/localDatabaseService';
-import { ComprehensiveServerSyncService } from '../../services/comprehensiveServerSyncService';
-import { AdvancedSyncService } from '../../services/advancedSyncService';
+// import { ComprehensiveServerSyncService } from '../../services/comprehensiveServerSyncService'; // DELETED
+// import { AdvancedSyncService } from '../../services/advancedSyncService'; // DELETED
 import { FirstTimeLoginService } from '../../services/firstTimeLoginService';
-import { SyncVerificationService } from '../../services/syncVerificationService';
+// import { SyncVerificationService } from '../../services/syncVerificationService'; // DELETED
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import SyncTestPanel from '../../components/SyncTestPanel';
+import { SyncService } from '../../services/SyncService';
+// import SyncTestPanel from '../../components/SyncTestPanel'; // DELETED
 
 interface MRDashboardScreenProps {
   navigation: any
@@ -255,23 +256,23 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       setSyncProgress({ step: 'Uploading', message: 'Uploading local changes to server...', progress: 50 });
       console.log('🚀 MANUAL SYNC DEBUG: Uploading local changes...');
       
-      // Perform comprehensive sync to ensure server matches local exactly
-      const syncResult = await AdvancedSyncService.syncLocalToServer(user.id);
+      // Perform sync using SyncService
+      const syncResult = await SyncService.syncUp();
       
       if (syncResult.success) {
         console.log('✅ MANUAL SYNC DEBUG: Manual sync completed successfully');
-        console.log('📊 MANUAL SYNC DEBUG: Synced operations:', syncResult.syncedOperations);
-        console.log('📊 MANUAL SYNC DEBUG: Failed operations:', syncResult.failedOperations);
+        console.log('📊 MANUAL SYNC DEBUG: Synced operations:', syncResult.synced);
+        console.log('📊 MANUAL SYNC DEBUG: Failed operations:', syncResult.failed);
         
-        // Verify sync status after sync completes
-        try {
-          console.log('🔍 SYNC VERIFICATION: Verifying sync status...');
-          const verificationResult = await SyncVerificationService.verifySyncStatus(user.id);
-          console.log('📊 SYNC VERIFICATION: Summary:', verificationResult.summary);
-          SyncVerificationService.printSyncLogs();
-        } catch (verifyError) {
-          console.warn('⚠️ SYNC VERIFICATION: Failed to verify sync status:', verifyError);
-        }
+        // TODO: Implement sync verification in SyncService if needed
+        // try {
+        //   console.log('🔍 SYNC VERIFICATION: Verifying sync status...');
+        //   const verificationResult = await SyncVerificationService.verifySyncStatus(user.id);
+        //   console.log('📊 SYNC VERIFICATION: Summary:', verificationResult.summary);
+        //   SyncVerificationService.printSyncLogs();
+        // } catch (verifyError) {
+        //   console.warn('⚠️ SYNC VERIFICATION: Failed to verify sync status:', verifyError);
+        // }
         
         // Update last sync timestamp
         await FirstTimeLoginService.updateLastSyncTimestamp();
@@ -279,7 +280,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         // Reload dashboard data to show updated information
         await loadDashboardData();
         
-        setSyncProgress({ step: 'Complete', message: `Sync completed! ${syncResult.syncedOperations} operations synced.`, progress: 100 });
+        setSyncProgress({ step: 'Complete', message: `Sync completed! ${syncResult.synced} operations synced.`, progress: 100 });
         
         // Clear progress after 3 seconds
         setTimeout(() => {
@@ -322,15 +323,21 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
           {
             text: 'Verify',
             onPress: async () => {
-              console.log('🔍 SYNC VERIFICATION: Starting verification...');
-              const result = await SyncVerificationService.verifySyncStatus(user.id);
-              console.log('📊 SYNC VERIFICATION: Results:', JSON.stringify(result.results, null, 2));
-              SyncVerificationService.printSyncLogs();
+              // TODO: Implement sync verification in SyncService if needed
+              console.log('🔍 SYNC VERIFICATION: Sync verification not yet implemented');
+              Alert.alert(
+                'Sync Verification',
+                'Sync verification feature is not yet implemented. Check console logs for sync status.',
+                [{ text: 'OK' }]
+              );
+              // const result = await SyncVerificationService.verifySyncStatus(user.id);
+              // console.log('📊 SYNC VERIFICATION: Results:', JSON.stringify(result.results, null, 2));
+              // SyncVerificationService.printSyncLogs();
               
               // Show summary in alert
-              const summaryLines = result.results.map(r => 
-                `${r.entity}: Local=${r.localCount}, Server=${r.serverCount}, Synced=${r.syncedToServerCount}, Queued=${r.queuedCount}`
-              ).join('\n');
+              // const summaryLines = result.results.map(r => 
+              //   `${r.entity}: Local=${r.localCount}, Server=${r.serverCount}, Synced=${r.syncedToServerCount}, Queued=${r.queuedCount}`
+              // ).join('\n');
               
               Alert.alert(
                 'Sync Verification Complete',
@@ -362,7 +369,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
               const userResult = await AuthService.getCurrentUser()
               
               // Stop sync service before logout
-              SmartSyncService.stop()
+              // SmartSyncService.stop() // DELETED - service removed
               
               // End session if user exists
               if (userResult.success && userResult.user) {
@@ -700,13 +707,14 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       </SafeAreaView>
 
       {/* Sync Test Panel Modal */}
-      {showTestPanel && (
+      {/* TODO: Implement sync test panel if needed */}
+      {/* {showTestPanel && (
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <SyncTestPanel onClose={() => setShowTestPanel(false)} />
           </View>
         </View>
-      )}
+      )} */}
     </View>
   )
 }

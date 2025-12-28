@@ -42,9 +42,9 @@ import { MRService } from '../../services/MRService'
 import { AuthService } from '../../services/AuthService'
 import { OfflineFirstService } from '../../services/offlineFirstService'
 import { UnifiedDataService } from '../../services/UnifiedDataService'
-import BrochureSyncStatus from '../../components/BrochureSyncStatus'
-import SyncStatusIndicator from '../../components/SyncStatusIndicator'
-import { SmartSyncService } from '../../services/smartSyncService'
+// import BrochureSyncStatus from '../../components/BrochureSyncStatus' // DELETED
+// import SyncStatusIndicator from '../../components/SyncStatusIndicator' // DELETED
+// import { SmartSyncService } from '../../services/smartSyncService' // DELETED
 import { FilePathUtils } from '../../utils/filePathUtils'
 import { useModalQueue } from '../../hooks/useModalQueue'
 import { useAppData } from '../../context/AppDataContext'
@@ -1017,7 +1017,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
   const handleSlidePress = (slide: BrochureSlide) => {
     // Track user activity for idle detection
-    SmartSyncService.trackActivity()
+    // SmartSyncService.trackActivity() // DELETED - service removed
     
     if (showCheckboxes) {
       // If checkboxes are visible, clicking anywhere selects/deselects
@@ -1230,6 +1230,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         JSON.stringify(brochureData, null, 2)
       )
 
+      // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+      console.log('🟢 GROUP_ADD_SLIDES: Marking brochure as modified for sync')
+      await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+        console.warn('🟢 GROUP_ADD_SLIDES: Failed to mark brochure as modified:', err);
+      });
+
       setShowGroupSelectionModal(false)
       exitSelectionMode()
       loadBrochureData()
@@ -1389,6 +1395,12 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                 JSON.stringify(brochureData, null, 2)
               )
 
+              // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+              console.log('🟡 GROUP_REMOVE_SLIDES: Marking brochure as modified for sync')
+              await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+                console.warn('🟡 GROUP_REMOVE_SLIDES: Failed to mark brochure as modified:', err);
+              });
+
               Alert.alert('Success', 'Slides removed from group successfully')
               exitSelectionMode()
               loadBrochureData()
@@ -1437,7 +1449,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
              {/* Manual Sync Button - Available in Both Orientations */}
              <TouchableOpacity
                style={styles.syncButton}
-               onPress={() => SmartSyncService.forceSyncNow()}
+               onPress={() => {
+                 // TODO: Replace with SyncService.syncUp() when ready
+                 console.warn('Sync button: SmartSyncService deleted, use SyncService.syncUp() instead')
+               }}
              >
                <Ionicons
                  name="cloud-upload"
@@ -1529,7 +1544,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
          </View>
 
          {/* Sync Status Indicator */}
-        <SyncStatusIndicator status="synced" />
+        {/* <SyncStatusIndicator status="synced" /> DELETED - component removed */}
 
          {/* Conditional Controls Based on Orientation and Visibility */}
         {currentOrientation === 'landscape' ? (

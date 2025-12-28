@@ -8,17 +8,19 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AuthService } from './src/services/AuthService';
 import useActivityTracker from './src/hooks/useActivityTracker';
-import { SmartSyncService } from './src/services/smartSyncService';
+// import { SmartSyncService } from './src/services/smartSyncService'; // DELETED
 import { SessionManagementService } from './src/services/sessionManagementService';
 import { LocalDatabaseService } from './src/services/localDatabaseService';
 import { NetworkService } from './src/services/networkService';
-import { AdvancedSyncService } from './src/services/advancedSyncService';
-import { UnifiedSyncService } from './src/services/unifiedSyncService';
-import { InitialSyncService } from './src/services/initialSyncService';
+import { SyncService } from './src/services/SyncService';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+// import { AdvancedSyncService } from './src/services/advancedSyncService'; // DELETED
+// import { UnifiedSyncService } from './src/services/unifiedSyncService'; // DELETED
+// import { InitialSyncService } from './src/services/initialSyncService'; // DELETED
 import { AppDataProvider, useAppData } from './src/context/AppDataContext';
 import { GlobalFormProvider } from './src/context/GlobalFormContext';
 import { LogFileWriter } from './src/utils/logFileWriter';
-import UnifiedSyncIndicator from './src/components/UnifiedSyncIndicator';
+// import UnifiedSyncIndicator from './src/components/UnifiedSyncIndicator'; // DELETED
 import LoginScreen from './src/screens/LoginScreen';
 import AdminDashboardScreen from './src/screens/admin/AdminDashboardScreen';
 import AdminTabs from './src/screens/admin/AdminTabs';
@@ -228,15 +230,12 @@ export default function App() {
         
         // Register session and initialize sync services
         await SessionManagementService.registerSessionWithConflictCheck(autoLoginResult.user.id)
-        // await AdvancedSyncService.initialize() // DISABLED - causing infinite doctor creation
-        // await UnifiedSyncService.initialize() // Temporarily disabled to fix sync issues
+        // await AdvancedSyncService.initialize() // DELETED - service removed
+        // await UnifiedSyncService.initialize() // DELETED - service removed
         
         // Perform comprehensive sync only if local DB is empty or outdated
         // This ensures offline-first: data should already be in local DB
         try {
-          const { shouldPerformComprehensiveSync } = await import('./src/services/loginSyncHelper');
-          const { NetworkService } = await import('./src/services/networkService');
-          
           // Check if device is online (sync only works when online)
           const isOnline = await NetworkService.isOnline();
           
@@ -246,14 +245,15 @@ export default function App() {
             return;
           }
           
-          // Determine if comprehensive sync should be performed
-          const syncDecision = await shouldPerformComprehensiveSync(autoLoginResult.user.id);
+          // Simple check: perform sync if local DB appears empty
+          // TODO: Implement more sophisticated sync decision logic if needed
+          const doctors = await LocalDatabaseService.getDoctors(autoLoginResult.user.id);
+          const shouldSync = doctors.length === 0;
           
-          if (syncDecision.shouldSync) {
-            console.log(`🔄 AUTO-LOGIN DEBUG: Starting comprehensive sync - Reason: ${syncDecision.reason}...`);
+          if (shouldSync) {
+            console.log(`🔄 AUTO-LOGIN DEBUG: Starting comprehensive sync - Reason: Local DB appears empty...`);
             
-            const { ComprehensiveServerSyncService } = await import('./src/services/comprehensiveServerSyncService');
-            const syncResult = await ComprehensiveServerSyncService.performComprehensiveSync(autoLoginResult.user.id);
+            const syncResult = await SyncService.syncDown(autoLoginResult.user.id);
             
             if (syncResult.success) {
               console.log('✅ AUTO-LOGIN DEBUG: Comprehensive sync completed successfully');
@@ -261,7 +261,6 @@ export default function App() {
               
               // Store sync time after successful sync
               try {
-                const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
                 await AsyncStorage.setItem(`last_sync_time_${autoLoginResult.user.id}`, Date.now().toString());
                 console.log('✅ AUTO-LOGIN DEBUG: Sync timestamp stored');
               } catch (error) {
@@ -271,23 +270,22 @@ export default function App() {
               console.warn('⚠️ AUTO-LOGIN DEBUG: Comprehensive sync failed:', syncResult.error);
             }
           } else {
-            console.log(`⏭️ AUTO-LOGIN DEBUG: Skipping sync - Local DB is ${syncDecision.reason} (offline-first mode)`);
+            console.log(`⏭️ AUTO-LOGIN DEBUG: Skipping sync - Local DB has ${doctors.length} doctors (offline-first mode)`);
             // Work with local data only
             
             // Even if sync is skipped, clean up any duplicates that may exist
-            try {
-              const { ComprehensiveServerSyncService } = await import('./src/services/comprehensiveServerSyncService');
-              const { LocalDatabaseService } = await import('./src/services/localDatabaseService');
-              await Promise.all([
-                // Note: cleanupDuplicateDoctorsByName was removed - use cleanupDuplicateDoctorsByServerId instead
-                // This is handled automatically by LocalDatabaseService during doctor operations
-                ComprehensiveServerSyncService.cleanupDuplicateMeetings(autoLoginResult.user.id),
-                ComprehensiveServerSyncService.cleanupDuplicateSavedBrochures(autoLoginResult.user.id),
-                ComprehensiveServerSyncService.cleanupDuplicateMeetingSlideNotes(autoLoginResult.user.id)
-              ]);
-            } catch (cleanupError) {
-              console.warn('⚠️ AUTO-LOGIN DEBUG: Error cleaning up duplicates:', cleanupError);
-            }
+            // TODO: Implement cleanup in SyncService or DataCleanupService
+            // try {
+            //   const { ComprehensiveServerSyncService } = await import('./src/services/comprehensiveServerSyncService'); // DELETED
+            //   const { LocalDatabaseService } = await import('./src/services/localDatabaseService');
+            //   await Promise.all([
+            //     ComprehensiveServerSyncService.cleanupDuplicateMeetings(autoLoginResult.user.id),
+            //     ComprehensiveServerSyncService.cleanupDuplicateSavedBrochures(autoLoginResult.user.id),
+            //     ComprehensiveServerSyncService.cleanupDuplicateMeetingSlideNotes(autoLoginResult.user.id)
+            //   ]);
+            // } catch (cleanupError) {
+            //   console.warn('⚠️ AUTO-LOGIN DEBUG: Error cleaning up duplicates:', cleanupError);
+            // }
           }
         } catch (error) {
           console.error('❌ AUTO-LOGIN DEBUG: Sync check error:', error);
@@ -306,8 +304,8 @@ export default function App() {
           
           // Register session and initialize sync service
           await SessionManagementService.registerSessionWithConflictCheck(result.user.id)
-          // await AdvancedSyncService.initialize() // DISABLED - causing infinite doctor creation
-          // await UnifiedSyncService.initialize() // Temporarily disabled to fix sync issues
+          // await AdvancedSyncService.initialize() // DELETED - service removed
+          // await UnifiedSyncService.initialize() // DELETED - service removed
           
           // Perform initial sync from server to local database
           // console.log('Performing initial sync from server...')

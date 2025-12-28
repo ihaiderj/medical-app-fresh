@@ -101,8 +101,15 @@ export class DataCleanupService {
       }
 
       // Clean up notes with undefined/null server_id but marked as synced
-      const notes = await LocalDatabaseService.getMeetingSlideNotes(userId);
-      for (const note of notes) {
+      // Get all meetings for the user, then get notes for each meeting
+      const meetingsForNotes = await LocalDatabaseService.getMeetings(userId);
+      const allNotes: any[] = [];
+      for (const meeting of meetingsForNotes) {
+        const notes = await LocalDatabaseService.getMeetingNotes(meeting.id);
+        allNotes.push(...notes);
+      }
+      
+      for (const note of allNotes) {
         if (note.sync_status === 'synced' && (!note.server_id || note.server_id === null || note.server_id === undefined)) {
           console.warn(`🧹 CLEANUP CORRUPT: Found corrupt note ${note.id} - marked as synced but no server_id`);
           try {
@@ -220,8 +227,14 @@ export class DataCleanupService {
       const meetingsForNotes = await LocalDatabaseService.getMeetings(userId);
       const validMeetingIds = new Set(meetingsForNotes.map(m => m.id));
       
-      const notes = await LocalDatabaseService.getMeetingSlideNotes(userId);
-      for (const note of notes) {
+      // Get all notes for all meetings
+      const allNotes: any[] = [];
+      for (const meeting of meetingsForNotes) {
+        const notes = await LocalDatabaseService.getMeetingNotes(meeting.id);
+        allNotes.push(...notes);
+      }
+      
+      for (const note of allNotes) {
         if (!validMeetingIds.has(note.meeting_id)) {
           console.warn(`🧹 CLEANUP ORPHANED: Found orphaned note ${note.id} - meeting ${note.meeting_id} not found`);
           try {
@@ -299,18 +312,20 @@ export class DataCleanupService {
     try {
       console.log('🧹 CLEANUP DUPLICATES: Starting duplicate records cleanup...');
 
+      // TODO: Implement cleanup in SyncService or DataCleanupService
       // Use existing cleanup functions
       try {
-        const { ComprehensiveServerSyncService } = await import('./comprehensiveServerSyncService');
+        // const { ComprehensiveServerSyncService } = await import('./comprehensiveServerSyncService'); // DELETED
         
         // Clean up duplicate meetings
-        await ComprehensiveServerSyncService.cleanupDuplicateMeetings(userId);
+        // await ComprehensiveServerSyncService.cleanupDuplicateMeetings(userId);
         
         // Clean up duplicate saved brochures
-        await ComprehensiveServerSyncService.cleanupDuplicateSavedBrochures(userId);
+        // await ComprehensiveServerSyncService.cleanupDuplicateSavedBrochures(userId);
         
         // Clean up duplicate meeting slide notes
-        await ComprehensiveServerSyncService.cleanupDuplicateMeetingSlideNotes(userId);
+        // await ComprehensiveServerSyncService.cleanupDuplicateMeetingSlideNotes(userId);
+        console.warn('🧹 CLEANUP DUPLICATES: Cleanup functions not yet implemented in SyncService');
         
         console.log('✅ CLEANUP DUPLICATES: Duplicate cleanup completed');
       } catch (error) {
