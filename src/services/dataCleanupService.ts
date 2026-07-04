@@ -4,7 +4,6 @@
  */
 import { LocalDatabaseService, LocalMeeting, LocalDoctor, LocalMeetingNote, LocalMeetingFollowUp, LocalSavedBrochure } from './localDatabaseService';
 import { MRService } from './MRService';
-import { supabase } from './supabase';
 
 export interface CleanupResult {
   duplicatesRemoved: number;
@@ -351,23 +350,18 @@ export class DataCleanupService {
       console.log('🧹 CLEANUP SERVER CORRUPT: Starting server corrupt records cleanup...');
 
       // Fetch meetings from server
-      const { data: meetings, error } = await supabase
-        .from('meetings')
-        .select('id, title, mr_id')
-        .eq('mr_id', userId);
+      const meetingsResult = await MRService.getMeetings(userId);
+      const meetings = meetingsResult.success ? meetingsResult.data || [] : [];
 
-      if (error) {
-        console.error('❌ CLEANUP SERVER CORRUPT: Error fetching meetings:', error);
-        result.errors.push(`Failed to fetch meetings: ${error.message}`);
-        return result;
-      }
-
-      if (!meetings) {
+      if (!meetingsResult.success) {
+        result.errors.push(`Failed to fetch meetings: ${meetingsResult.error}`);
         return result;
       }
 
       // Find meetings with undefined/null IDs
-      const corruptMeetings = meetings.filter(m => !m.id || m.id === null || m.id === undefined);
+      const corruptMeetings = meetings.filter(
+        (m) => !(m.meeting_id || m.id) || m.meeting_id === null || m.id === null,
+      )
       
       if (corruptMeetings.length > 0) {
         console.warn(`🧹 CLEANUP SERVER CORRUPT: Found ${corruptMeetings.length} corrupt meetings on server`);

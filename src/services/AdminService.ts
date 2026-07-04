@@ -1,4 +1,5 @@
-import { supabase } from './supabase'
+import { apiClient, ApiError } from './apiClient'
+import { resolveMediaUrl } from '../config/apiConfig'
 import { PDFProcessingService } from './pdfProcessingService'
 
 export interface DashboardStats {
@@ -109,181 +110,102 @@ export interface MeetingData {
   created_at: string
 }
 
+function serviceError(error: unknown, fallback: string): string {
+  return error instanceof ApiError ? error.message : fallback
+}
+
 export class AdminService {
-  /**
-   * Get dashboard statistics
-   */
   static async getDashboardStats(): Promise<{ success: boolean; data?: DashboardStats; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_admin_dashboard_stats')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<DashboardStats>('/api/admin/dashboard/stats/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch dashboard stats' }
+      return { success: false, error: serviceError(error, 'Failed to fetch dashboard stats') }
     }
   }
 
   static async getRecentActivities(limit: number = 5): Promise<{ success: boolean; data?: RecentActivity[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_recent_activities', { limit_count: limit })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<RecentActivity[]>('/api/admin/dashboard/activities/', { query: { limit } })
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch recent activities' }
+      return { success: false, error: serviceError(error, 'Failed to fetch recent activities') }
     }
   }
 
   static async getSystemStatus(): Promise<{ success: boolean; data?: SystemStatus; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_system_status')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<SystemStatus>('/api/admin/system/status/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch system status' }
+      return { success: false, error: serviceError(error, 'Failed to fetch system status') }
     }
   }
 
   static async getMRPerformanceStats(): Promise<{ success: boolean; data?: MRPerformance[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_performance_stats')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRPerformance[]>('/api/admin/analytics/mr-performance/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR performance stats' }
+      return { success: false, error: serviceError(error, 'Failed to fetch MR performance stats') }
     }
   }
 
   static async getBrochureAnalytics(): Promise<{ success: boolean; data?: BrochureAnalytics[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_brochure_analytics')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<BrochureAnalytics[]>('/api/admin/analytics/brochures/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch brochure analytics' }
+      return { success: false, error: serviceError(error, 'Failed to fetch brochure analytics') }
     }
   }
 
-  /**
-   * Get all medical representatives
-   */
   static async getAllMRs(): Promise<{ success: boolean; data?: MRData[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_all_mrs')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRData[]>('/api/admin/mrs/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MRs' }
+      return { success: false, error: serviceError(error, 'Failed to fetch MRs') }
     }
   }
 
-  /**
-   * Create new medical representative
-   */
   static async createMR(
     email: string,
     password: string,
     firstName: string,
     lastName: string,
     phone?: string,
-    profileImageUrl?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      // First create auth user
-      const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-        email,
-        password,
-        email_confirm: true,
-      })
-
-      if (authError) {
-        return { success: false, error: authError.message }
-      }
-
-      if (!authData.user) {
-        return { success: false, error: 'Failed to create user' }
-      }
-
-      // Then create user profile
-      const { data, error } = await supabase.rpc('create_mr', {
-        p_email: email,
-        p_password_hash: '', // Password is handled by Supabase Auth
-        p_first_name: firstName,
-        p_last_name: lastName,
-        p_phone: phone,
-        p_profile_image_url: profileImageUrl,
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to create MR' }
-    }
+    profileImageUrl?: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    return this.createMRWithPermissions(
+      email,
+      password,
+      firstName,
+      lastName,
+      phone,
+      undefined,
+      profileImageUrl,
+    )
   }
 
-  /**
-   * Get all brochures
-   */
   static async getAllBrochures(): Promise<{ success: boolean; data?: BrochureData[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_all_brochures')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<BrochureData[]>('/api/admin/brochures/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch brochures' }
+      return { success: false, error: serviceError(error, 'Failed to fetch brochures') }
     }
   }
 
-  /**
-   * Get all doctors
-   */
   static async getAllDoctors(): Promise<{ success: boolean; data?: DoctorData[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_all_doctors')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<DoctorData[]>('/api/admin/doctors/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch doctors' }
+      return { success: false, error: serviceError(error, 'Failed to fetch doctors') }
     }
   }
 
-  /**
-   * Create new doctor
-   */
   static async createDoctor(
     firstName: string,
     lastName: string,
@@ -293,78 +215,52 @@ export class AdminService {
     phone?: string,
     location?: string,
     profileImageUrl?: string,
-    notes?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    notes?: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('create_doctor', {
-        p_first_name: firstName,
-        p_last_name: lastName,
-        p_email: email,
-        p_phone: phone,
-        p_specialty: specialty,
-        p_hospital: hospital,
-        p_location: location,
-        p_profile_image_url: profileImageUrl,
-        p_notes: notes,
-        p_created_by: null, // Will be set by the function
+      const data = await apiClient.post('/api/admin/doctors/', {
+        first_name: firstName,
+        last_name: lastName,
+        specialty,
+        hospital,
+        email,
+        phone,
+        location,
+        profile_image_url: profileImageUrl,
+        notes,
       })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to create doctor' }
+      return { success: false, error: serviceError(error, 'Failed to create doctor') }
     }
   }
 
-  /**
-   * Assign doctor to MR
-   */
   static async assignDoctorToMR(
     doctorId: string,
     mrId: string,
-    notes?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    notes?: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('assign_doctor_to_mr', {
-        p_doctor_id: doctorId,
-        p_mr_id: mrId,
-        p_assigned_by: null, // Will be set by the function
-        p_notes: notes,
+      const data = await apiClient.post('/api/admin/doctor-assignments/', {
+        doctor_id: doctorId,
+        mr_id: mrId,
+        notes,
       })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to assign doctor to MR' }
+      return { success: false, error: serviceError(error, 'Failed to assign doctor to MR') }
     }
   }
 
-  /**
-   * Get all meetings
-   */
   static async getAllMeetings(): Promise<{ success: boolean; data?: MeetingData[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_all_meetings')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MeetingData[]>('/api/admin/meetings/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch meetings' }
+      return { success: false, error: serviceError(error, 'Failed to fetch meetings') }
     }
   }
 
-  /**
-   * Create MR with permissions
-   */
   static async createMRWithPermissions(
     email: string,
     password: string,
@@ -375,79 +271,54 @@ export class AdminService {
     profileImageUrl?: string,
     canUploadBrochures: boolean = false,
     canManageDoctors: boolean = false,
-    canScheduleMeetings: boolean = true
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    canScheduleMeetings: boolean = true,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('create_mr_with_permissions', {
-        p_email: email,
-        p_password_hash: password, // This will be hashed by Supabase Auth
-        p_first_name: firstName,
-        p_last_name: lastName,
-        p_phone: phone,
-        p_address: address,
-        p_profile_image_url: profileImageUrl,
-        p_can_upload_brochures: canUploadBrochures,
-        p_can_manage_doctors: canManageDoctors,
-        p_can_schedule_meetings: canScheduleMeetings,
+      const data = await apiClient.post('/api/admin/mrs/', {
+        email,
+        password,
+        first_name: firstName,
+        last_name: lastName,
+        phone,
+        address,
+        profile_image_url: profileImageUrl,
+        can_upload_brochures: canUploadBrochures,
+        can_manage_doctors: canManageDoctors,
+        can_schedule_meetings: canScheduleMeetings,
       })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to create MR' }
+      return { success: false, error: serviceError(error, 'Failed to create MR') }
     }
   }
 
-  /**
-   * Get all MRs with permissions
-   */
-  static async getAllMRsWithPermissions(): Promise<{ success: boolean; data?: any[]; error?: string }> {
+  static async getAllMRsWithPermissions(): Promise<{ success: boolean; data?: unknown[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_all_mrs_with_permissions')
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<unknown[]>('/api/admin/mrs/', { query: { include_permissions: true } })
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MRs' }
+      return { success: false, error: serviceError(error, 'Failed to fetch MRs') }
     }
   }
 
-  /**
-   * Update MR permissions
-   */
   static async updateMRPermissions(
     mrId: string,
     canUploadBrochures?: boolean,
     canManageDoctors?: boolean,
-    canScheduleMeetings?: boolean
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    canScheduleMeetings?: boolean,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('update_mr_permissions', {
-        p_mr_id: mrId,
-        p_can_upload_brochures: canUploadBrochures,
-        p_can_manage_doctors: canManageDoctors,
-        p_can_schedule_meetings: canScheduleMeetings,
+      const data = await apiClient.patch(`/api/admin/mrs/${mrId}/permissions/`, {
+        can_upload_brochures: canUploadBrochures,
+        can_manage_doctors: canManageDoctors,
+        can_schedule_meetings: canScheduleMeetings,
       })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to update MR permissions' }
+      return { success: false, error: serviceError(error, 'Failed to update MR permissions') }
     }
   }
 
-  /**
-   * Update MR profile
-   */
   static async updateMRProfile(
     mrId: string,
     firstName?: string,
@@ -455,102 +326,63 @@ export class AdminService {
     phone?: string,
     address?: string,
     profileImageUrl?: string,
-    isActive?: boolean
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    isActive?: boolean,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('update_mr_profile', {
-        p_mr_id: mrId,
-        p_first_name: firstName,
-        p_last_name: lastName,
-        p_phone: phone,
-        p_address: address,
-        p_profile_image_url: profileImageUrl,
-        p_is_active: isActive,
+      const data = await apiClient.patch(`/api/admin/mrs/${mrId}/`, {
+        first_name: firstName,
+        last_name: lastName,
+        phone,
+        address,
+        profile_image_url: profileImageUrl,
+        is_active: isActive,
       })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to update MR profile' }
+      return { success: false, error: serviceError(error, 'Failed to update MR profile') }
     }
   }
 
-  /**
-   * Deactivate MR (soft delete - keeps data but makes inactive)
-   */
-  static async deactivateMR(mrId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async deactivateMR(mrId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('deactivate_mr', {
-        p_mr_id: mrId,
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.post(`/api/admin/mrs/${mrId}/deactivate/`)
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to deactivate MR' }
+      return { success: false, error: serviceError(error, 'Failed to deactivate MR') }
     }
   }
 
-  /**
-   * Delete MR (hard delete - permanently removes from database)
-   */
-  static async deleteMR(mrId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async deleteMR(mrId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('hard_delete_mr', {
-        p_mr_id: mrId,
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.delete(`/api/admin/mrs/${mrId}/`)
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to delete MR' }
+      return { success: false, error: serviceError(error, 'Failed to delete MR') }
     }
   }
 
-  /**
-   * Log activity
-   */
   static async logActivity(
     action: string,
     entityType: string,
     entityId?: string,
-    details?: any
+    details?: unknown,
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      const { error } = await supabase.rpc('log_activity', {
-        p_user_id: null, // Will be set by the function
-        p_action: action,
-        p_entity_type: entityType,
-        p_entity_id: entityId,
-        p_details: details,
-        p_ip_address: null,
-        p_user_agent: null,
+      await apiClient.post('/api/activity-logs/', {
+        action,
+        activity_type: action,
+        entity_type: entityType,
+        entity_id: entityId,
+        description: action,
+        details,
+        metadata: details,
       })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
       return { success: true }
     } catch (error) {
-      return { success: false, error: 'Failed to log activity' }
+      return { success: false, error: serviceError(error, 'Failed to log activity') }
     }
   }
 
-  /**
-   * Brochure Management Methods
-   */
-
-  // Create new brochure
   static async createBrochure(
     title: string,
     category: string,
@@ -561,266 +393,93 @@ export class AdminService {
     thumbnailUrl?: string,
     pages?: number,
     fileSize?: string,
-    tags?: string[]
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    tags?: string[],
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      // Default to "General" category if none specified
-      const categoryName = category && category.trim() ? category.trim() : 'General'
-      
-      // First, try to find or create the category
-      let categoryId = null
-      
-      // Try to find existing category by name
-      const { data: existingCategory } = await supabase
-        .from('brochure_categories')
-        .select('id')
-        .eq('name', categoryName)
-        .single()
-
-      if (existingCategory) {
-        categoryId = existingCategory.id
-      } else {
-        // Create new category if it doesn't exist
-        const { data: newCategory, error: categoryError } = await supabase
-          .from('brochure_categories')
-          .insert({
-            name: categoryName,
-            description: `Category for ${categoryName} brochures`,
-            color: categoryName === 'General' ? '#6b7280' : '#8b5cf6',
-            is_active: true
-          })
-          .select('id')
-          .single()
-
-        if (categoryError) {
-          console.error('Create category error:', categoryError)
-          return { success: false, error: 'Failed to create category' }
-        }
-        
-        categoryId = newCategory.id
-      }
-
-      // Use provided thumbnail or generate based on file type
+      const categoryName = category?.trim() || 'General'
       let finalThumbnailUrl = thumbnailUrl
-      
+
       if (!finalThumbnailUrl) {
         if (fileType?.includes('pdf') && fileUrl) {
-          // For PDFs, create a placeholder thumbnail
           finalThumbnailUrl = 'https://picsum.photos/300/200?random=' + Date.now()
         } else if (fileType?.includes('image') && fileUrl) {
-          // For images, use the image itself as thumbnail
           finalThumbnailUrl = fileUrl
         } else {
-          // Default placeholder
           finalThumbnailUrl = 'https://picsum.photos/300/200?random=' + Date.now()
         }
       }
 
-      // Now create the brochure with the category ID
-      const { data, error } = await supabase.rpc('create_brochure_with_category', {
-        p_title: title,
-        p_category_id: categoryId,
-        p_description: description,
-        p_file_url: fileUrl,
-        p_file_name: fileName,
-        p_file_type: fileType ? fileType.substring(0, 100) : null, // Truncate long MIME types
-        p_thumbnail_url: finalThumbnailUrl,
-        p_pages: pages,
-        p_file_size: fileSize,
-        p_tags: tags,
-        p_is_public: true
+      const data = await apiClient.post('/api/admin/brochures/', {
+        title,
+        category: categoryName,
+        description,
+        file_url: fileUrl ? resolveMediaUrl(fileUrl) : fileUrl,
+        file_name: fileName,
+        file_type: fileType ? fileType.substring(0, 100) : undefined,
+        thumbnail_url: finalThumbnailUrl,
+        pages,
+        file_size: fileSize,
+        tags,
+        is_public: true,
       })
-
-      if (error) {
-        console.error('Create brochure error:', error)
-        return { success: false, error: error.message }
-      }
-
       return { success: true, data }
     } catch (error) {
-      console.error('Create brochure error:', error)
-      return { success: false, error: 'Failed to create brochure' }
+      return { success: false, error: serviceError(error, 'Failed to create brochure') }
     }
   }
 
-  // Get all brochures with categories
-  static async getAllBrochuresWithCategories(): Promise<{ success: boolean; data?: any[]; error?: string }> {
+  static async getAllBrochuresWithCategories(): Promise<{ success: boolean; data?: unknown[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_all_brochures_with_categories')
+      const result = await apiClient.get<{ brochures: unknown[]; categories: unknown[] }>(
+        '/api/admin/brochures/',
+        { query: { with_categories: true } },
+      )
+      return { success: true, data: result.brochures || [] }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to load brochures') }
+    }
+  }
 
-      if (error) {
-        console.error('Get brochures error:', error)
-        return { success: false, error: error.message }
-      }
-
+  static async getBrochureCategories(): Promise<{ success: boolean; data?: unknown[]; error?: string }> {
+    try {
+      const data = await apiClient.get<unknown[]>('/api/admin/brochure-categories/')
       return { success: true, data: data || [] }
     } catch (error) {
-      console.error('Get brochures error:', error)
-      return { success: false, error: 'Failed to load brochures' }
+      return { success: false, error: serviceError(error, 'Failed to load categories') }
     }
   }
 
-  // Get brochure categories
-  static async getBrochureCategories(): Promise<{ success: boolean; data?: any[]; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('get_brochure_categories')
-
-      if (error) {
-        console.error('Get categories error:', error)
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data: data || [] }
-    } catch (error) {
-      console.error('Get categories error:', error)
-      return { success: false, error: 'Failed to load categories' }
-    }
-  }
-
-  // Update brochure
   static async updateBrochure(
     brochureId: string,
     title?: string,
     description?: string,
-    category?: string,
+    _category?: string,
     tags?: string[],
     isPublic?: boolean,
     thumbnailUrl?: string,
-    pages?: number
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    pages?: number,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const updateData: any = {}
-      
-      if (title !== undefined) updateData.title = title
-      if (description !== undefined) updateData.description = description
-      if (tags !== undefined) updateData.tags = tags
-      if (isPublic !== undefined) updateData.is_public = isPublic
-      if (thumbnailUrl !== undefined) updateData.thumbnail_url = thumbnailUrl
-      if (pages !== undefined) updateData.pages = pages
-      
-      const { data, error } = await supabase
-        .from('brochures')
-        .update(updateData)
-        .eq('id', brochureId)
-        .select()
-
-      if (error) {
-        console.error('Update brochure error:', error)
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.patch(`/api/admin/brochures/${brochureId}/`, {
+        title,
+        description,
+        tags,
+        is_public: isPublic,
+        thumbnail_url: thumbnailUrl,
+        pages,
+      })
       return { success: true, data }
     } catch (error) {
-      console.error('Update brochure error:', error)
-      return { success: false, error: 'Failed to update brochure' }
+      return { success: false, error: serviceError(error, 'Failed to update brochure') }
     }
   }
 
-  // Delete brochure
-  static async deleteBrochure(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async deleteBrochure(brochureId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      // First get the brochure data to find file URLs
-      const { data: brochureData, error: fetchError } = await supabase
-        .from('brochures')
-        .select('file_url, thumbnail_url')
-        .eq('id', brochureId)
-        .single()
-
-      if (fetchError) {
-        console.error('Error fetching brochure for deletion:', fetchError)
-        return { success: false, error: fetchError.message }
-      }
-
-      // Delete from database first
-      const { data, error } = await supabase
-        .from('brochures')
-        .delete()
-        .eq('id', brochureId)
-
-      if (error) {
-        console.error('Delete brochure error:', error)
-        return { success: false, error: error.message }
-      }
-
-      // Delete files from Supabase Storage
-      if (brochureData) {
-        try {
-          // Delete main file if it's stored in our storage
-          if (brochureData.file_url && brochureData.file_url.includes('supabase.co/storage')) {
-            console.log('Deleting file from storage:', brochureData.file_url)
-            
-            // Parse the URL to get the file path
-            // URL format: https://xxx.supabase.co/storage/v1/object/sign/brochures/uploads/filename.zip?token=...
-            // or: https://xxx.supabase.co/storage/v1/object/public/brochures/uploads/filename.zip
-            let filePath = ''
-            
-            if (brochureData.file_url.includes('/sign/brochures/')) {
-              // Signed URL format
-              const pathPart = brochureData.file_url.split('/sign/brochures/')[1]
-              filePath = pathPart.split('?')[0] // Remove token part
-            } else if (brochureData.file_url.includes('/public/brochures/')) {
-              // Public URL format
-              filePath = brochureData.file_url.split('/public/brochures/')[1]
-            } else {
-              // Fallback: try to get last two parts
-              const fileUrlParts = brochureData.file_url.split('/')
-              filePath = fileUrlParts.slice(-2).join('/')
-            }
-            
-            console.log('Extracted file path for deletion:', filePath)
-            
-            const { error: fileDeleteError } = await supabase.storage
-              .from('brochures')
-              .remove([filePath])
-            
-            if (fileDeleteError) {
-              console.error('Could not delete file from storage:', fileDeleteError.message)
-            } else {
-              console.log('File deleted from storage successfully')
-            }
-          }
-
-          // Delete thumbnail if it's stored in our storage
-          if (brochureData.thumbnail_url && brochureData.thumbnail_url.includes('supabase.co/storage')) {
-            console.log('Deleting thumbnail from storage:', brochureData.thumbnail_url)
-            
-            // Parse thumbnail URL similar to main file
-            let thumbnailPath = ''
-            
-            if (brochureData.thumbnail_url.includes('/sign/brochures/')) {
-              const pathPart = brochureData.thumbnail_url.split('/sign/brochures/')[1]
-              thumbnailPath = pathPart.split('?')[0]
-            } else if (brochureData.thumbnail_url.includes('/public/brochures/')) {
-              thumbnailPath = brochureData.thumbnail_url.split('/public/brochures/')[1]
-            } else {
-              const thumbnailUrlParts = brochureData.thumbnail_url.split('/')
-              thumbnailPath = thumbnailUrlParts.slice(-2).join('/')
-            }
-            
-            console.log('Extracted thumbnail path for deletion:', thumbnailPath)
-            
-            const { error: thumbnailDeleteError } = await supabase.storage
-              .from('brochures')
-              .remove([thumbnailPath])
-            
-            if (thumbnailDeleteError) {
-              console.error('Could not delete thumbnail from storage:', thumbnailDeleteError.message)
-            } else {
-              console.log('Thumbnail deleted from storage successfully')
-            }
-          }
-        } catch (storageError) {
-          console.log('Warning: Storage cleanup failed:', storageError)
-          // Don't fail the whole operation if storage cleanup fails
-        }
-      }
-
-      console.log('Brochure deleted successfully from database and storage')
+      const data = await apiClient.delete(`/api/admin/brochures/${brochureId}/`)
       return { success: true, data }
     } catch (error) {
-      console.error('Delete brochure error:', error)
-      return { success: false, error: 'Failed to delete brochure' }
+      return { success: false, error: serviceError(error, 'Failed to delete brochure') }
     }
   }
 }
-

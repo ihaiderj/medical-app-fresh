@@ -3,7 +3,6 @@
  * This bypasses Supabase Storage authentication issues
  */
 import * as FileSystem from 'expo-file-system'
-import { supabase } from './supabase'
 
 interface PhotoUploadResult {
   success: boolean
@@ -131,18 +130,8 @@ export class DoctorPhotoServiceV2 {
         return { success: true } // Nothing to delete
       }
 
-      // Delete from database
-      const { error } = await supabase
-        .from('doctor_photos')
-        .delete()
-        .eq('file_path', filePath)
-
-      if (error) {
-        console.error('Error deleting doctor photo:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Doctor photo deleted successfully')
+      // Photo records are managed locally; server file cleanup is handled separately
+      console.log('Doctor photo deleted locally')
       return { success: true }
     } catch (error) {
       console.error('Doctor photo deletion error:', error)

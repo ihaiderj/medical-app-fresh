@@ -4,8 +4,10 @@ import { AuthService } from './AuthService'
 import { NetworkService } from './networkService'
 import { FileStorageService } from './fileStorageService'
 import { BrochureManagementService } from './brochureManagementService'
+import { apiClient } from './apiClient'
+import { TokenStorage } from './tokenStorage'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as FileSystem from 'expo-file-system'
-import { supabase } from './supabase'
 
 export interface SyncResult {
   success: boolean
@@ -25,6 +27,7 @@ export interface SyncProgress {
 
 export class SyncService {
   private static progressCallback: ((progress: SyncProgress) => void) | null = null
+  private static readonly LAST_SYNC_KEY = 'fervid_last_sync_timestamp'
 
   /**
    * Set progress callback for sync operations
@@ -61,28 +64,18 @@ export class SyncService {
         }
       }
 
-      // Test Supabase connectivity
-      try {
-        const { data: { user } } = await supabase.auth.getUser()
-        if (!user) {
-          const userResult = await AuthService.getCurrentUser()
-          if (!userResult.success || !userResult.user) {
-            console.log('❌ SYNC UP: User not authenticated')
-            return {
-              success: false,
-              synced: 0,
-              failed: 0,
-              message: 'User not authenticated. Please login again.'
-            }
+      // Verify authentication via JWT
+      const hasToken = await TokenStorage.hasTokens()
+      if (!hasToken) {
+        const userResult = await AuthService.getCurrentUser()
+        if (!userResult.success || !userResult.user) {
+          console.log('❌ SYNC UP: User not authenticated')
+          return {
+            success: false,
+            synced: 0,
+            failed: 0,
+            message: 'User not authenticated. Please login again.',
           }
-        }
-      } catch (authError) {
-        console.error('❌ SYNC UP: Auth check failed:', authError)
-        return {
-          success: false,
-          synced: 0,
-          failed: 0,
-          message: 'Authentication failed. Please login again.'
         }
       }
 
@@ -114,8 +107,13 @@ export class SyncService {
 
       console.log(`🔄 SYNC UP: Found ${pendingOps.length} pending operations`)
 
-      // Process operations in dependency order: doctors → meetings → notes → follow-ups → brochures
       const sortedOps = this.sortOperationsByDependency(pendingOps)
+      const bulkResult = await this.syncUpViaPush(sortedOps, userId)
+      if (bulkResult) {
+        return bulkResult
+      }
+
+      // Fallback: process operations individually
       
       let synced = 0
       let failed = 0
@@ -429,7 +427,11 @@ export class SyncService {
           return false
         }
 
-        const result = await MRService.updateSlideNote(data.server_id, data.note_text || '')
+        const result = await MRService.updateSlideNote(
+          data.server_id,
+          data.note_text || '',
+          meeting.server_id,
+        )
         if (result.success) {
           await LocalDatabaseService.updateMeetingSlideNote(op.record_id, {
             sync_status: 'synced'
@@ -443,7 +445,7 @@ export class SyncService {
           return false
         }
 
-        const result = await MRService.deleteSlideNote(data.server_id)
+        const result = await MRService.deleteSlideNote(data.server_id, meeting.server_id)
         if (result.success) {
           await LocalDatabaseService.updateMeetingSlideNote(op.record_id, {
             sync_status: 'synced'
@@ -792,6 +794,11 @@ export class SyncService {
 
       await LocalDatabaseService.ensureReady()
 
+      const pullResult = await this.syncDownViaPull(userId)
+      if (pullResult) {
+        return pullResult
+      }
+
       let synced = 0
       let failed = 0
       const errors: string[] = []
@@ -982,17 +989,9 @@ export class SyncService {
               const syncDataResult = await MRService.getBrochureSyncData(userId, change.brochure_id)
               if (syncDataResult.success && syncDataResult.data) {
                 const syncData = syncDataResult.data
-                // Get the actual server_id from the brochure_sync table
-                const { data: syncRecord } = await supabase
-                  .from('brochure_sync')
-                  .select('id')
-                  .eq('mr_id', userId)
-                  .eq('brochure_id', change.brochure_id)
-                  .single()
-                
                 await LocalDatabaseService.upsertBrochureSync({
                   id: `brochure_sync_${userId}_${change.brochure_id}`,
-                  server_id: syncRecord?.id || undefined,
+                  server_id: (syncData as { id?: string }).id || change.id,
                   mr_id: userId,
                   brochure_id: change.brochure_id,
                   brochure_title: change.brochure_title,
@@ -1001,7 +1000,7 @@ export class SyncService {
                   created_at: change.last_modified,
                   version: 1,
                   sync_status: 'synced',
-                  is_deleted: false
+                  is_deleted: false,
                 })
                 synced++
               }
@@ -1040,8 +1039,257 @@ export class SyncService {
         synced: 0,
         failed: 0,
         message: error instanceof Error ? error.message : 'Sync down failed',
-        errors: [error instanceof Error ? error.message : 'Unknown error']
+        errors: [error instanceof Error ? error.message : 'Unknown error'],
       }
+    }
+  }
+
+  private static mapTableToEntity(tableName: string): string | null {
+    const mapping: Record<string, string> = {
+      doctors: 'doctors',
+      meetings: 'meetings',
+      meeting_notes: 'meeting_slide_notes',
+      meeting_slide_notes: 'meeting_slide_notes',
+      meeting_followups: 'meeting_followups',
+      saved_brochures: 'saved_brochures',
+      brochure_sync: 'brochure_sync',
+      activity_logs: 'activity_logs',
+    }
+    return mapping[tableName] || null
+  }
+
+  private static async syncUpViaPush(ops: any[], userId: string): Promise<SyncResult | null> {
+    const brochureSyncOps = ops.filter((op) => op.table_name === 'brochure_sync')
+    const bulkOps = ops.filter((op) => op.table_name !== 'brochure_sync')
+
+    if (bulkOps.length === 0 && brochureSyncOps.length === 0) {
+      return null
+    }
+
+    let synced = 0
+    let failed = 0
+    const errors: string[] = []
+
+    if (bulkOps.length > 0) {
+      try {
+        const operations = []
+        for (const op of bulkOps) {
+          const entity = this.mapTableToEntity(op.table_name)
+          if (!entity) continue
+
+          const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
+          operations.push({
+            local_id: String(op.id),
+            entity,
+            action: op.operation_type,
+            data,
+          })
+        }
+
+        if (operations.length > 0) {
+          const response = await apiClient.post<{ results: Array<{ id: string; success: boolean; server_id?: string; error?: string }> }>(
+            '/api/sync/push/',
+            { operations },
+          )
+
+          for (const result of response.results || []) {
+            const op = bulkOps.find((item) => String(item.id) === result.id)
+            if (!op) continue
+
+            if (result.success) {
+              await this.applyPushSuccess(op, result.server_id, userId)
+              await LocalDatabaseService.markOperationCompleted(op.id)
+              synced++
+            } else {
+              await LocalDatabaseService.markOperationFailed(op.id, result.error || 'Sync failed')
+              failed++
+              errors.push(result.error || `Failed ${op.table_name}`)
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('Bulk sync push failed, falling back to individual sync:', error)
+        return null
+      }
+    }
+
+    for (const op of brochureSyncOps) {
+      const success = await this.syncBrochureChanges(op, userId)
+      if (success) {
+        await LocalDatabaseService.markOperationCompleted(op.id)
+        synced++
+      } else {
+        await LocalDatabaseService.markOperationFailed(op.id, 'Failed to sync brochure changes')
+        failed++
+        errors.push(`Failed brochure_sync ${op.id}`)
+      }
+    }
+
+    if (bulkOps.length === 0 && brochureSyncOps.length > 0) {
+      return {
+        success: failed === 0,
+        synced,
+        failed,
+        message: `Synced: ${synced}, Failed: ${failed}`,
+        errors: errors.length > 0 ? errors : undefined,
+      }
+    }
+
+    if (bulkOps.length > 0) {
+      return {
+        success: failed === 0,
+        synced,
+        failed,
+        message: `Synced: ${synced}, Failed: ${failed}`,
+        errors: errors.length > 0 ? errors : undefined,
+      }
+    }
+
+    return null
+  }
+
+  private static async applyPushSuccess(op: any, serverId: string | undefined, userId: string) {
+    const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
+
+    switch (op.table_name) {
+      case 'doctors':
+        if (serverId) {
+          await LocalDatabaseService.updateDoctor(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        }
+        break
+      case 'meetings':
+        if (serverId) {
+          await LocalDatabaseService.updateMeeting(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        }
+        break
+      case 'meeting_notes':
+      case 'meeting_slide_notes':
+        if (serverId) {
+          await LocalDatabaseService.updateMeetingSlideNote(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        }
+        break
+      case 'meeting_followups':
+        if (serverId) {
+          await LocalDatabaseService.updateMeetingFollowUp(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        }
+        break
+      case 'saved_brochures':
+        if (serverId) {
+          await LocalDatabaseService.updateSavedBrochure(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        }
+        break
+      case 'activity_logs':
+        break
+      default:
+        break
+    }
+
+    if (op.table_name === 'doctors' && op.operation_type === 'update') {
+      await LocalDatabaseService.updateDoctor(op.record_id, { sync_status: 'synced' }, true)
+    }
+  }
+
+  private static async syncDownViaPull(userId: string): Promise<SyncResult | null> {
+    try {
+      const since =
+        (await AsyncStorage.getItem(this.LAST_SYNC_KEY)) || '1970-01-01T00:00:00.000Z'
+
+      const data = await apiClient.get<{
+        doctors: any[]
+        meetings: any[]
+        meeting_slide_notes: any[]
+        meeting_followups: any[]
+        saved_brochures: any[]
+        brochure_sync: any[]
+        activity_logs: any[]
+        sync_timestamp: string
+      }>('/api/sync/pull/', { query: { since } })
+
+      let synced = 0
+      let failed = 0
+      const errors: string[] = []
+
+      for (const doctor of data.doctors || []) {
+        if (doctor.is_deleted) continue
+        try {
+          await LocalDatabaseService.upsertDoctor({
+            id: `doctor_${doctor.id}`,
+            server_id: doctor.id,
+            mr_id: userId,
+            first_name: doctor.first_name,
+            last_name: doctor.last_name,
+            specialty: doctor.specialty,
+            hospital: doctor.hospital,
+            phone: doctor.phone,
+            email: doctor.email,
+            location: doctor.location,
+            notes: doctor.notes,
+            profile_image_url: doctor.profile_image_url,
+            created_at: doctor.created_at,
+            updated_at: doctor.updated_at || doctor.created_at,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Doctor ${doctor.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      for (const meeting of data.meetings || []) {
+        if (meeting.is_deleted) continue
+        try {
+          const doctor = await LocalDatabaseService.getDoctorByServerId(meeting.doctor_id)
+          if (!doctor) {
+            failed++
+            continue
+          }
+          await LocalDatabaseService.upsertMeeting({
+            id: `meeting_${meeting.id}`,
+            server_id: meeting.id,
+            mr_id: userId,
+            doctor_id: doctor.id,
+            doctor_server_id: meeting.doctor_id,
+            brochure_id: meeting.brochure_id || null,
+            title: meeting.title,
+            scheduled_date: meeting.scheduled_date,
+            duration_minutes: meeting.duration_minutes || 30,
+            status: meeting.status,
+            location: meeting.location || meeting.hospital || null,
+            purpose: meeting.purpose || null,
+            notes: meeting.notes || null,
+            follow_up_required: meeting.follow_up_required || false,
+            follow_up_date: meeting.follow_up_date || null,
+            follow_up_time: meeting.follow_up_time || null,
+            follow_up_notes: meeting.follow_up_notes || null,
+            created_at: meeting.created_at,
+            updated_at: meeting.updated_at || meeting.created_at,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Meeting ${meeting.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      if (data.sync_timestamp) {
+        await AsyncStorage.setItem(this.LAST_SYNC_KEY, data.sync_timestamp)
+      }
+
+      this.reportProgress('Complete', `Downloaded: ${synced}, Failed: ${failed}`, 100)
+      return {
+        success: failed === 0,
+        synced,
+        failed,
+        message: `Downloaded: ${synced}, Failed: ${failed}`,
+        errors: errors.length > 0 ? errors : undefined,
+      }
+    } catch (error) {
+      console.warn('Bulk sync pull failed, falling back to individual download:', error)
+      return null
     }
   }
 }

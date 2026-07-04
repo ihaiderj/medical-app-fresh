@@ -2,7 +2,7 @@
  * Presentation Group Service
  * Manages doctor-based presentation groups
  */
-import { supabase } from './supabase'
+import { MRService } from './MRService'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 
 export interface PresentationGroup {
@@ -33,14 +33,13 @@ export class PresentationGroupService {
    */
   static async getAvailableDoctors(mrId: string): Promise<{ success: boolean; data?: GroupDoctor[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_assigned_doctors', { p_mr_id: mrId })
+      const result = await MRService.getAssignedDoctors(mrId)
 
-      if (error) {
-        return { success: false, error: error.message }
+      if (!result.success) {
+        return { success: false, error: result.error }
       }
 
-      // Transform data to GroupDoctor format
-      const doctors: GroupDoctor[] = (data || []).map((doctor: any) => ({
+      const doctors: GroupDoctor[] = (result.data || []).map((doctor) => ({
         doctor_id: doctor.doctor_id,
         first_name: doctor.first_name,
         last_name: doctor.last_name,

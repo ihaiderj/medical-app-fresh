@@ -1,6 +1,6 @@
 import * as FileSystem from 'expo-file-system'
 import { Platform } from 'react-native'
-import { supabase } from './supabase'
+import { TokenStorage } from './tokenStorage'
 // import { brochureSyncService, BrochureSyncData } from './brochureSyncService' // DELETED
 // Define BrochureSyncData locally
 interface BrochureSyncData {
@@ -171,18 +171,16 @@ export class BrochureManagementService {
           while (retries > 0) {
             try {
               // Use FileSystem.downloadAsync with authentication headers
-              const { data: { session } } = await supabase.auth.getSession()
-              if (!session) {
+              const accessToken = await TokenStorage.getAccessToken()
+              if (!accessToken) {
                 throw new Error('User not authenticated')
               }
-              
-              console.log('Downloading with authentication headers...')
-              
+
               downloadResult = await FileSystem.downloadAsync(zipUri, downloadPath, {
                 headers: {
-                  'Authorization': `Bearer ${session.access_token}`,
+                  Authorization: `Bearer ${accessToken}`,
                   'Cache-Control': 'no-cache',
-                }
+                },
               })
               
               console.log('Download result with auth:', downloadResult)

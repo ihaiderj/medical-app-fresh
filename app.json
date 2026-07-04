@@ -53,9 +53,11 @@
           }
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-font"
     ],
     "extra": {
+      "apiBaseUrl": "http://127.0.0.1:8000",
       "eas": {
         "projectId": "264174ba-9998-4c8d-ae1f-4cbcf3c52715"
       }

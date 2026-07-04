@@ -1,5 +1,7 @@
-import { supabase } from './supabase'
+import { apiClient, ApiError } from './apiClient'
+import { resolveMediaUrl } from '../config/apiConfig'
 import { AuthService } from './AuthService'
+import * as FileSystem from 'expo-file-system'
 
 export interface MRDashboardStats {
   active_presentations: number
@@ -19,8 +21,8 @@ export interface MRRecentActivity {
 }
 
 export interface MRAssignedBrochure {
-  brochure_id?: string  // Legacy field name
-  id: string           // Actual field name from database
+  brochure_id?: string
+  id: string
   title: string
   category: string
   description?: string
@@ -66,11 +68,12 @@ export interface MRAssignedDoctor {
   next_meeting_date?: string
   notes?: string
   created_at: string
+  profile_image_url?: string
 }
 
 export interface MRMeeting {
   meeting_id: string
-  id?: string  // Alias for meeting_id
+  id?: string
   title: string
   doctor_id: string
   doctor_name: string
@@ -79,12 +82,13 @@ export interface MRMeeting {
   doctor_specialty: string
   hospital: string
   scheduled_date: string
-  meeting_date?: string  // Alias for scheduled_date
+  meeting_date?: string
   duration_minutes: number
   status: string
   purpose?: string
   notes?: string
   brochure_title?: string
+  brochure_id?: string
   notes_count: number
   last_note_date?: string
   follow_up_required?: boolean
@@ -107,7 +111,7 @@ export interface SlideNote {
 }
 
 export interface MeetingDetails {
-  meeting: any
+  meeting: MRMeeting
   slide_notes: SlideNote[]
 }
 
@@ -125,237 +129,86 @@ export interface MRPresentation {
   created_at: string
 }
 
+function serviceError(error: unknown, fallback: string): string {
+  return error instanceof ApiError ? error.message : fallback
+}
+
 export class MRService {
-  /**
-   * MR Dashboard Methods
-   */
-  
-  static async getDashboardStats(mrId: string): Promise<{ success: boolean; data?: MRDashboardStats; error?: string }> {
+  static async getDashboardStats(_mrId: string): Promise<{ success: boolean; data?: MRDashboardStats; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_dashboard_stats', { p_mr_id: mrId })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRDashboardStats>('/api/mr/dashboard/stats/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR dashboard stats' }
+      return { success: false, error: serviceError(error, 'Failed to fetch MR dashboard stats') }
     }
   }
 
-  static async getRecentActivities(mrId: string, limit: number = 5): Promise<{ success: boolean; data?: MRRecentActivity[]; error?: string }> {
+  static async getRecentActivities(_mrId: string, limit: number = 5): Promise<{ success: boolean; data?: MRRecentActivity[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_recent_activities', { 
-        p_mr_id: mrId, 
-        limit_count: limit 
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRRecentActivity[]>('/api/mr/dashboard/activities/', { query: { limit } })
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR recent activities' }
+      return { success: false, error: serviceError(error, 'Failed to fetch MR recent activities') }
     }
   }
 
-  static async getAssignedBrochures(mrId: string): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
+  static async getAssignedBrochures(_mrId: string): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
     try {
-      console.log('🔍 SERVER DEBUG: Fetching assigned brochures from server for MR:', mrId);
-      const { data, error } = await supabase.rpc('get_mr_assigned_brochures', { p_mr_id: mrId })
-
-      if (error) {
-        console.warn('❌ SERVER DEBUG: MRService.getAssignedBrochures rpc error:', error.message)
-        throw error
-      }
-
-      console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} assigned brochures on server:`, 
-        data?.map((b: any) => ({ id: b.id, title: b.title, category: b.category })));
+      const data = await apiClient.get<MRAssignedBrochure[]>('/api/mr/brochures/')
       return { success: true, data }
-    } catch (rpcError) {
-      console.warn('⚠️ SERVER DEBUG: MRService.getAssignedBrochures falling back to direct query:', rpcError)
-
-      try {
-        console.log('🔍 SERVER DEBUG: Using fallback query for brochures...');
-        const { data: brochures, error: fallbackError } = await supabase
-          .from('brochures')
-          .select('*')
-          .eq('status', 'active')
-          .or(`is_public.eq.true,uploaded_by.eq.${mrId}`)
-          .order('created_at', { ascending: false })
-
-        if (fallbackError) {
-          console.error('❌ SERVER DEBUG: MRService.getAssignedBrochures fallback error:', fallbackError)
-          return { success: false, error: fallbackError.message }
-        }
-
-        console.log(`✅ SERVER DEBUG: Fallback query found ${brochures?.length || 0} brochures:`, 
-          brochures?.map(b => ({ id: b.id, title: b.title, category: b.category })));
-
-        const uploaderIds = Array.from(new Set((brochures || []).map(b => b.uploaded_by).filter(Boolean)))
-        let uploaderMap: Record<string, string> = {}
-
-        if (uploaderIds.length > 0) {
-          const { data: uploaders, error: uploaderError } = await supabase
-            .from('users')
-            .select('id, first_name, last_name, role')
-            .in('id', uploaderIds)
-
-          if (!uploaderError && uploaders) {
-            uploaderMap = uploaders.reduce<Record<string, string>>((acc, user) => {
-              const fullName = `${user.first_name || ''} ${user.last_name || ''}`.trim()
-              acc[user.id] = fullName || (user.role === 'admin' ? 'Administrator' : 'Unknown')
-              return acc
-            }, {})
-          }
-        }
-
-        const mapped = (brochures || []).map((item: any) => ({
-          id: item.id,
-          brochure_id: item.id,
-          title: item.title,
-          category: item.category,
-          description: item.description,
-          thumbnail_url: item.thumbnail_url,
-          view_count: item.view_count ?? 0,
-          download_count: item.download_count ?? 0,
-          uploaded_by_name: uploaderMap[item.uploaded_by] || 'Unknown',
-          created_at: item.created_at,
-          file_url: item.file_url,
-          file_name: item.file_name,
-          file_type: item.file_type,
-        })) as MRAssignedBrochure[]
-
-        return { success: true, data: mapped }
-      } catch (fallbackCatchError) {
-        console.error('MRService.getAssignedBrochures final failure:', fallbackCatchError)
-        return { success: false, error: 'Failed to fetch MR assigned brochures' }
-      }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to fetch assigned brochures') }
     }
   }
 
   static async getBrochureById(brochureId: string): Promise<MRAssignedBrochure | null> {
     try {
-      const { data, error } = await supabase
-        .from('brochures')
-        .select('id, title, category, description, thumbnail_url, view_count, download_count, file_url, file_name, file_type, created_at, uploaded_by:profiles!brochures_uploaded_by_fkey(full_name)')
-        .eq('id', brochureId)
-        .single()
-
-      if (error) {
-        console.error('Error fetching brochure by ID:', error)
-        return null
-      }
-
-      if (!data) {
-        return null
-      }
-
-      // Transform the data to match MRAssignedBrochure interface
-      return {
-        id: data.id,
-        brochure_id: data.id,
-        title: data.title,
-        category: data.category,
-        description: data.description,
-        thumbnail_url: data.thumbnail_url,
-        view_count: data.view_count || 0,
-        download_count: data.download_count || 0,
-        file_url: data.file_url,
-        file_name: data.file_name,
-        file_type: data.file_type,
-        created_at: data.created_at,
-        uploaded_by_name: (data.uploaded_by as any)?.full_name || 'Unknown'
-      }
-    } catch (error) {
-      console.error('Exception in getBrochureById:', error)
+      const result = await this.getAssignedBrochures('')
+      const brochures = result.data || []
+      return brochures.find((b) => b.id === brochureId || b.brochure_id === brochureId) || null
+    } catch {
       return null
     }
   }
 
-  static async getUpcomingMeetings(mrId: string, limit: number = 5): Promise<{ success: boolean; data?: MRUpcomingMeeting[]; error?: string }> {
+  static async getUpcomingMeetings(_mrId: string, limit: number = 5): Promise<{ success: boolean; data?: MRUpcomingMeeting[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_upcoming_meetings', { 
-        p_mr_id: mrId, 
-        limit_count: limit 
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRUpcomingMeeting[]>('/api/mr/meetings/upcoming/', { query: { limit } })
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR upcoming meetings' }
+      return { success: false, error: serviceError(error, 'Failed to fetch upcoming meetings') }
     }
   }
 
-  static async getPerformanceSummary(mrId: string): Promise<{ success: boolean; data?: MRPerformanceSummary; error?: string }> {
+  static async getPerformanceSummary(_mrId: string): Promise<{ success: boolean; data?: MRPerformanceSummary; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_performance_summary', { p_mr_id: mrId })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRPerformanceSummary>('/api/mr/dashboard/performance/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR performance summary' }
+      return { success: false, error: serviceError(error, 'Failed to fetch performance summary') }
     }
   }
 
-  static async getAssignedDoctors(mrId: string): Promise<{ success: boolean; data?: MRAssignedDoctor[]; error?: string }> {
+  static async getAssignedDoctors(_mrId: string): Promise<{ success: boolean; data?: MRAssignedDoctor[]; error?: string }> {
     try {
-      console.log('🔍 SERVER DEBUG: Fetching assigned doctors from server for MR:', mrId);
-      const { data, error } = await supabase.rpc('get_mr_assigned_doctors', { p_mr_id: mrId })
-
-      if (error) {
-        console.error('❌ SERVER DEBUG: Get assigned doctors error:', error);
-        return { success: false, error: error.message }
-      }
-
-      // Debug: Log the actual response structure to understand the mapping
-      console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} assigned doctors on server`);
-      if (data && data.length > 0) {
-        console.log('🔍 SERVER DEBUG: First doctor object keys:', Object.keys(data[0]));
-        console.log('🔍 SERVER DEBUG: First doctor object:', JSON.stringify(data[0], null, 2));
-        console.log('🔍 SERVER DEBUG: First doctor doctor_id:', (data[0] as any).doctor_id);
-        console.log('🔍 SERVER DEBUG: First doctor id:', (data[0] as any).id);
-      }
-      
-      // Map the response to ensure doctor_id is available
-      const mappedData = data?.map((d: any) => ({
-        ...d,
-        doctor_id: d.doctor_id || d.id, // Ensure doctor_id is set
-        id: d.id || d.doctor_id // Also set id for compatibility
-      }));
-      
-      return { success: true, data: mappedData }
+      const data = await apiClient.get<MRAssignedDoctor[]>('/api/mr/doctors/')
+      return { success: true, data }
     } catch (error) {
-      console.error('❌ SERVER DEBUG: Failed to fetch MR assigned doctors:', error);
-      return { success: false, error: 'Failed to fetch MR assigned doctors' }
+      return { success: false, error: serviceError(error, 'Failed to fetch assigned doctors') }
     }
   }
 
-
-  static async getPresentations(mrId: string): Promise<{ success: boolean; data?: MRPresentation[]; error?: string }> {
+  static async getPresentations(_mrId: string): Promise<{ success: boolean; data?: MRPresentation[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_mr_presentations', { p_mr_id: mrId })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MRPresentation[]>('/api/mr/presentations/')
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to fetch MR presentations' }
+      return { success: false, error: serviceError(error, 'Failed to fetch presentations') }
     }
   }
 
   static async createDoctorAssignment(
-    mrId: string,
+    _mrId: string,
     firstName: string,
     lastName: string,
     specialty: string,
@@ -363,29 +216,18 @@ export class MRService {
     phone?: string,
     email?: string,
     location?: string,
-    notes?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('create_mr_doctor_assignment', {
-        p_mr_id: mrId,
-        p_first_name: firstName,
-        p_last_name: lastName,
-        p_specialty: specialty,
-        p_hospital: hospital,
-        p_phone: phone,
-        p_email: email,
-        p_location: location,
-        p_notes: notes
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to create doctor assignment' }
-    }
+    notes?: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    return this.addDoctor('', {
+      first_name: firstName,
+      last_name: lastName,
+      specialty,
+      hospital,
+      phone,
+      email,
+      location,
+      notes,
+    })
   }
 
   static async updateDoctorAssignment(
@@ -397,135 +239,63 @@ export class MRService {
     phone?: string,
     email?: string,
     location?: string,
-    notes?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('update_mr_doctor_assignment', {
-        p_doctor_id: doctorId,
-        p_first_name: firstName,
-        p_last_name: lastName,
-        p_specialty: specialty,
-        p_hospital: hospital,
-        p_phone: phone,
-        p_email: email,
-        p_location: location,
-        p_notes: notes
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to update doctor assignment' }
-    }
+    notes?: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    return this.updateDoctor(doctorId, {
+      first_name: firstName,
+      last_name: lastName,
+      specialty,
+      hospital,
+      phone,
+      email,
+      location,
+      notes,
+    })
   }
 
-  static async deleteDoctorAssignment(
-    doctorId: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('delete_mr_doctor_assignment', {
-        p_doctor_id: doctorId
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to delete doctor assignment' }
-    }
+  static async deleteDoctorAssignment(doctorId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    return this.deleteDoctor(doctorId)
   }
-
-  // Old createMeeting function removed - using the new one with brochure support
 
   static async updateMeeting(
     meetingId: string,
-    scheduledDate: string,
+    scheduledDateOrUpdates: string | Record<string, unknown>,
     durationMinutes: number = 30,
-    presentationId?: string,
+    _presentationId?: string,
     notes?: string,
     status: string = 'scheduled',
     title?: string,
-    doctorId?: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    doctorId?: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      console.log('=== MRService.updateMeeting DEBUG ===')
-      console.log('Parameters:')
-      console.log('- meetingId:', meetingId)
-      console.log('- scheduledDate:', scheduledDate)
-      console.log('- durationMinutes:', durationMinutes)
-      console.log('- presentationId:', presentationId)
-      console.log('- notes:', notes)
-      console.log('- status:', status)
-      console.log('- title:', title)
-      console.log('- doctorId:', doctorId)
-      
-      const { data, error } = await supabase.rpc('update_mr_meeting', {
-        p_meeting_id: meetingId,
-        p_scheduled_date: scheduledDate,
-        p_duration_minutes: durationMinutes,
-        p_presentation_id: presentationId,
-        p_notes: notes,
-        p_status: status,
-        p_title: title,
-        p_doctor_id: doctorId
-      })
+      const body =
+        typeof scheduledDateOrUpdates === 'object'
+          ? scheduledDateOrUpdates
+          : {
+              scheduled_date: scheduledDateOrUpdates,
+              duration_minutes: durationMinutes,
+              notes,
+              status,
+              title,
+              doctor_id: doctorId,
+            }
 
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.log('Supabase error occurred:', error.message)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Update successful, returning success')
+      const data = await apiClient.patch(`/api/mr/meetings/${meetingId}/`, body)
       return { success: true, data }
     } catch (error) {
-      console.error('Exception in updateMeeting:', error)
-      return { success: false, error: 'Failed to update meeting' }
+      return { success: false, error: serviceError(error, 'Failed to update meeting') }
     }
   }
 
-  static async deleteMeeting(
-    meetingId: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async deleteMeeting(meetingId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      console.log('=== MRService.deleteMeeting DEBUG ===')
-      console.log('meetingId:', meetingId)
-      console.log('Calling supabase.rpc with delete_mr_meeting...')
-      
-      const { data, error } = await supabase.rpc('delete_mr_meeting', {
-        p_meeting_id: meetingId
-      })
-
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.log('Supabase error occurred:', error.message)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Delete successful, returning success')
+      const data = await apiClient.delete(`/api/mr/meetings/${meetingId}/`)
       return { success: true, data }
     } catch (error) {
-      console.error('Exception in deleteMeeting:', error)
-      return { success: false, error: 'Failed to delete meeting' }
+      return { success: false, error: serviceError(error, 'Failed to delete meeting') }
     }
   }
 
-  /**
-   * MR-specific brochure management methods
-   */
-
-  // Create brochure (for MRs with permission)
   static async createBrochure(
     title: string,
     category: string,
@@ -536,160 +306,53 @@ export class MRService {
     thumbnailUrl?: string,
     pages?: number,
     fileSize?: string,
-    tags?: string[]
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    tags?: string[],
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      // Default to "General" category if none specified
-      const categoryName = category && category.trim() ? category.trim() : 'General'
-      
-      // First, try to find or create the category
-      let categoryId = null
-      
-      // Try to find existing category by name
-      const { data: existingCategory } = await supabase
-        .from('brochure_categories')
-        .select('id')
-        .eq('name', categoryName)
-        .single()
-
-      if (existingCategory) {
-        categoryId = existingCategory.id
-      } else {
-        // Create new category if it doesn't exist
-        const { data: newCategory, error: categoryError } = await supabase
-          .from('brochure_categories')
-          .insert({
-            name: categoryName,
-            description: `Category for ${categoryName} brochures`,
-            color: categoryName === 'General' ? '#6b7280' : '#8b5cf6',
-            is_active: true
-          })
-          .select('id')
-          .single()
-
-        if (categoryError) {
-          console.error('Create category error:', categoryError)
-          return { success: false, error: 'Failed to create category' }
-        }
-        
-        categoryId = newCategory.id
-      }
-
-      // Now create the brochure with the category ID
-          const { data, error } = await supabase.rpc('create_brochure_with_category', {
-            p_title: title,
-            p_category_id: categoryId,
-            p_description: description,
-            p_file_url: fileUrl,
-            p_file_name: fileName,
-            p_file_type: fileType ? fileType.substring(0, 100) : null, // Truncate long MIME types
-            p_thumbnail_url: thumbnailUrl,
-            p_pages: pages,
-            p_file_size: fileSize,
-            p_tags: tags,
-            p_is_public: true
-          })
-
-      if (error) {
-        console.error('Create brochure error:', error)
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.post('/api/mr/brochures/upload/', {
+        title,
+        category: category?.trim() || 'General',
+        description,
+        file_url: fileUrl ? resolveMediaUrl(fileUrl) : fileUrl,
+        file_name: fileName,
+        file_type: fileType ? fileType.substring(0, 100) : undefined,
+        thumbnail_url: thumbnailUrl,
+        pages,
+        file_size: fileSize,
+        tags,
+        is_public: true,
+      })
       return { success: true, data }
     } catch (error) {
-      console.error('Create brochure error:', error)
-      return { success: false, error: 'Failed to create brochure' }
+      return { success: false, error: serviceError(error, 'Failed to create brochure') }
     }
   }
 
-  // Get all public brochures with category info
-  static async getPublicBrochures(): Promise<{ success: boolean; data?: any[]; error?: string }> {
-    try {
-      const { data, error } = await supabase
-        .from('brochures')
-        .select(`
-          *,
-          brochure_categories (
-            name,
-            color
-          )
-        `)
-        .eq('is_public', true)
-        .order('created_at', { ascending: false })
-
-      if (error) {
-        console.error('Get assigned brochures error:', error)
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data: data || [] }
-    } catch (error) {
-      console.error('Get assigned brochures error:', error)
-      return { success: false, error: 'Failed to load brochures' }
-    }
+  static async getPublicBrochures(): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
+    return this.getAssignedBrochures('')
   }
 
-  // Check if MR has brochure upload permission
   static async hasBrochureUploadPermission(): Promise<{ success: boolean; hasPermission?: boolean; error?: string }> {
     try {
-      const { data: { user } } = await supabase.auth.getUser()
-      
-      if (!user) {
+      const userResult = await AuthService.getCurrentUser()
+      if (!userResult.success || !userResult.user) {
         return { success: false, error: 'User not authenticated' }
       }
-
-      const { data, error } = await supabase
-        .from('users')
-        .select('can_upload_brochures')
-        .eq('id', user.id)
-        .single()
-
-      if (error) {
-        console.error('Check permission error:', error)
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, hasPermission: data?.can_upload_brochures || false }
+      return { success: true, hasPermission: !!userResult.user.can_upload_brochures }
     } catch (error) {
-      console.error('Check permission error:', error)
-      return { success: false, error: 'Failed to check permission' }
+      return { success: false, error: serviceError(error, 'Failed to check permission') }
     }
   }
 
-  // Get MR profile with permissions
-  static async getMRProfile(): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async getMRProfile(): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      console.log('🔍 SERVER DEBUG: Fetching MR profile from server...');
-      const { data: { user } } = await supabase.auth.getUser()
-      
-      if (!user) {
-        console.error('❌ SERVER DEBUG: User not authenticated for profile fetch');
-        return { success: false, error: 'User not authenticated' }
-      }
-
-      console.log('🔍 SERVER DEBUG: Authenticated user ID:', user.id);
-      const { data, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', user.id)
-        .single()
-
-      if (error) {
-        console.error('❌ SERVER DEBUG: Get MR profile error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('✅ SERVER DEBUG: MR profile fetched successfully:', data);
+      const data = await apiClient.get('/api/auth/me/')
       return { success: true, data }
     } catch (error) {
-      console.error('Get MR profile error:', error)
-      return { success: false, error: 'Failed to load profile' }
+      return { success: false, error: serviceError(error, 'Failed to load profile') }
     }
   }
 
-  /**
-   * Create new meeting
-   */
   static async createMeeting(meetingData: {
     mr_id: string
     doctor_id: string
@@ -699,161 +362,87 @@ export class MRService {
     purpose: string
     scheduled_date?: string
     duration_minutes?: number
+    location?: string
+    notes?: string
   }): Promise<{ success: boolean; data?: { meeting_id: string }; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('create_meeting_with_brochure', {
-        p_mr_id: meetingData.mr_id,
-        p_doctor_id: meetingData.doctor_id,
-        p_brochure_id: meetingData.brochure_id,
-        p_brochure_title: meetingData.brochure_title,
-        p_title: meetingData.title,
-        p_purpose: meetingData.purpose,
-        p_scheduled_date: meetingData.scheduled_date || new Date().toISOString(),
-        p_duration_minutes: meetingData.duration_minutes || 30
+      const data = await apiClient.post<{ meeting_id: string }>('/api/mr/meetings/', {
+        doctor_id: meetingData.doctor_id,
+        brochure_id: meetingData.brochure_id || undefined,
+        brochure_title: meetingData.brochure_title,
+        title: meetingData.title,
+        purpose: meetingData.purpose,
+        scheduled_date: meetingData.scheduled_date || new Date().toISOString(),
+        duration_minutes: meetingData.duration_minutes || 30,
+        location: meetingData.location,
+        notes: meetingData.notes,
       })
-
-      if (error) {
-        console.error('Create meeting error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (!data.success) {
-        return { success: false, error: data.error || 'Failed to create meeting' }
-      }
-
-      return { 
-        success: true, 
-        data: { meeting_id: data.meeting_id }
-      }
+      return { success: true, data: { meeting_id: data.meeting_id } }
     } catch (error) {
-      console.error('Create meeting error:', error)
-      return { success: false, error: 'Failed to create meeting' }
+      return { success: false, error: serviceError(error, 'Failed to create meeting') }
     }
   }
 
-  /**
-   * Add slide note to meeting
-   */
   static async addSlideNote(noteData: {
     meeting_id: string
     slide_id: string
-    slide_title: string
-    slide_order: number
-    brochure_id: string
+    slide_title?: string
+    slide_order?: number
+    brochure_id?: string
     note_text: string
     slide_image_uri?: string
-    timestamp: string
-  }): Promise<{ success: boolean; error?: string }> {
+    timestamp?: string
+  }): Promise<{ success: boolean; data?: { note_id: string }; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('add_slide_note_to_meeting', {
-        p_meeting_id: noteData.meeting_id,
-        p_slide_id: noteData.slide_id,
-        p_slide_title: noteData.slide_title,
-        p_slide_order: noteData.slide_order,
-        p_brochure_id: noteData.brochure_id,
-        p_note_text: noteData.note_text,
-        p_slide_image_uri: noteData.slide_image_uri || null
+      const data = await apiClient.post<{ note_id: string }>(`/api/mr/meetings/${noteData.meeting_id}/notes/`, {
+        slide_id: noteData.slide_id,
+        slide_title: noteData.slide_title,
+        slide_order: noteData.slide_order ?? 0,
+        brochure_id: noteData.brochure_id,
+        note_text: noteData.note_text,
       })
-
-      if (error) {
-        console.error('Add slide note error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (!data.success) {
-        return { success: false, error: data.error || 'Failed to add slide note' }
-      }
-
-      return { success: true }
+      return { success: true, data }
     } catch (error) {
-      console.error('Add slide note error:', error)
-      return { success: false, error: 'Failed to add slide note' }
+      return { success: false, error: serviceError(error, 'Failed to add slide note') }
     }
   }
 
-  /**
-   * Get meetings for MR user
-   */
-  static async getMeetings(mrId: string, filter?: string): Promise<{ success: boolean; data?: MRMeeting[]; error?: string }> {
+  static async getMeetings(_mrId: string, _filter?: string): Promise<{ success: boolean; data?: MRMeeting[]; error?: string }> {
     try {
-      console.log('🔍 SERVER DEBUG: Fetching meetings from server for MR:', mrId);
-      const { data, error } = await supabase.rpc('get_mr_meetings_with_notes', {
-        p_mr_id: mrId
-      })
-
-      if (error) {
-        console.error('❌ SERVER DEBUG: Get meetings error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log(`✅ SERVER DEBUG: Found ${data?.length || 0} meetings on server:`, 
-        data?.map((m: any) => ({ id: m.id, title: m.title, scheduled_date: m.scheduled_date, status: m.status })));
+      const data = await apiClient.get<MRMeeting[]>('/api/mr/meetings/')
       return { success: true, data: data || [] }
     } catch (error) {
-      console.error('❌ SERVER DEBUG: Failed to get meetings:', error)
-      return { success: false, error: 'Failed to get meetings' }
+      return { success: false, error: serviceError(error, 'Failed to get meetings') }
     }
   }
 
-  static async getMeetingDetails(meetingId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async getMeetingDetails(meetingId: string): Promise<{ success: boolean; data?: MeetingDetails; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_meeting_details_with_notes', {
-        p_meeting_id: meetingId
-      })
-
-      if (error) {
-        console.error('Get meeting details error:', error)
-        return { success: false, error: error.message }
-      }
-
+      const data = await apiClient.get<MeetingDetails>(`/api/mr/meetings/${meetingId}/`)
       return { success: true, data }
-    } catch (error: any) {
-      console.error('Get meeting details error:', error)
-      return { success: false, error: error.message || 'Failed to fetch meeting details' }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to fetch meeting details') }
     }
   }
 
-  /**
-   * Get meeting details with all slide notes (legacy function)
-   */
   static async updateMeetingFollowUp(followUpData: {
     meeting_id: string
     follow_up_date: string
     follow_up_time: string
     follow_up_notes: string
-  }): Promise<{ success: boolean; data?: any; error?: string }> {
+  }): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      console.log('=== MRService.updateMeetingFollowUp DEBUG ===')
-      console.log('followUpData:', followUpData)
-      console.log('Calling supabase.rpc with update_meeting_followup...')
-      
-      const { data, error } = await supabase.rpc('update_meeting_followup', {
-        p_meeting_id: followUpData.meeting_id,
-        p_follow_up_date: followUpData.follow_up_date,
-        p_follow_up_time: followUpData.follow_up_time,
-        p_follow_up_notes: followUpData.follow_up_notes
+      const data = await apiClient.patch(`/api/mr/meetings/${followUpData.meeting_id}/followup/`, {
+        follow_up_date: followUpData.follow_up_date,
+        follow_up_time: followUpData.follow_up_time,
+        follow_up_notes: followUpData.follow_up_notes,
       })
-
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.error('Update follow-up error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Follow-up update successful')
       return { success: true, data }
-    } catch (error: any) {
-      console.error('Exception in updateMeetingFollowUp:', error)
-      return { success: false, error: error.message || 'Failed to update follow-up' }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to update follow-up') }
     }
   }
 
-  /**
-   * Create a new meeting follow-up
-   */
   static async createMeetingFollowUp(followUpData: {
     meeting_id: string
     follow_up_date: string
@@ -862,587 +451,239 @@ export class MRService {
     status?: 'scheduled' | 'completed' | 'cancelled'
   }): Promise<{ success: boolean; data?: { follow_up_id: string }; error?: string }> {
     try {
-      console.log('=== MRService.createMeetingFollowUp DEBUG ===')
-      console.log('followUpData:', followUpData)
-      
-      const { data, error } = await supabase.rpc('create_meeting_followup', {
-        p_meeting_id: followUpData.meeting_id,
-        p_follow_up_date: followUpData.follow_up_date,
-        p_follow_up_time: followUpData.follow_up_time,
-        p_follow_up_notes: followUpData.follow_up_notes || null,
-        p_status: followUpData.status || 'scheduled'
-      })
-
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.error('Create follow-up error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Follow-up created successfully')
-      return { success: true, data: { follow_up_id: data?.follow_up_id || data?.id } }
-    } catch (error: any) {
-      console.error('Exception in createMeetingFollowUp:', error)
-      return { success: false, error: error.message || 'Failed to create follow-up' }
+      const data = await apiClient.post<{ follow_up_id: string }>(
+        `/api/mr/meetings/${followUpData.meeting_id}/followups/`,
+        {
+          follow_up_date: followUpData.follow_up_date,
+          follow_up_time: followUpData.follow_up_time,
+          follow_up_notes: followUpData.follow_up_notes,
+          status: followUpData.status || 'scheduled',
+        },
+      )
+      return { success: true, data: { follow_up_id: data.follow_up_id } }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to create follow-up') }
     }
   }
 
-  /**
-   * Update an existing meeting follow-up
-   */
-  static async updateMeetingFollowUpById(followUpId: string, followUpData: {
-    follow_up_date?: string
-    follow_up_time?: string
-    follow_up_notes?: string
-    status?: 'scheduled' | 'completed' | 'cancelled'
-  }): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async updateMeetingFollowUpById(
+    followUpId: string,
+    followUpData: {
+      follow_up_date?: string
+      follow_up_time?: string
+      follow_up_notes?: string
+      status?: string
+    },
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      console.log('=== MRService.updateMeetingFollowUpById DEBUG ===')
-      console.log('followUpId:', followUpId)
-      console.log('followUpData:', followUpData)
-      
-      const { data, error } = await supabase.rpc('update_meeting_followup_by_id', {
-        p_follow_up_id: followUpId,
-        p_follow_up_date: followUpData.follow_up_date || null,
-        p_follow_up_time: followUpData.follow_up_time || null,
-        p_follow_up_notes: followUpData.follow_up_notes || null,
-        p_status: followUpData.status || null
-      })
-
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.error('Update follow-up error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Follow-up updated successfully')
+      const data = await apiClient.patch(`/api/mr/followups/${followUpId}/`, followUpData)
       return { success: true, data }
-    } catch (error: any) {
-      console.error('Exception in updateMeetingFollowUpById:', error)
-      return { success: false, error: error.message || 'Failed to update follow-up' }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to update follow-up') }
     }
   }
 
-  /**
-   * Delete a meeting follow-up
-   */
   static async deleteMeetingFollowUp(followUpId: string): Promise<{ success: boolean; error?: string }> {
     try {
-      console.log('=== MRService.deleteMeetingFollowUp DEBUG ===')
-      console.log('followUpId:', followUpId)
-      
-      const { data, error } = await supabase.rpc('delete_meeting_followup', {
-        p_follow_up_id: followUpId
-      })
-
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.error('Delete follow-up error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Follow-up deleted successfully')
+      await apiClient.delete(`/api/mr/followups/${followUpId}/`)
       return { success: true }
-    } catch (error: any) {
-      console.error('Exception in deleteMeetingFollowUp:', error)
-      return { success: false, error: error.message || 'Failed to delete follow-up' }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to delete follow-up') }
     }
   }
 
-  /**
-   * Get all follow-ups for a meeting
-   */
-  static async getMeetingFollowUps(meetingId: string): Promise<{ success: boolean; data?: any[]; error?: string }> {
+  static async getMeetingFollowUps(meetingId: string): Promise<{ success: boolean; data?: unknown[]; error?: string }> {
     try {
-      console.log('=== MRService.getMeetingFollowUps DEBUG ===')
-      console.log('meetingId:', meetingId)
-      
-      const { data, error } = await supabase.rpc('get_meeting_followups', {
-        p_meeting_id: meetingId
-      })
-
-      console.log('Supabase RPC result:')
-      console.log('- data:', data)
-      console.log('- error:', error)
-
-      if (error) {
-        console.error('Get follow-ups error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Follow-ups fetched successfully')
-      return { success: true, data: data || [] }
-    } catch (error: any) {
-      console.error('Exception in getMeetingFollowUps:', error)
-      return { success: false, error: error.message || 'Failed to get follow-ups' }
+      const data = await apiClient.get<unknown[]>(`/api/mr/meetings/${meetingId}/followups/`)
+      return { success: true, data }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to fetch follow-ups') }
     }
   }
 
-  static async updateSlideNote(noteId: string, noteText: string): Promise<{ success: boolean; error?: string }> {
+  static async updateSlideNote(
+    noteId: string,
+    noteText: string,
+    meetingId?: string,
+  ): Promise<{ success: boolean; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('update_slide_note', {
-        p_note_id: noteId,
-        p_note_text: noteText
-      })
-
-      if (error) {
-        console.error('Update slide note error:', error)
-        return { success: false, error: error.message }
+      if (!meetingId) {
+        return { success: false, error: 'Meeting ID required for slide note update' }
       }
-
+      await apiClient.patch(`/api/mr/meetings/${meetingId}/notes/${noteId}/`, { note_text: noteText })
       return { success: true }
-    } catch (error: any) {
-      console.error('Update slide note error:', error)
-      return { success: false, error: error.message || 'Failed to update note' }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to update slide note') }
     }
   }
 
-  static async deleteSlideNote(noteId: string): Promise<{ success: boolean; error?: string }> {
+  static async deleteSlideNote(noteId: string, meetingId?: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('delete_slide_note', {
-        p_note_id: noteId
-      })
-
-      if (error) {
-        console.error('Delete slide note error:', error)
-        return { success: false, error: error.message }
+      if (!meetingId) {
+        return { success: false, error: 'Meeting ID required for slide note delete' }
       }
-
+      await apiClient.delete(`/api/mr/meetings/${meetingId}/notes/${noteId}/`)
       return { success: true }
-    } catch (error: any) {
-      console.error('Delete slide note error:', error)
-      return { success: false, error: error.message || 'Failed to delete note' }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to delete slide note') }
     }
   }
 
   static async getMeetingDetailsLegacy(meetingId: string): Promise<{ success: boolean; data?: MeetingDetails; error?: string }> {
+    return this.getMeetingDetails(meetingId)
+  }
+
+  static async trackBrochureView(brochureId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_meeting_details_with_notes', {
-        p_meeting_id: meetingId
+      await apiClient.get(`/api/files/brochures/${brochureId}/download/`)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to track brochure view') }
+    }
+  }
+
+  static async trackBrochureDownload(brochureId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    return this.trackBrochureView(brochureId)
+  }
+
+  static async logActivity(
+    _userId: string,
+    activityType: string,
+    description: string,
+    metadata?: unknown,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    try {
+      const data = await apiClient.post('/api/activity-logs/', {
+        activity_type: activityType,
+        description,
+        metadata,
       })
-
-      if (error) {
-        console.error('Get meeting details error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (!data.success) {
-        return { success: false, error: data.error || 'Failed to get meeting details' }
-      }
-
-      return { 
-        success: true, 
-        data: {
-          meeting: data.meeting,
-          slide_notes: data.slide_notes || []
-        }
-      }
+      return { success: true, data }
     } catch (error) {
-      console.error('Get meeting details error:', error)
-      return { success: false, error: 'Failed to get meeting details' }
+      return { success: false, error: serviceError(error, 'Failed to log activity') }
     }
   }
 
-  // Track brochure view
-  static async trackBrochureView(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async clearRecentActivities(_userId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    console.warn('clearRecentActivities: no server delete endpoint; clearing local cache only')
+    return { success: true, data: null }
+  }
+
+  static async addDoctor(_mrId: string, doctorData: Record<string, unknown>): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      // First get current view_count
-      const { data: currentData, error: fetchError } = await supabase
-        .from('brochures')
-        .select('view_count')
-        .eq('id', brochureId)
-        .single()
-      
-      if (fetchError) {
-        console.error('View count fetch error:', fetchError)
-        return { success: false, error: fetchError.message }
-      }
-      
-      const { data, error } = await supabase
-        .from('brochures')
-        .update({ 
-          view_count: (currentData?.view_count || 0) + 1,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', brochureId)
-        .select()
-
-      if (error) {
-        console.error('View count update error:', error)
-        return { success: false, error: error.message }
-      }
-
-      // Log activity
-      try {
-        const userResult = await AuthService.getCurrentUser()
-        if (userResult.success && userResult.user) {
-          const brochureTitle = data?.[0]?.title || 'Unknown brochure'
-          await this.logActivity(userResult.user.id, 'brochure_view', `Viewed ${brochureTitle}`)
-        }
-      } catch (activityError) {
-        console.log('Failed to log activity:', activityError)
-      }
-
-      console.log('View count updated successfully:', data)
+      const data = await apiClient.post('/api/mr/doctor-assignments/', doctorData)
       return { success: true, data }
     } catch (error) {
-      return { success: false, error: 'Failed to track view' }
+      return { success: false, error: serviceError(error, 'Failed to create doctor assignment') }
     }
   }
 
-  // Track brochure download
-  static async trackBrochureDownload(brochureId: string): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      // First get current download_count
-      const { data: currentData, error: fetchError } = await supabase
-        .from('brochures')
-        .select('download_count')
-        .eq('id', brochureId)
-        .single()
-      
-      if (fetchError) {
-        console.error('Download count fetch error:', fetchError)
-        return { success: false, error: fetchError.message }
-      }
-      
-      const { data, error } = await supabase
-        .from('brochures')
-        .update({ 
-          download_count: (currentData?.download_count || 0) + 1,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', brochureId)
-        .select()
-
-      if (error) {
-        console.error('Download count update error:', error)
-        return { success: false, error: error.message }
-      }
-
-      // Log activity
-      try {
-        const userResult = await AuthService.getCurrentUser()
-        if (userResult.success && userResult.user) {
-          const brochureTitle = data?.[0]?.title || 'Unknown brochure'
-          await this.logActivity(userResult.user.id, 'brochure_download', `Downloaded ${brochureTitle}`)
-        }
-      } catch (activityError) {
-        console.log('Failed to log activity:', activityError)
-      }
-
-      console.log('Download count updated successfully:', data)
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to track download' }
-    }
+  static async getDoctors(_mrId: string): Promise<{ success: boolean; data?: MRAssignedDoctor[]; error?: string }> {
+    return this.getAssignedDoctors(_mrId)
   }
 
-  // Log activity function
-  static async logActivity(userId: string, activityType: string, description: string, metadata?: any): Promise<{ success: boolean; data?: any; error?: string }> {
+  static async updateDoctor(doctorId: string, doctorData: Record<string, unknown>): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      console.log('Attempting to log activity:', { userId, activityType, description })
-      const { data, error } = await supabase.rpc('log_activity', {
-        p_user_id: userId,
-        p_activity_type: activityType,
-        p_description: description,
-        p_metadata: metadata || null
-      })
-
-      if (error) {
-        console.error('Activity log error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Activity logged successfully:', data)
+      const data = await apiClient.patch(`/api/mr/doctor-assignments/${doctorId}/`, doctorData)
       return { success: true, data }
     } catch (error) {
-      console.error('Activity log error:', error)
-      return { success: false, error: 'Failed to log activity' }
-    }
-  }
-
-  // Clear recent activities for a user
-  static async clearRecentActivities(userId: string): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      console.log('Clearing recent activities for user:', userId)
-      const { data, error } = await supabase
-        .from('activity_logs')
-        .delete()
-        .eq('user_id', userId)
-
-      if (error) {
-        console.error('Clear activities error:', error)
-        return { success: false, error: error.message }
-      }
-
-      console.log('Activities cleared successfully:', data)
-      return { success: true, data }
-    } catch (error) {
-      console.error('Clear activities error:', error)
-      return { success: false, error: 'Failed to clear activities' }
-    }
-  }
-
-  // Alias methods for doctor management to match DoctorsScreen expectations
-  static async addDoctor(mrId: string, doctorData: any): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('create_mr_doctor_assignment', {
-        p_mr_id: mrId,
-        p_first_name: doctorData.first_name,
-        p_last_name: doctorData.last_name,
-        p_specialty: doctorData.specialty,
-        p_hospital: doctorData.hospital,
-        p_phone: doctorData.phone,
-        p_email: doctorData.email,
-        p_location: doctorData.location,
-        p_notes: doctorData.notes,
-        p_profile_image_url: doctorData.profile_image_url
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to create doctor assignment' }
-    }
-  }
-
-  static async getDoctors(mrId: string): Promise<{ success: boolean; data?: MRAssignedDoctor[]; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('get_mr_doctors', { p_mr_id: mrId })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to fetch doctors' }
-    }
-  }
-
-  static async updateDoctor(doctorId: string, doctorData: any): Promise<{ success: boolean; data?: any; error?: string }> {
-    try {
-      const { data, error } = await supabase.rpc('update_mr_doctor_assignment', {
-        p_doctor_id: doctorId,
-        p_first_name: doctorData.first_name,
-        p_last_name: doctorData.last_name,
-        p_specialty: doctorData.specialty,
-        p_hospital: doctorData.hospital,
-        p_phone: doctorData.phone,
-        p_email: doctorData.email,
-        p_location: doctorData.location,
-        p_notes: doctorData.notes,
-        p_profile_image_url: doctorData.profile_image_url
-      })
-
-      if (error) {
-        return { success: false, error: error.message }
-      }
-
-      return { success: true, data }
-    } catch (error) {
-      return { success: false, error: 'Failed to update doctor assignment' }
+      return { success: false, error: serviceError(error, 'Failed to update doctor assignment') }
     }
   }
 
   static async deleteDoctor(doctorId: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const { error } = await supabase.rpc('delete_mr_doctor_assignment', {
-        p_doctor_id: doctorId
-      });
-
-      if (error) {
-        return { success: false, error: error.message };
-      }
-
-      return { success: true };
+      await apiClient.delete(`/api/mr/doctor-assignments/${doctorId}/`)
+      return { success: true }
     } catch (error) {
-      return { success: false, error: 'Failed to delete doctor' };
+      return { success: false, error: serviceError(error, 'Failed to delete doctor') }
     }
   }
 
-  // ==================== SAVED BROCHURES RPCs ====================
-
-  /**
-   * Save a brochure for an MR user
-   */
   static async saveBrochureForMr(
-    mrId: string,
+    _mrId: string,
     brochureId: string,
-    customTitle: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    customTitle: string,
+  ): Promise<{ success: boolean; data?: { id: string }; error?: string }> {
     try {
-      // Get brochure details first
       const brochure = await this.getBrochureById(brochureId)
       if (!brochure) {
         return { success: false, error: 'Brochure not found' }
       }
 
-      const { data, error } = await supabase.rpc('save_brochure_for_mr', {
-        p_mr_id: mrId,
-        p_brochure_id: brochureId,
-        p_brochure_title: brochure.title,
-        p_custom_title: customTitle,
-        p_original_brochure_data: {
+      const data = await apiClient.post<{ id: string }>('/api/mr/saved-brochures/', {
+        brochure_id: brochureId,
+        brochure_title: brochure.title,
+        custom_title: customTitle,
+        original_brochure_data: {
           id: brochure.id,
           title: brochure.title,
           category: brochure.category,
           description: brochure.description,
-          thumbnail_url: brochure.thumbnail_url
-        }
+          thumbnail_url: brochure.thumbnail_url,
+        },
       })
-
-      if (error) {
-        console.error('Save brochure for MR error:', error)
-        return { success: false, error: error.message }
-      }
-
-      // Get the saved brochure ID by querying the table
-      const { data: savedBrochure, error: queryError } = await supabase
-        .from('saved_brochures')
-        .select('id')
-        .eq('mr_id', mrId)
-        .eq('brochure_id', brochureId)
-        .single()
-
-      if (queryError) {
-        console.warn('Could not get saved brochure ID:', queryError)
-      }
-
-      return {
-        success: true,
-        data: savedBrochure ? { id: savedBrochure.id } : data
-      }
+      return { success: true, data: { id: data.id } }
     } catch (error) {
-      console.error('Save brochure for MR error:', error)
-      return { success: false, error: 'Failed to save brochure' }
+      return { success: false, error: serviceError(error, 'Failed to save brochure') }
     }
   }
 
-  /**
-   * Get all saved brochures for an MR user
-   */
-  static async getSavedBrochuresForMr(
-    mrId: string
-  ): Promise<{ success: boolean; data?: any[]; error?: string }> {
+  static async getSavedBrochuresForMr(_mrId: string): Promise<{ success: boolean; data?: unknown[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_saved_brochures_for_mr', {
-        p_mr_id: mrId
-      })
-
-      if (error) {
-        console.error('Get saved brochures error:', error)
-        return { success: false, error: error.message }
-      }
-
-      // Transform the data to include id field
-      const transformedData = data?.map((item: any, index: number) => ({
-        id: `saved_${mrId}_${item.brochure_id}_${index}`, // Generate local ID
-        brochure_id: item.brochure_id,
-        brochure_title: item.brochure_title,
-        custom_title: item.custom_title,
-        original_brochure_data: item.original_brochure_data,
-        saved_at: item.saved_at,
-        last_accessed: item.last_accessed
-      })) || []
-
+      const data = await apiClient.get<unknown[]>('/api/mr/saved-brochures/')
+      const transformedData =
+        data?.map((item: Record<string, unknown>, index: number) => ({
+          id: item.id || `saved_${item.brochure_id}_${index}`,
+          brochure_id: item.brochure_id,
+          brochure_title: item.brochure_title,
+          custom_title: item.custom_title,
+          original_brochure_data: item.original_brochure_data,
+          saved_at: item.saved_at || item.created_at,
+          last_accessed: item.last_accessed,
+        })) || []
       return { success: true, data: transformedData }
     } catch (error) {
-      console.error('Get saved brochures error:', error)
-      return { success: false, error: 'Failed to fetch saved brochures' }
+      return { success: false, error: serviceError(error, 'Failed to fetch saved brochures') }
     }
   }
 
-  /**
-   * Update custom title of a saved brochure
-   */
   static async updateSavedBrochureTitle(
-    mrId: string,
-    brochureId: string,
-    customTitle: string
+    _mrId: string,
+    brochureOrSavedId: string,
+    customTitle: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('update_saved_brochure_title', {
-        p_mr_id: mrId,
-        p_brochure_id: brochureId,
-        p_new_custom_title: customTitle
-      })
-
-      if (error) {
-        console.error('Update saved brochure title error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (data && !data.success) {
-        return { success: false, error: data.error || 'Failed to update title' }
-      }
-
+      await apiClient.patch(`/api/mr/saved-brochures/${brochureOrSavedId}/`, { custom_title: customTitle })
       return { success: true }
     } catch (error) {
-      console.error('Update saved brochure title error:', error)
-      return { success: false, error: 'Failed to update saved brochure title' }
+      return { success: false, error: serviceError(error, 'Failed to update saved brochure title') }
     }
   }
 
-  /**
-   * Remove a saved brochure for an MR user
-   */
   static async removeSavedBrochureForMr(
-    mrId: string,
-    brochureId: string
+    _mrId: string,
+    brochureOrSavedId: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('remove_saved_brochure_for_mr', {
-        p_mr_id: mrId,
-        p_brochure_id: brochureId
-      })
-
-      if (error) {
-        console.error('Remove saved brochure error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (data && !data.success) {
-        return { success: false, error: data.error || 'Failed to remove saved brochure' }
-      }
-
+      await apiClient.delete(`/api/mr/saved-brochures/${brochureOrSavedId}/`)
       return { success: true }
     } catch (error) {
-      console.error('Remove saved brochure error:', error)
-      return { success: false, error: 'Failed to remove saved brochure' }
+      return { success: false, error: serviceError(error, 'Failed to remove saved brochure') }
     }
   }
 
-  // ==================== BROCHURE SYNC RPCs ====================
-
-  /**
-   * Save brochure changes (slides, groups, etc.) to server
-   */
   static async saveBrochureChanges(params: {
     mr_id: string
     brochure_id: string
     brochure_title: string
     brochure_data_url: string
     last_modified: string
-  }): Promise<{ success: boolean; data?: any; error?: string }> {
+  }): Promise<{ success: boolean; data?: { id?: string; last_modified?: string }; error?: string }> {
     try {
-      // Get brochure data from local file to extract slides and groups
-      const brochureDataPath = `${require('expo-file-system').documentDirectory}brochures/${params.brochure_id}/brochure_data.json`
-      const FileSystem = require('expo-file-system')
-      
-      let brochureData: any = { slides: [], groups: [] }
+      const brochureDataPath = `${FileSystem.documentDirectory}brochures/${params.brochure_id}/brochure_data.json`
+      let brochureData: { slides?: unknown[]; groups?: unknown[]; totalSlides?: number } = { slides: [], groups: [] }
+
       try {
         const fileInfo = await FileSystem.getInfoAsync(brochureDataPath)
         if (fileInfo.exists) {
@@ -1453,123 +694,55 @@ export class MRService {
         console.warn('Could not read local brochure data file:', fileError)
       }
 
-      const { data, error } = await supabase.rpc('save_brochure_changes', {
-        p_mr_id: params.mr_id,
-        p_brochure_id: params.brochure_id,
-        p_brochure_title: params.brochure_title,
-        p_brochure_data: {
-          brochure_data_url: params.brochure_data_url,
+      const data = await apiClient.put<{ id?: string; last_modified?: string }>('/api/mr/brochure-sync/', {
+        brochure_id: params.brochure_id,
+        brochure_title: params.brochure_title,
+        brochure_data: {
+          brochure_data_url: resolveMediaUrl(params.brochure_data_url),
           slides: brochureData.slides || [],
           groups: brochureData.groups || [],
           last_modified: params.last_modified,
-          total_slides: brochureData.totalSlides || brochureData.slides?.length || 0
-        }
+          total_slides: brochureData.totalSlides || brochureData.slides?.length || 0,
+        },
       })
-
-      if (error) {
-        console.error('Save brochure changes error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (data && !data.success) {
-        return { success: false, error: data.error || 'Failed to save brochure changes' }
-      }
 
       return {
         success: true,
-        data: {
-          id: data?.brochure_sync_id,
-          last_modified: data?.last_modified
-        }
+        data: { id: data.id, last_modified: data.last_modified || params.last_modified },
       }
     } catch (error) {
-      console.error('Save brochure changes error:', error)
-      return { success: false, error: 'Failed to save brochure changes' }
+      return { success: false, error: serviceError(error, 'Failed to save brochure changes') }
     }
   }
 
-  /**
-   * Get all brochure changes for an MR user
-   */
-  static async getBrochureChangesForMr(
-    mrId: string
-  ): Promise<{ success: boolean; data?: any[]; error?: string }> {
+  static async getBrochureChangesForMr(_mrId: string): Promise<{ success: boolean; data?: unknown[]; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_brochure_changes', {
-        p_mr_id: mrId
-      })
-
-      if (error) {
-        console.error('Get brochure changes error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (data && !data.success) {
-        return { success: false, error: data.error || 'Failed to get brochure changes' }
-      }
-
-      return { success: true, data: data?.data || [] }
+      const data = await apiClient.get<unknown[] | { data: unknown[] }>('/api/mr/brochure-sync/')
+      const list = Array.isArray(data) ? data : (data as { data: unknown[] }).data || []
+      return { success: true, data: list }
     } catch (error) {
-      console.error('Get brochure changes error:', error)
-      return { success: false, error: 'Failed to fetch brochure changes' }
+      return { success: false, error: serviceError(error, 'Failed to fetch brochure changes') }
     }
   }
 
-  /**
-   * Get specific brochure sync data for download
-   */
   static async getBrochureSyncData(
-    mrId: string,
-    brochureId: string
-  ): Promise<{ success: boolean; data?: any; error?: string }> {
+    _mrId: string,
+    brochureId: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('get_brochure_sync_data', {
-        p_mr_id: mrId,
-        p_brochure_id: brochureId
-      })
-
-      if (error) {
-        console.error('Get brochure sync data error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (data && !data.success) {
-        return { success: false, error: data.error || 'Brochure sync data not found' }
-      }
-
-      return { success: true, data: data?.data }
+      const data = await apiClient.get<unknown>('/api/mr/brochure-sync/', { query: { brochure_id: brochureId } })
+      return { success: true, data }
     } catch (error) {
-      console.error('Get brochure sync data error:', error)
-      return { success: false, error: 'Failed to fetch brochure sync data' }
+      return { success: false, error: serviceError(error, 'Failed to fetch brochure sync data') }
     }
   }
 
-  /**
-   * Delete brochure sync data
-   */
-  static async deleteBrochureSync(
-    mrId: string,
-    brochureId: string
-  ): Promise<{ success: boolean; error?: string }> {
+  static async deleteBrochureSync(_mrId: string, brochureId: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const { data, error } = await supabase.rpc('delete_brochure_sync', {
-        p_mr_id: mrId,
-        p_brochure_id: brochureId
-      })
-
-      if (error) {
-        console.error('Delete brochure sync error:', error)
-        return { success: false, error: error.message }
-      }
-
-      if (data && !data.success) {
-        return { success: false, error: data.error || 'Failed to delete brochure sync' }
-      }
-
+      await apiClient.delete(`/api/mr/brochure-sync/${brochureId}/`)
       return { success: true }
     } catch (error) {
-      console.error('Delete brochure sync error:', error)
-      return { success: false, error: 'Failed to delete brochure sync' }
+      return { success: false, error: serviceError(error, 'Failed to delete brochure sync') }
     }
   }
 }
