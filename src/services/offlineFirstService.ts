@@ -697,7 +697,7 @@ export class OfflineFirstService {
    */
   static async getSyncStats(): Promise<ServiceResponse<{ pending: number; failed: number; completed: number }>> {
     try {
-      const stats = await LocalDatabaseService.getSyncStats();
+      const stats = await LocalDatabaseService.getActionableSyncStats();
       const isOnline = await NetworkService.isOnline();
       
       return { 

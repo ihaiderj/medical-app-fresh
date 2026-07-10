@@ -14,6 +14,10 @@ interface BrochureSyncData {
 }
 import { FilePathUtils } from '../utils/filePathUtils'
 import { FileStorageService } from './fileStorageService'
+import { PDFConversionService } from './pdfConversionService'
+import { PDFProcessingService } from './pdfProcessingService'
+import { isPdfBrochure, isZipBrochure } from '../utils/brochureTypeUtils'
+import { MRService } from './MRService'
 
 // Conditionally import react-native-zip-archive only for native platforms
 let unzip: any = null
@@ -332,6 +336,72 @@ export class BrochureManagementService {
   }
 
   /**
+   * Process a PDF brochure: convert pages to images and generate a thumbnail.
+   */
+  static async processPdfFile(
+    brochureId: string,
+    pdfUri: string,
+    brochureTitle: string,
+  ): Promise<{ success: boolean; brochureData?: BrochureData; thumbnailUri?: string; error?: string }> {
+    try {
+      await this.initializeStorage()
+
+      const presentationData = await PDFConversionService.convertPDFToImages(
+        brochureId,
+        brochureTitle,
+        pdfUri,
+      )
+
+      const slides: BrochureSlide[] = presentationData.slides.map((slide, index) => ({
+        id: `${brochureId}_page_${slide.pageNumber}`,
+        title: slide.title,
+        fileName: `page_${slide.pageNumber}.jpg`,
+        imageUri: slide.imagePath,
+        order: index + 1,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }))
+
+      const thumbnailResult = await PDFProcessingService.generateThumbnail(brochureId, pdfUri)
+      const now = new Date().toISOString()
+
+      const brochureData: BrochureData = {
+        id: brochureId,
+        title: brochureTitle,
+        category: 'General',
+        slides,
+        groups: [],
+        thumbnailUri: thumbnailResult.thumbnailUri || slides[0]?.imageUri,
+        totalSlides: slides.length,
+        createdAt: now,
+        updatedAt: now,
+        localLastModified: now,
+        needsSync: false,
+        isModified: false,
+      }
+
+      const brochureDir = `${this.STORAGE_DIR}${brochureId}/`
+      await FileSystem.makeDirectoryAsync(brochureDir, { intermediates: true })
+      await FileSystem.writeAsStringAsync(
+        `${brochureDir}brochure_data.json`,
+        JSON.stringify(brochureData, null, 2),
+      )
+
+      return {
+        success: true,
+        brochureData,
+        thumbnailUri: brochureData.thumbnailUri,
+      }
+    } catch (error) {
+      console.error('PDF processing error:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to process PDF file',
+      }
+    }
+  }
+
+  /**
    * Download brochure file (ZIP/PDF) from server
    */
   static async downloadBrochureFile(
@@ -393,15 +463,22 @@ export class BrochureManagementService {
 
       console.log('BrochureManager: File downloaded successfully to:', localPath);
 
-      // Process ZIP file if needed
-      if (fileUrl.includes('.zip') || extension === 'zip') {
+      // Process ZIP or PDF after download
+      if (isZipBrochure({ file_url: fileUrl }, localPath)) {
         console.log('BrochureManager: Processing ZIP file for brochure:', brochureId);
         try {
           await this.processZipFile(brochureId, localPath, brochureTitle);
           console.log('BrochureManager: ZIP file processed successfully');
         } catch (error) {
           console.warn('BrochureManager: ZIP processing failed, will process on first view:', error);
-          // Don't fail the download if ZIP processing fails
+        }
+      } else if (isPdfBrochure({ file_url: fileUrl }, localPath)) {
+        console.log('BrochureManager: Processing PDF file for brochure:', brochureId);
+        try {
+          await this.processPdfFile(brochureId, localPath, brochureTitle);
+          console.log('BrochureManager: PDF file processed successfully');
+        } catch (error) {
+          console.warn('BrochureManager: PDF processing failed, will process on first view:', error);
         }
       }
 
@@ -1323,11 +1400,48 @@ export class BrochureManagementService {
     error?: string 
   }> {
     try {
-      // TODO: Implement in SyncService when RPCs are available
-      console.warn('🔵 BROCHURE_SYNC: checkBrochureSyncStatus not yet implemented in SyncService')
+      const result = await MRService.getBrochureSyncData(mrId, brochureId)
+      if (!result.success || !result.data) {
+        return {
+          success: true,
+          data: {
+            hasServerChanges: false,
+            needsDownload: false,
+            localLastModified,
+          },
+        }
+      }
+
+      const syncRecord = result.data as {
+        last_modified?: string
+        brochure_data?: { last_modified?: string }
+      }
+      const serverLastModified =
+        syncRecord.last_modified || syncRecord.brochure_data?.last_modified
+
+      if (!serverLastModified) {
+        return {
+          success: true,
+          data: {
+            hasServerChanges: false,
+            needsDownload: false,
+            localLastModified,
+          },
+        }
+      }
+
+      const needsDownload =
+        !localLastModified ||
+        new Date(serverLastModified).getTime() > new Date(localLastModified).getTime()
+
       return {
-        success: false,
-        error: 'Brochure sync status check not yet implemented'
+        success: true,
+        data: {
+          hasServerChanges: needsDownload,
+          needsDownload,
+          serverLastModified,
+          localLastModified,
+        },
       }
     } catch (error) {
       console.error('Brochure sync status check error:', error)
@@ -1350,11 +1464,45 @@ export class BrochureManagementService {
     error?: string 
   }> {
     try {
-      // TODO: Implement in SyncService when RPCs are available
-      console.warn('🔵 BROCHURE_SYNC: downloadBrochureChanges not yet implemented in SyncService')
+      const result = await MRService.getBrochureSyncData(mrId, brochureId)
+      if (!result.success || !result.data) {
+        return {
+          success: false,
+          error: result.error || 'No brochure sync data found',
+        }
+      }
+
+      const syncRecord = result.data as {
+        brochure_title?: string
+        last_modified?: string
+        brochure_data?: {
+          slides?: BrochureSyncData['slides']
+          groups?: BrochureSyncData['groups']
+          total_slides?: number
+          last_modified?: string
+          title?: string
+        }
+      }
+
+      const brochureData = syncRecord.brochure_data || {}
+      const slides = brochureData.slides || []
+      const groups = brochureData.groups || []
+      const lastModified =
+        syncRecord.last_modified ||
+        brochureData.last_modified ||
+        new Date().toISOString()
+
       return {
-        success: false,
-        error: 'Brochure download not yet implemented'
+        success: true,
+        data: {
+          brochureId,
+          brochureTitle: syncRecord.brochure_title || brochureData.title,
+          title: brochureData.title,
+          slides,
+          groups,
+          totalSlides: brochureData.total_slides || slides.length,
+          lastModified,
+        },
       }
     } catch (error) {
       console.error('Brochure download error:', error)

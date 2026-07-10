@@ -1,6 +1,7 @@
 import { apiClient, ApiError } from './apiClient'
 import { resolveMediaUrl } from '../config/apiConfig'
 import { AuthService } from './AuthService'
+import { resolveServerBrochureId } from '../utils/brochureTypeUtils'
 import * as FileSystem from 'expo-file-system'
 
 export interface MRDashboardStats {
@@ -31,6 +32,7 @@ export interface MRAssignedBrochure {
   download_count: number
   uploaded_by_name: string
   created_at: string
+  updated_at?: string
   file_url?: string
   file_name?: string
   file_type?: string
@@ -155,7 +157,12 @@ export class MRService {
   static async getAssignedBrochures(_mrId: string): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
     try {
       const data = await apiClient.get<MRAssignedBrochure[]>('/api/mr/brochures/')
-      return { success: true, data }
+      const brochures = (data || []).map((brochure) => ({
+        ...brochure,
+        file_url: brochure.file_url ? resolveMediaUrl(brochure.file_url) : brochure.file_url,
+        thumbnail_url: brochure.thumbnail_url ? resolveMediaUrl(brochure.thumbnail_url) : brochure.thumbnail_url,
+      }))
+      return { success: true, data: brochures }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to fetch assigned brochures') }
     }
@@ -606,13 +613,14 @@ export class MRService {
     customTitle: string,
   ): Promise<{ success: boolean; data?: { id: string }; error?: string }> {
     try {
-      const brochure = await this.getBrochureById(brochureId)
+      const resolvedBrochureId = resolveServerBrochureId(brochureId)
+      const brochure = await this.getBrochureById(resolvedBrochureId)
       if (!brochure) {
         return { success: false, error: 'Brochure not found' }
       }
 
       const data = await apiClient.post<{ id: string }>('/api/mr/saved-brochures/', {
-        brochure_id: brochureId,
+        brochure_id: resolvedBrochureId,
         brochure_title: brochure.title,
         custom_title: customTitle,
         original_brochure_data: {
@@ -626,6 +634,50 @@ export class MRService {
       return { success: true, data: { id: data.id } }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to save brochure') }
+    }
+  }
+
+  static async saveOrGetSavedBrochureForMr(
+    mrId: string,
+    brochureId: string,
+    customTitle: string,
+  ): Promise<{ success: boolean; data?: { id: string }; alreadyExists?: boolean; error?: string }> {
+    const result = await this.saveBrochureForMr(mrId, brochureId, customTitle)
+    if (!result.success || !result.data) {
+      return result
+    }
+    return { ...result, alreadyExists: false }
+  }
+
+  /** @deprecated Server now dedupes; kept for legacy cleanup after migration */
+  static async pruneDuplicateSavedBrochuresOnServer(
+    mrId: string,
+    canonicalBrochureId: string,
+    keepServerId?: string,
+  ): Promise<void> {
+    const resolved = resolveServerBrochureId(canonicalBrochureId)
+    const list = await this.getSavedBrochuresForMr(mrId)
+    if (!list.success || !list.data) return
+
+    const matches = (list.data as Array<{ id: string; brochure_id: string }>).filter(
+      (item) => resolveServerBrochureId(item.brochure_id) === resolved,
+    )
+
+    if (matches.length <= 1) return
+
+    const keeper = keepServerId
+      ? matches.find((item) => item.id === keepServerId)
+      : matches.find((item) => item.brochure_id === resolved)
+
+    const keepId = keeper?.id || matches[0].id
+
+    for (const item of matches) {
+      if (item.id !== keepId) {
+        await this.removeSavedBrochureWithIdentifiers({
+          server_id: item.id,
+          brochure_id: item.brochure_id,
+        })
+      }
     }
   }
 
@@ -665,12 +717,43 @@ export class MRService {
     _mrId: string,
     brochureOrSavedId: string,
   ): Promise<{ success: boolean; error?: string }> {
-    try {
-      await apiClient.delete(`/api/mr/saved-brochures/${brochureOrSavedId}/`)
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: serviceError(error, 'Failed to remove saved brochure') }
+    return this.removeSavedBrochureWithIdentifiers({
+      brochure_id: brochureOrSavedId,
+    })
+  }
+
+  static async removeSavedBrochureWithIdentifiers(
+    identifiers: { server_id?: string | null; brochure_id?: string | null },
+  ): Promise<{ success: boolean; error?: string }> {
+    const candidates = [
+      identifiers.server_id,
+      identifiers.brochure_id,
+      identifiers.brochure_id ? resolveServerBrochureId(identifiers.brochure_id) : undefined,
+    ].filter((id): id is string => !!id)
+      .filter((id, index, all) => all.indexOf(id) === index)
+
+    if (candidates.length === 0) {
+      return { success: false, error: 'No saved brochure identifier available' }
     }
+
+    let lastError = 'Failed to remove saved brochure'
+    for (const id of candidates) {
+      try {
+        await apiClient.delete(`/api/mr/saved-brochures/${encodeURIComponent(id)}/`)
+        return { success: true }
+      } catch (error) {
+        lastError = serviceError(error, 'Failed to remove saved brochure')
+        if (error instanceof ApiError && error.status === 404) {
+          continue
+        }
+      }
+    }
+
+    if (lastError.toLowerCase().includes('not found')) {
+      return { success: true }
+    }
+
+    return { success: false, error: lastError }
   }
 
   static async saveBrochureChanges(params: {

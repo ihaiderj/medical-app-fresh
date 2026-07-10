@@ -3,10 +3,8 @@
  * Handles brochure management with offline-first approach
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as FileSystem from 'expo-file-system';
 import { MRService, MRAssignedBrochure } from './MRService';
 import { NetworkService } from './networkService';
-import { AuthService } from './AuthService';
 
 export interface OfflineBrochureCache {
   brochures: MRAssignedBrochure[];
@@ -18,6 +16,7 @@ export interface BrochureAvailability {
   available: MRAssignedBrochure[];
   cached: MRAssignedBrochure[];
   isFromCache: boolean;
+  isDeviceOffline: boolean;
   lastSync: number;
 }
 
@@ -26,94 +25,119 @@ export class OfflineBrochureService {
   private static readonly CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
   private static readonly ESSENTIAL_BROCHURES_KEY = 'essential_brochures';
 
+  private static mapLocalBrochure(b: {
+    id: string;
+    title: string;
+    category?: string;
+    description?: string;
+    file_url?: string;
+    thumbnail_url?: string;
+    file_name?: string;
+    file_type?: string;
+    view_count?: number;
+    download_count?: number;
+    uploaded_by?: string;
+    created_at?: string;
+    updated_at?: string;
+  }): MRAssignedBrochure {
+    return {
+      brochure_id: b.id,
+      id: b.id,
+      title: b.title,
+      category: b.category || 'General',
+      description: b.description,
+      file_url: b.file_url,
+      thumbnail_url: b.thumbnail_url,
+      file_name: b.file_name,
+      file_type: b.file_type,
+      view_count: b.view_count || 0,
+      download_count: b.download_count || 0,
+      uploaded_by_name: b.uploaded_by || 'Administrator',
+      created_at: b.created_at || new Date().toISOString(),
+      updated_at: b.updated_at,
+    };
+  }
+
   /**
-   * Get available brochures (offline-first)
+   * Get available brochures — refresh from server when online, otherwise use cache.
    */
   static async getAvailableBrochures(userId: string): Promise<BrochureAvailability> {
     try {
       console.log('OfflineBrochure: Getting available brochures for user:', userId);
+      const isDeviceOffline = !(await NetworkService.isOnline());
 
-      // OFFLINE-FIRST: Try to get from local database first
+      if (!isDeviceOffline) {
+        try {
+          const serverResult = await MRService.getAssignedBrochures(userId);
+          if (serverResult.success) {
+            const brochures = serverResult.data || [];
+            console.log(`OfflineBrochure: Fetched ${brochures.length} brochures from server`);
+
+            const { LocalDatabaseService } = await import('./localDatabaseService');
+            await LocalDatabaseService.syncBrochuresFromServer(brochures);
+            await this.cacheBrochures(userId, brochures);
+
+            return {
+              available: brochures,
+              cached: brochures,
+              isFromCache: false,
+              isDeviceOffline: false,
+              lastSync: Date.now(),
+            };
+          }
+        } catch (error) {
+          console.warn('OfflineBrochure: Server fetch failed, falling back to cache:', error);
+        }
+      }
+
+      // Offline or server failed — use local database
       try {
         const { LocalDatabaseService } = await import('./localDatabaseService');
         const localBrochures = await LocalDatabaseService.getBrochures(userId);
-        
-        if (localBrochures && localBrochures.length > 0) {
-          console.log(`OfflineBrochure: Found ${localBrochures.length} brochures in local DB`);
-          
-          // Map local brochures to MRAssignedBrochure format
-          const mappedBrochures: MRAssignedBrochure[] = localBrochures.map(b => ({
-            brochure_id: b.id,
-            id: b.id,
-            title: b.title,
-            category: b.category || 'General',
-            description: b.description,
-            file_url: b.file_url,
-            thumbnail_url: b.thumbnail_url,
-            view_count: b.view_count || 0,
-            download_count: b.download_count || 0,
-          }));
-          
+
+        if (localBrochures.length > 0) {
+          const mappedBrochures = localBrochures.map((b) => this.mapLocalBrochure(b));
+          const cache = await this.getCachedBrochures(userId);
+
           return {
             available: mappedBrochures,
             cached: mappedBrochures,
             isFromCache: true,
-            lastSync: Date.now()
+            isDeviceOffline,
+            lastSync: cache.lastUpdated || Date.now(),
           };
         }
       } catch (localError) {
-        console.warn('OfflineBrochure: Local DB fetch failed, falling back to server/cache:', localError);
+        console.warn('OfflineBrochure: Local DB fetch failed:', localError);
       }
 
       // Fallback to AsyncStorage cache
-      console.log('OfflineBrochure: Using AsyncStorage cached brochures');
       const cachedBrochures = await this.getCachedBrochures(userId);
-      
       if (cachedBrochures.brochures.length > 0) {
         return {
           available: cachedBrochures.brochures,
           cached: cachedBrochures.brochures,
           isFromCache: true,
-          lastSync: cachedBrochures.lastUpdated
+          isDeviceOffline,
+          lastSync: cachedBrochures.lastUpdated,
         };
-      }
-
-      // Last resort: Try server (but only if online)
-      if (await NetworkService.isOnline()) {
-        try {
-          console.log('OfflineBrochure: Online - fetching from server as last resort');
-          const serverResult = await MRService.getAssignedBrochures(userId);
-          
-          if (serverResult.success && serverResult.data) {
-            // Cache the fresh data
-            await this.cacheBrochures(userId, serverResult.data);
-            
-            return {
-              available: serverResult.data,
-              cached: [],
-              isFromCache: false,
-              lastSync: Date.now()
-            };
-          }
-        } catch (error) {
-          console.warn('OfflineBrochure: Server fetch failed:', error);
-        }
       }
 
       return {
         available: [],
         cached: [],
         isFromCache: true,
-        lastSync: 0
+        isDeviceOffline,
+        lastSync: 0,
       };
-
     } catch (error) {
       console.error('OfflineBrochure: Error getting available brochures:', error);
       return {
         available: [],
         cached: [],
         isFromCache: true,
-        lastSync: 0
+        isDeviceOffline: true,
+        lastSync: 0,
       };
     }
   }
@@ -126,7 +150,7 @@ export class OfflineBrochureService {
       const cache: OfflineBrochureCache = {
         brochures,
         lastUpdated: Date.now(),
-        userId
+        userId,
       };
 
       await AsyncStorage.setItem(`${this.CACHE_KEY}_${userId}`, JSON.stringify(cache));
@@ -142,35 +166,32 @@ export class OfflineBrochureService {
   static async getCachedBrochures(userId: string): Promise<OfflineBrochureCache> {
     try {
       const cacheData = await AsyncStorage.getItem(`${this.CACHE_KEY}_${userId}`);
-      
+
       if (cacheData) {
         const cache: OfflineBrochureCache = JSON.parse(cacheData);
-        
-        // Check if cache is still valid
         const isExpired = Date.now() - cache.lastUpdated > this.CACHE_DURATION;
-        
+
         if (!isExpired) {
           console.log(`OfflineBrochure: Using valid cache with ${cache.brochures.length} brochures`);
           return cache;
-        } else {
-          console.log('OfflineBrochure: Cache expired, but returning stale data for offline use');
-          return cache; // Return stale data for offline use
         }
+
+        console.log('OfflineBrochure: Cache expired, returning stale data for offline use');
+        return cache;
       }
 
-      // No cache found
       console.log('OfflineBrochure: No cache found');
       return {
         brochures: [],
         lastUpdated: 0,
-        userId
+        userId,
       };
     } catch (error) {
       console.error('OfflineBrochure: Error getting cached brochures:', error);
       return {
         brochures: [],
         lastUpdated: 0,
-        userId
+        userId,
       };
     }
   }
@@ -186,54 +207,34 @@ export class OfflineBrochureService {
         return { success: false, count: 0, error: 'Internet connection required for initial setup' };
       }
 
-      // Get all available brochures
       const result = await MRService.getAssignedBrochures(userId);
-      
+
       if (!result.success || !result.data) {
         return { success: false, count: 0, error: result.error || 'Failed to fetch brochures' };
       }
 
-      // Cache all brochures for offline access
+      const { LocalDatabaseService } = await import('./localDatabaseService');
+      await LocalDatabaseService.syncBrochuresFromServer(result.data);
       await this.cacheBrochures(userId, result.data);
 
-      // Optionally pre-download essential brochures (first 3-5)
       const essentialBrochures = result.data.slice(0, 3);
-      let downloadedCount = 0;
-
-      for (const brochure of essentialBrochures) {
-        try {
-          if (brochure.file_type?.includes('zip') && brochure.file_url) {
-            console.log(`OfflineBrochure: Pre-downloading ${brochure.title}...`);
-            
-            // This would trigger the existing download flow
-            // For now, we'll just cache the metadata
-            downloadedCount++;
-          }
-        } catch (error) {
-          console.warn(`OfflineBrochure: Failed to pre-download ${brochure.title}:`, error);
-        }
-      }
-
-      // Store essential brochures list
       await AsyncStorage.setItem(
-        `${this.ESSENTIAL_BROCHURES_KEY}_${userId}`, 
-        JSON.stringify(essentialBrochures.map(b => b.id))
+        `${this.ESSENTIAL_BROCHURES_KEY}_${userId}`,
+        JSON.stringify(essentialBrochures.map((b) => b.id)),
       );
 
-      console.log(`OfflineBrochure: Pre-cached ${result.data.length} brochures, pre-downloaded ${downloadedCount}`);
-      
-      return { 
-        success: true, 
-        count: result.data.length,
-        error: downloadedCount < essentialBrochures.length ? 'Some downloads failed' : undefined
-      };
+      console.log(`OfflineBrochure: Pre-cached ${result.data.length} brochures`);
 
+      return {
+        success: true,
+        count: result.data.length,
+      };
     } catch (error) {
       console.error('OfflineBrochure: Error pre-caching brochures:', error);
-      return { 
-        success: false, 
-        count: 0, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
+      return {
+        success: false,
+        count: 0,
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
@@ -246,13 +247,13 @@ export class OfflineBrochureService {
       const cache = await this.getCachedBrochures(userId);
       const isExpired = Date.now() - cache.lastUpdated > this.CACHE_DURATION;
       return isExpired || cache.brochures.length === 0;
-    } catch (error) {
+    } catch {
       return true;
     }
   }
 
   /**
-   * Refresh brochure cache
+   * Refresh brochure cache from server
    */
   static async refreshCache(userId: string): Promise<{ success: boolean; count: number; error?: string }> {
     try {
@@ -261,18 +262,20 @@ export class OfflineBrochureService {
       }
 
       const result = await MRService.getAssignedBrochures(userId);
-      
+
       if (result.success && result.data) {
+        const { LocalDatabaseService } = await import('./localDatabaseService');
+        await LocalDatabaseService.syncBrochuresFromServer(result.data);
         await this.cacheBrochures(userId, result.data);
         return { success: true, count: result.data.length };
       }
 
       return { success: false, count: 0, error: result.error };
     } catch (error) {
-      return { 
-        success: false, 
-        count: 0, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
+      return {
+        success: false,
+        count: 0,
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
@@ -295,14 +298,14 @@ export class OfflineBrochureService {
         hasCachedBrochures: cache.brochures.length > 0,
         cacheAge,
         isExpired,
-        brochureCount: cache.brochures.length
+        brochureCount: cache.brochures.length,
       };
-    } catch (error) {
+    } catch {
       return {
         hasCachedBrochures: false,
         cacheAge: 0,
         isExpired: true,
-        brochureCount: 0
+        brochureCount: 0,
       };
     }
   }
@@ -327,31 +330,29 @@ export class OfflineBrochureService {
     try {
       console.log('OfflineBrochure: Initializing for new user:', userId);
 
-      // Check if user already has cache
       const status = await this.getCacheStatus(userId);
       if (status.hasCachedBrochures && !status.isExpired) {
         return { success: true, message: 'Brochures already cached' };
       }
 
-      // Pre-cache brochures for offline access
       const result = await this.preCacheEssentialBrochures(userId);
-      
+
       if (result.success) {
-        return { 
-          success: true, 
-          message: `${result.count} brochures cached for offline access` 
-        };
-      } else {
-        return { 
-          success: false, 
-          message: result.error || 'Failed to cache brochures' 
+        return {
+          success: true,
+          message: `${result.count} brochures cached for offline access`,
         };
       }
+
+      return {
+        success: false,
+        message: result.error || 'Failed to cache brochures',
+      };
     } catch (error) {
       console.error('OfflineBrochure: Error initializing for new user:', error);
-      return { 
-        success: false, 
-        message: error instanceof Error ? error.message : 'Initialization failed' 
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Initialization failed',
       };
     }
   }

@@ -1,4 +1,18 @@
 import * as FileSystem from 'expo-file-system'
+import { Platform } from 'react-native'
+
+type PdfThumbnailModule = {
+  generate: (filePath: string, page: number, quality?: number) => Promise<{ uri: string; width: number; height: number }>
+}
+
+let PdfThumbnail: PdfThumbnailModule | null = null
+if (Platform.OS !== 'web') {
+  try {
+    PdfThumbnail = require('react-native-pdf-thumbnail').default
+  } catch {
+    console.warn('react-native-pdf-thumbnail not available for thumbnail generation')
+  }
+}
 
 export interface PDFPage {
   pageNumber: number
@@ -37,32 +51,27 @@ export class PDFProcessingService {
    */
   static async generateThumbnail(
     brochureId: string,
-    pdfUri: string
+    pdfUri: string,
   ): Promise<{ success: boolean; thumbnailUri?: string; error?: string }> {
     try {
       await this.initializeStorage()
-      
-      // For now, create a mock thumbnail
-      // In a real implementation, you'd use a PDF library to extract the first page
-      const thumbnailPath = `${this.STORAGE_DIR}${brochureId}_thumbnail.jpg`
-      
-      // Create a local thumbnail using base64 encoded image
-      const base64Thumbnail = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAHGArEkAAAAAElFTkSuQmCC'
-      
-      // Save the base64 image as a local file
-      await FileSystem.writeAsStringAsync(thumbnailPath, base64Thumbnail, {
-        encoding: FileSystem.EncodingType.Base64,
-      })
-      
-      return { 
-        success: true, 
-        thumbnailUri: thumbnailPath 
+
+      const brochureDir = `${this.STORAGE_DIR}${brochureId}/`
+      await FileSystem.makeDirectoryAsync(brochureDir, { intermediates: true })
+      const thumbnailPath = `${brochureDir}thumbnail.jpg`
+
+      if (PdfThumbnail) {
+        const { uri } = await PdfThumbnail.generate(pdfUri, 0, 85)
+        await FileSystem.copyAsync({ from: uri, to: thumbnailPath })
+        return { success: true, thumbnailUri: thumbnailPath }
       }
+
+      return { success: false, error: 'PDF thumbnail module not available' }
     } catch (error) {
       console.error('Thumbnail generation error:', error)
-      return { 
-        success: false, 
-        error: 'Failed to generate thumbnail' 
+      return {
+        success: false,
+        error: 'Failed to generate thumbnail',
       }
     }
   }

@@ -2,6 +2,7 @@ import { View, Text, ScrollView, TouchableOpacity, StyleSheet, SafeAreaView, Ale
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
 import { useState, useEffect, useCallback } from "react"
+import { useFocusEffect } from '@react-navigation/native'
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from "../../services/MRService"
 // import { SmartSyncService } from "../../services/smartSyncService" // DELETED
@@ -16,6 +17,7 @@ import { FirstTimeLoginService } from '../../services/firstTimeLoginService';
 // import { SyncVerificationService } from '../../services/syncVerificationService'; // DELETED
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SyncService } from '../../services/SyncService';
+import { NetworkService } from '../../services/networkService';
 // import SyncTestPanel from '../../components/SyncTestPanel'; // DELETED
 
 interface MRDashboardScreenProps {
@@ -35,24 +37,23 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0 })
   const [showTestPanel, setShowTestPanel] = useState(false)
 
+  const refreshSyncStats = useCallback(async () => {
+    try {
+      const result = await OfflineFirstService.getSyncStats();
+      if (result.success && result.data) {
+        setSyncStats({ pending: result.data.pending, failed: 0 });
+      }
+    } catch (error) {
+      console.error('Failed to load sync stats:', error);
+    }
+  }, []);
+
   // Load sync stats periodically
   useEffect(() => {
-    const loadSyncStats = async () => {
-      try {
-        const result = await OfflineFirstService.getSyncStats();
-        if (result.success && result.data) {
-          setSyncStats(result.data);
-        }
-      } catch (error) {
-        console.error('Failed to load sync stats:', error);
-      }
-    };
-    
-    loadSyncStats();
-    const interval = setInterval(loadSyncStats, 30000); // Refresh every 30 seconds
-    
+    refreshSyncStats();
+    const interval = setInterval(refreshSyncStats, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [refreshSyncStats]);
 
   // Set user profile from context immediately
   useEffect(() => {
@@ -144,16 +145,20 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       }
       console.log('🔍 DASHBOARD DEBUG: Meetings loading completed.');
 
-      // Load available brochures count - use saved brochures count from stats
+      // Load available brochures count - prefer live server count when online
       console.log('🔍 DASHBOARD DEBUG: Setting brochure count...');
-      if (statsResult.success && statsResult.data) {
-        const brochureCount = statsResult.data.brochures_available || 0;
-        setAvailableBrochuresCount(brochureCount);
-        console.log('✅ DASHBOARD DEBUG: Brochure count set to:', brochureCount);
-      } else {
-        setAvailableBrochuresCount(0);
-        console.log('🔍 DASHBOARD DEBUG: Brochure count set to 0 (fallback)');
+      let brochureCount = 0
+      if (user?.id && (await NetworkService.isOnline())) {
+        const liveBrochures = await MRService.getAssignedBrochures(user.id)
+        if (liveBrochures.success && liveBrochures.data) {
+          brochureCount = liveBrochures.data.length
+        }
       }
+      if (!brochureCount && statsResult.success && statsResult.data) {
+        brochureCount = statsResult.data.brochures_available || 0
+      }
+      setAvailableBrochuresCount(brochureCount)
+      console.log('✅ DASHBOARD DEBUG: Brochure count set to:', brochureCount)
 
     } catch (error) {
       console.error('❌ DASHBOARD DEBUG: Error loading dashboard data:', error);
@@ -187,6 +192,14 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   useEffect(() => {
     loadDashboardData()
   }, [loadDashboardData])
+
+  useFocusEffect(
+    useCallback(() => {
+      if (user?.id) {
+        loadDashboardData()
+      }
+    }, [user?.id, loadDashboardData]),
+  )
 
   // Subscribe to meeting changes to refresh dashboard stats
   useEffect(() => {
@@ -246,6 +259,17 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
 
   const handleManualSync = async () => {
     if (!user?.id || isSyncing) return;
+
+    if (!(await NetworkService.isOnline())) {
+      NetworkAlerts.syncRequiresInternet()
+      return
+    }
+
+    const pendingStats = await OfflineFirstService.getSyncStats();
+    if (!pendingStats.success || pendingStats.data.pending === 0) {
+      Alert.alert('Sync', 'Nothing queued to sync to server.');
+      return;
+    }
     
     console.log('🚀 MANUAL SYNC DEBUG: Starting manual sync (upload-only) for user:', user.id);
     setIsSyncing(true);
@@ -279,8 +303,15 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         
         // Reload dashboard data to show updated information
         await loadDashboardData();
+        await refreshSyncStats();
         
         setSyncProgress({ step: 'Complete', message: `Sync completed! ${syncResult.synced} operations synced.`, progress: 100 });
+        Alert.alert(
+          'Sync Complete',
+          syncResult.synced > 0
+            ? `${syncResult.synced} change(s) uploaded to the server.`
+            : 'Everything is already synced.',
+        )
         
         // Clear progress after 3 seconds
         setTimeout(() => {
@@ -292,6 +323,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
           ? syncResult.errors.join(', ') 
           : 'Unknown error';
         setSyncProgress({ step: 'Error', message: `Sync failed: ${errorMessage}`, progress: 0 });
+        Alert.alert('Sync Failed', errorMessage)
         
         // Clear error after 5 seconds
         setTimeout(() => {
@@ -545,7 +577,11 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
             </TouchableOpacity>
             <View style={{ position: 'relative' }}>
               <TouchableOpacity 
-                style={[styles.syncButton, isSyncing && styles.syncButtonActive]} 
+                style={[
+                  styles.syncButton,
+                  isSyncing && styles.syncButtonActive,
+                  syncStats.pending === 0 && !isSyncing && styles.syncButtonIdle,
+                ]} 
                 onPress={handleManualSync}
                 onLongPress={() => {
                   Alert.alert(
@@ -563,7 +599,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
                 <Ionicons 
                   name={isSyncing ? "sync" : "cloud-upload-outline"} 
                   size={24} 
-                  color={isSyncing ? "#f59e0b" : "#10b981"} 
+                  color={isSyncing ? "#f59e0b" : syncStats.pending > 0 ? "#10b981" : "#94a3b8"} 
                 />
               </TouchableOpacity>
               {syncStats.pending > 0 && (
@@ -771,6 +807,10 @@ const styles = StyleSheet.create({
   syncButtonActive: {
     backgroundColor: "#fef3c7",
     borderColor: "#f59e0b",
+  },
+  syncButtonIdle: {
+    backgroundColor: "#f8fafc",
+    borderColor: "#cbd5e1",
   },
   modalOverlay: {
     position: 'absolute',

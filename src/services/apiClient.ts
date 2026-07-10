@@ -133,16 +133,21 @@ async function request<T>(
     }
   }
 
-  const response = await fetch(buildUrl(path, query), {
-    method,
-    headers: requestHeaders,
-    body:
-      body === undefined
-        ? undefined
-        : body instanceof FormData
-          ? body
-          : JSON.stringify(body),
-  })
+  let response: Response
+  try {
+    response = await fetch(buildUrl(path, query), {
+      method,
+      headers: requestHeaders,
+      body:
+        body === undefined
+          ? undefined
+          : body instanceof FormData
+            ? body
+            : JSON.stringify(body),
+    })
+  } catch {
+    throw new ApiError(`Network request failed: cannot reach ${API_BASE_URL}`)
+  }
 
   if (response.status === 401 && auth && retryOnUnauthorized) {
     const refreshed = await ensureRefreshed()

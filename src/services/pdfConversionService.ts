@@ -1,16 +1,19 @@
 import * as FileSystem from 'expo-file-system';
 import { Asset } from 'expo-asset';
+import { Platform } from 'react-native';
 
-// Mock implementation for PDF thumbnail generation
-// This will be replaced with actual PDF processing when the dependency is available
-const PdfThumbnail = {
-  generateAllPages: async (pdfPath: string, quality: number) => {
-    // Mock implementation - returns empty pages array
-    // In a real implementation, this would generate thumbnails from PDF
-    console.log('Mock PDF thumbnail generation for:', pdfPath, 'quality:', quality);
-    return { pages: [] };
-  }
+type PdfThumbnailModule = {
+  generateAllPages: (filePath: string, quality?: number) => Promise<Array<{ uri: string; width: number; height: number }>>;
 };
+
+let PdfThumbnail: PdfThumbnailModule | null = null;
+if (Platform.OS !== 'web') {
+  try {
+    PdfThumbnail = require('react-native-pdf-thumbnail').default;
+  } catch {
+    console.warn('react-native-pdf-thumbnail not available — PDF page images will use fallback');
+  }
+}
 
 export interface ConvertedSlide {
   pageNumber: number;
@@ -60,43 +63,30 @@ export class PDFConversionService {
       await FileSystem.makeDirectoryAsync(presentationDir, { intermediates: true });
 
       console.log('Converting PDF to images...', pdfPath);
-      
-      // Convert PDF to images using react-native-pdf-thumbnail
-      const { pages } = await PdfThumbnail.generateAllPages(pdfPath, 90);
-      
-      console.log(`Generated ${pages.length} images from PDF`);
 
       const slides: ConvertedSlide[] = [];
-      
-      // Handle case where no pages are generated (mock implementation)
-      if (pages.length === 0) {
-        console.log('No pages generated - using mock data for demonstration');
-        // Create a mock slide for demonstration
-        slides.push({
-          pageNumber: 1,
-          imagePath: `${presentationDir}slide_001.jpg`,
-          title: 'Mock Slide 1'
-        });
-      } else {
-        // Save each page as an image
+
+      if (PdfThumbnail) {
+        const pages = await PdfThumbnail.generateAllPages(pdfPath, 90);
+        console.log(`Generated ${pages.length} images from PDF`);
+
         for (let i = 0; i < pages.length; i++) {
           const pageNumber = i + 1;
           const imagePath = `${presentationDir}slide_${pageNumber.toString().padStart(3, '0')}.jpg`;
-          
-          // Copy the generated image to our presentation directory
+
           await FileSystem.copyAsync({
-            from: pages[i],
-            to: imagePath
+            from: pages[i].uri,
+            to: imagePath,
           });
 
           slides.push({
             pageNumber,
             imagePath,
-            title: `Slide ${pageNumber}`
+            title: `Page ${pageNumber}`,
           });
-
-          console.log(`Saved slide ${pageNumber} to:`, imagePath);
         }
+      } else {
+        throw new Error('PDF thumbnail module not available. Rebuild the dev client after installing react-native-pdf-thumbnail.');
       }
 
       // Save presentation metadata

@@ -5,6 +5,7 @@
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { generateUUID } from '../utils/uuid';
+import { resolveServerBrochureId } from '../utils/brochureTypeUtils';
 import { MRRecentActivity, MRUpcomingMeeting } from './MRService';
 import { appEvents, DATA_CHANGED_EVENT } from './eventService';
 
@@ -168,6 +169,7 @@ export interface LocalSavedBrochure {
   saved_at?: string;
   last_accessed?: string;
   created_at?: string;
+  updated_at?: string;
   version: number;
   sync_status: 'pending' | 'synced' | 'conflict' | 'error';
   local_changes?: string;
@@ -318,21 +320,96 @@ export class LocalDatabaseService {
   private static db: any = null;
   private static isInitialized = false;
   private static useAsyncStorage = false;
+  private static initPromise: Promise<void> | null = null;
+  private static dbQueue: Promise<unknown> = Promise.resolve();
+
+  private static resetConnectionState(): void {
+    this.isInitialized = false;
+    this.db = null;
+    this.initPromise = null;
+  }
+
+  private static isRecoverableDbError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes('NullPointerException') ||
+      message.includes('prepareAsync') ||
+      message.includes('NativeDatabase') ||
+      message.includes('Database connection')
+    );
+  }
+
+  private static enqueueDb<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.dbQueue.then(() => operation());
+    this.dbQueue = run.then(() => undefined).catch(() => undefined);
+    return run;
+  }
+
+  private static async reinitializeConnection(): Promise<void> {
+    const previousDb = this.db;
+    this.resetConnectionState();
+    if (previousDb) {
+      try {
+        await previousDb.closeAsync();
+      } catch {
+        // ignore close errors during recovery
+      }
+    }
+    await this.doInitialize();
+  }
+
+  private static async withDb<T>(operation: (db: any) => Promise<T>, allowRetry = true): Promise<T> {
+    return this.enqueueDb(async () => {
+      await this.ensureReady();
+      if (this.useAsyncStorage || !this.db) {
+        throw new Error('SQLite database unavailable');
+      }
+
+      try {
+        return await operation(this.db);
+      } catch (error) {
+        if (allowRetry && this.isRecoverableDbError(error)) {
+          console.warn('LocalDB: SQLite connection lost, reinitializing...');
+          await this.reinitializeConnection();
+          return this.withDb(operation, false);
+        }
+        throw error;
+      }
+    });
+  }
+
+  private static async runSql(sql: string, params: any[] = []): Promise<void> {
+    await this.withDb((db) => db.runAsync(sql, params));
+  }
+
+  private static async queryAllSql<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+    return this.withDb((db) => db.getAllAsync(sql, params)) as Promise<T[]>;
+  }
+
+  private static async queryFirstSql<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+    return this.withDb((db) => db.getFirstAsync(sql, params)) as Promise<T | null>;
+  }
 
   /**
    * Ensure database is initialized
    */
   private static async ensureInitialized(): Promise<void> {
-    if (!this.isInitialized) {
-      await this.initialize();
+    if (this.isInitialized && (this.useAsyncStorage || this.db)) {
+      return;
     }
+
+    if (this.isInitialized && !this.useAsyncStorage && !this.db) {
+      this.resetConnectionState();
+    }
+
+    await this.initialize();
   }
 
   /**
    * Check if we're using AsyncStorage fallback
    */
   static isUsingAsyncStorage(): boolean {
-    return this.useAsyncStorage || !this.db;
+    return this.useAsyncStorage;
   }
 
   /**
@@ -398,6 +475,31 @@ export class LocalDatabaseService {
 
   static async ensureReady(): Promise<void> {
     await this.ensureInitialized();
+    if (!this.useAsyncStorage && !this.db) {
+      this.resetConnectionState();
+      await this.initialize();
+    }
+  }
+
+  /**
+   * Initialize the local database (serialized — only one init runs at a time)
+   */
+  static async initialize(): Promise<void> {
+    if (this.isInitialized && (this.useAsyncStorage || this.db)) {
+      return;
+    }
+
+    if (this.isInitialized && !this.useAsyncStorage && !this.db) {
+      this.resetConnectionState();
+    }
+
+    if (!this.initPromise) {
+      this.initPromise = this.doInitialize().finally(() => {
+        this.initPromise = null;
+      });
+    }
+
+    await this.initPromise;
   }
 
   /**
@@ -433,19 +535,14 @@ export class LocalDatabaseService {
       }
     }
     
-    this.isInitialized = false;
+    this.resetConnectionState();
     
     // Now reinitialize with fresh tables
     console.log('LocalDB: Reinitializing database with fresh schema...');
     await this.initialize();
   }
 
-  /**
-   * Initialize the local database
-   */
-  static async initialize(): Promise<void> {
-    if (this.isInitialized) return;
-
+  private static async doInitialize(): Promise<void> {
     try {
       console.log('LocalDB: Initializing database...');
       
@@ -466,6 +563,8 @@ export class LocalDatabaseService {
         console.log('LocalDB: About to run migrations...');
         await this.migrateDbIfNeeded();
         console.log('LocalDB: Migrations completed');
+
+        await this.db.getFirstAsync('SELECT 1');
       } else {
         console.log('LocalDB: Using AsyncStorage fallback...');
         this.useAsyncStorage = true;
@@ -482,6 +581,7 @@ export class LocalDatabaseService {
       // Fall back to AsyncStorage if SQLite fails
       console.log('LocalDB: Falling back to AsyncStorage...');
       try {
+        this.db = null;
         this.useAsyncStorage = true;
         await this.initializeAsyncStorage();
         this.isInitialized = true;
@@ -490,6 +590,31 @@ export class LocalDatabaseService {
         console.error('LocalDB: AsyncStorage fallback also failed:', fallbackError);
         throw fallbackError;
       }
+    }
+  }
+
+  private static async tableExists(tableName: string): Promise<boolean> {
+    if (!this.db) return false;
+    const row = await this.db.getFirstAsync(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
+      [tableName],
+    );
+    return !!row;
+  }
+
+  private static async getTableColumnNames(tableName: string): Promise<string[]> {
+    if (!this.db) return [];
+    const columns = await this.db.getAllAsync(`PRAGMA table_info(${tableName})`);
+    return columns.map((col: { name: string }) => col.name);
+  }
+
+  private static async ensureUsersTable(): Promise<void> {
+    if (!this.db) {
+      throw new Error('Database connection is not available');
+    }
+    if (!(await this.tableExists('users'))) {
+      console.log('LocalDB: users table missing, creating tables...');
+      await this.createTables();
     }
   }
 
@@ -589,15 +714,17 @@ export class LocalDatabaseService {
    */
   private static async checkSchemaMismatch(): Promise<boolean> {
     try {
+      if (!this.db) {
+        return false;
+      }
+
       // Check if activity_logs table has the required columns
-      const activityLogsCheck = await this.db.prepareAsync(
-        'PRAGMA table_info(activity_logs)'
-      );
-      const result = await activityLogsCheck.executeAsync();
-      const columns = await result.getAllAsync();
-      await activityLogsCheck.finalizeAsync();
-      
-      const columnNames = columns.map((col: any) => col.name);
+      if (!(await this.tableExists('activity_logs'))) {
+        console.log('LocalDB: activity_logs table does not exist yet');
+        return false;
+      }
+
+      const columnNames = await this.getTableColumnNames('activity_logs');
       const requiredColumns = ['mr_id', 'brochure_id', 'action', 'details', 'metadata', 'timestamp', 'is_deleted'];
       
       const missingColumns = requiredColumns.filter(col => !columnNames.includes(col));
@@ -606,44 +733,27 @@ export class LocalDatabaseService {
         return true;
       }
       
-      // Check if other tables have required columns
-      const meetingsCheck = await this.db.prepareAsync('PRAGMA table_info(meetings)');
-      const meetingsResult = await meetingsCheck.executeAsync();
-      const meetingsColumns = await meetingsResult.getAllAsync();
-      await meetingsCheck.finalizeAsync();
-      
-      const meetingsColumnNames = meetingsColumns.map((col: any) => col.name);
-      if (!meetingsColumnNames.includes('brochure_id')) {
-        console.log('LocalDB: Missing brochure_id column in meetings table');
-        return true;
+      // Check if meetings table has required columns
+      if (await this.tableExists('meetings')) {
+        const meetingsColumnNames = await this.getTableColumnNames('meetings');
+        if (!meetingsColumnNames.includes('brochure_id')) {
+          console.log('LocalDB: Missing brochure_id column in meetings table');
+          return true;
+        }
       }
       
       // Check if brochure_sync table has is_deleted column
-      try {
-        const brochureSyncCheck = await this.db.prepareAsync('PRAGMA table_info(brochure_sync)');
-        const brochureSyncResult = await brochureSyncCheck.executeAsync();
-        const brochureSyncColumns = await brochureSyncResult.getAllAsync();
-        await brochureSyncCheck.finalizeAsync();
-        
-        const brochureSyncColumnNames = brochureSyncColumns.map((col: any) => col.name);
+      if (await this.tableExists('brochure_sync')) {
+        const brochureSyncColumnNames = await this.getTableColumnNames('brochure_sync');
         if (!brochureSyncColumnNames.includes('is_deleted')) {
           console.log('LocalDB: Missing is_deleted column in brochure_sync table');
           return true;
         }
-      } catch (error) {
-        // If table doesn't exist, schema mismatch - will be created
-        console.log('LocalDB: brochure_sync table check failed:', error);
-        return true;
       }
       
       // Check if user_sessions table has correct schema
-      try {
-        const sessionsCheck = await this.db.prepareAsync('PRAGMA table_info(user_sessions)');
-        const sessionsResult = await sessionsCheck.executeAsync();
-        const sessionsColumns = await sessionsResult.getAllAsync();
-        await sessionsCheck.finalizeAsync();
-        
-        const sessionsColumnNames = sessionsColumns.map((col: any) => col.name);
+      if (await this.tableExists('user_sessions')) {
+        const sessionsColumnNames = await this.getTableColumnNames('user_sessions');
         const expectedColumns = ['id', 'user_id', 'device_id', 'is_active', 'last_seen_at', 'created_at', 'updated_at', 'sync_status', 'local_changes'];
         const missingColumns = expectedColumns.filter((col: string) => !sessionsColumnNames.includes(col));
         const unexpectedColumns = sessionsColumnNames.filter((col: string) => !expectedColumns.includes(col));
@@ -657,16 +767,12 @@ export class LocalDatabaseService {
           console.log('LocalDB: Unexpected columns in user_sessions table (will recreate):', unexpectedColumns);
           return true;
         }
-      } catch (error) {
-        // If table doesn't exist, schema mismatch - will be created
-        console.log('LocalDB: user_sessions table check failed:', error);
-        return true;
       }
       
       return false;
     } catch (error) {
       console.log('LocalDB: Error checking schema mismatch:', error);
-      return true; // If we can't check, assume mismatch and recreate
+      return false;
     }
   }
 
@@ -996,7 +1102,9 @@ export class LocalDatabaseService {
         version INTEGER DEFAULT 1,
         sync_status TEXT DEFAULT 'pending',
         local_changes TEXT,
-        is_deleted INTEGER DEFAULT 0
+        is_deleted INTEGER DEFAULT 0,
+        created_at TEXT,
+        updated_at TEXT
       );
 
       -- Activity logs table (optional)
@@ -1413,6 +1521,21 @@ export class LocalDatabaseService {
           }
         }
       }
+
+      // Migration 6: Add updated_at/created_at to saved_brochures table
+      if (currentVersion < 6) {
+        try {
+          await this.runMigration_006();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 006 failed, but continuing:', migrationError);
+        }
+      } else {
+        try {
+          await this.ensureSavedBrochuresSchema();
+        } catch (error) {
+          console.log('LocalDB: Could not verify saved_brochures columns:', error);
+        }
+      }
       
     } catch (error) {
       console.error('LocalDB: Migration error:', error);
@@ -1784,6 +1907,74 @@ export class LocalDatabaseService {
       // The getMeetingFollowUps method will handle missing table gracefully
       console.warn('LocalDB: App will continue without meeting_followups table. Method will return empty array.');
     }
+  }
+
+  /**
+   * Ensure saved_brochures has columns required for update/delete operations.
+   */
+  private static async ensureSavedBrochuresSchema(): Promise<void> {
+    if (!this.db || this.isUsingAsyncStorage()) {
+      return;
+    }
+
+    const columns = await this.getTableColumnNames('saved_brochures');
+    const now = new Date().toISOString();
+
+    if (!columns.includes('updated_at')) {
+      await this.db.execAsync('ALTER TABLE saved_brochures ADD COLUMN updated_at TEXT');
+      await this.db.runAsync(
+        `UPDATE saved_brochures SET updated_at = COALESCE(saved_at, last_accessed, ?) WHERE updated_at IS NULL`,
+        [now],
+      );
+      console.log('LocalDB: Added updated_at to saved_brochures table');
+    }
+
+    if (!columns.includes('created_at')) {
+      await this.db.execAsync('ALTER TABLE saved_brochures ADD COLUMN created_at TEXT');
+      await this.db.runAsync(
+        `UPDATE saved_brochures SET created_at = COALESCE(saved_at, ?) WHERE created_at IS NULL`,
+        [now],
+      );
+      console.log('LocalDB: Added created_at to saved_brochures table');
+    }
+
+    if (!columns.includes('version')) {
+      await this.db.execAsync('ALTER TABLE saved_brochures ADD COLUMN version INTEGER DEFAULT 1');
+      console.log('LocalDB: Added version to saved_brochures table');
+    }
+  }
+
+  /**
+   * Migration 006: Add updated_at and created_at to saved_brochures table
+   */
+  private static async runMigration_006(): Promise<void> {
+    console.log('LocalDB: Running migration 006 - Adding updated_at/created_at to saved_brochures...');
+
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+
+    await this.ensureSavedBrochuresSchema();
+
+    try {
+      const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 6');
+      const versionResult = await versionCheck.executeAsync();
+      const versionRow = await versionResult.getFirstAsync();
+      await versionCheck.finalizeAsync();
+
+      if (!versionRow) {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (6)');
+        console.log('LocalDB: Schema version updated to 6');
+      }
+    } catch {
+      try {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (6)');
+      } catch {
+        console.log('LocalDB: Schema version 6 already exists');
+      }
+    }
+
+    console.log('LocalDB: Migration 006 completed');
   }
 
   // ==================== DOCTORS CRUD ====================
@@ -3984,21 +4175,61 @@ export class LocalDatabaseService {
    */
   static async createSavedBrochure(savedBrochureData: Omit<LocalSavedBrochure, 'id' | 'created_at' | 'version' | 'sync_status' | 'local_changes'>): Promise<string> {
     await this.initialize();
-    
-    const id = generateUUID();
+
+    const normalizedBrochureId = resolveServerBrochureId(savedBrochureData.brochure_id);
     const now = new Date().toISOString();
-    
-    const savedBrochure: LocalSavedBrochure = {
-      id,
-      ...savedBrochureData,
-      created_at: now,
-      version: 1,
-      sync_status: 'pending',
-      local_changes: JSON.stringify({}), // Initialize local_changes
-      is_deleted: savedBrochureData.is_deleted || false
-    };
 
     try {
+      const existing = await this.db.getFirstAsync(`
+        SELECT id, sync_status, server_id FROM saved_brochures
+        WHERE mr_id = ? AND brochure_id = ? AND is_deleted = 0
+        LIMIT 1
+      `, [savedBrochureData.mr_id, normalizedBrochureId]) as {
+        id: string;
+        sync_status: string;
+        server_id?: string;
+      } | null;
+
+      if (existing?.id) {
+        await this.db.runAsync(`
+          UPDATE saved_brochures
+          SET last_accessed = ?, updated_at = ?, custom_title = COALESCE(?, custom_title)
+          WHERE id = ?
+        `, [now, now, savedBrochureData.custom_title || null, existing.id]);
+
+        if (existing.sync_status !== 'synced' || !existing.server_id) {
+          const pendingCreate = await this.db.getFirstAsync(`
+            SELECT id FROM sync_operations
+            WHERE table_name = 'saved_brochures'
+              AND record_id = ?
+              AND operation_type = 'create'
+              AND status IN ('pending', 'failed')
+          `, [existing.id]);
+
+          if (!pendingCreate) {
+            const record = await this.getSavedBrochureRecordById(existing.id);
+            if (record) {
+              await this.addToSyncQueue('create', 'saved_brochures', existing.id, record);
+            }
+          }
+        }
+
+        console.log('LocalDB: Reused existing saved brochure:', existing.id);
+        return existing.id;
+      }
+
+      const id = generateUUID();
+      const savedBrochure: LocalSavedBrochure = {
+        id,
+        ...savedBrochureData,
+        brochure_id: normalizedBrochureId,
+        created_at: now,
+        version: 1,
+        sync_status: 'pending',
+        local_changes: JSON.stringify({}),
+        is_deleted: savedBrochureData.is_deleted || false,
+      };
+
       await this.db.runAsync(`
         INSERT INTO saved_brochures (
           id, server_id, mr_id, brochure_id, brochure_title, custom_title, original_brochure_data, saved_at, last_accessed, version, sync_status, local_changes, is_deleted
@@ -4010,7 +4241,6 @@ export class LocalDatabaseService {
         savedBrochure.is_deleted ? 1 : 0
       ]);
 
-      // Add to sync queue
       await this.addToSyncQueue('create', 'saved_brochures', id, savedBrochure);
       
       // Create activity log for brochure saving
@@ -4105,6 +4335,25 @@ export class LocalDatabaseService {
     try {
       const skipSyncQueue = updates.skipSyncQueue || false;
       const { skipSyncQueue: _, ...updateData } = updates;
+      const syncStatus =
+        updateData.sync_status ?? (skipSyncQueue ? undefined : 'pending');
+
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('saved_brochures');
+        const brochures: LocalSavedBrochure[] = data ? JSON.parse(data) : [];
+        const index = brochures.findIndex((brochure) => brochure.id === id);
+        if (index >= 0) {
+          brochures[index] = {
+            ...brochures[index],
+            ...updateData,
+            updated_at: new Date().toISOString(),
+          } as LocalSavedBrochure;
+          await AsyncStorage.setItem('saved_brochures', JSON.stringify(brochures));
+        }
+        return;
+      }
+
+      await this.ensureSavedBrochuresSchema();
       
       const now = new Date().toISOString();
       const updateFields = [];
@@ -4112,14 +4361,21 @@ export class LocalDatabaseService {
 
       // Build dynamic update query
       Object.entries(updateData).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at') {
+        if (key !== 'id' && key !== 'created_at' && key !== 'sync_status') {
           updateFields.push(`${key} = ?`);
           values.push(value);
         }
       });
 
-      updateFields.push('updated_at = ?', 'version = version + 1', 'sync_status = ?');
-      values.push(now, 'pending', id);
+      updateFields.push('updated_at = ?', 'version = version + 1');
+      values.push(now);
+
+      if (syncStatus !== undefined) {
+        updateFields.push('sync_status = ?');
+        values.push(syncStatus);
+      }
+
+      values.push(id);
 
       await this.db.runAsync(`
         UPDATE saved_brochures SET ${updateFields.join(', ')} WHERE id = ?
@@ -4147,29 +4403,47 @@ export class LocalDatabaseService {
     await this.initialize();
     
     try {
-      const existing = await this.getSavedBrochureById(savedBrochure.id);
+      const canonicalBrochureId = resolveServerBrochureId(savedBrochure.brochure_id);
+      const rows = await this.db.getAllAsync(`
+        SELECT * FROM saved_brochures WHERE mr_id = ?
+      `, [savedBrochure.mr_id]) as LocalSavedBrochure[];
+
+      const existingByBrochure = rows.find(
+        (row) => resolveServerBrochureId(row.brochure_id) === canonicalBrochureId,
+      ) || null;
+
+      if (existingByBrochure?.is_deleted === true || (existingByBrochure as { is_deleted?: number })?.is_deleted === 1) {
+        console.log('LocalDB: Skipping upsert for locally deleted saved brochure:', canonicalBrochureId);
+        return;
+      }
+
+      const normalizedRecord = {
+        ...savedBrochure,
+        brochure_id: canonicalBrochureId,
+      };
+
+      const targetId = existingByBrochure?.id || savedBrochure.id;
+      const existing = existingByBrochure || await this.getSavedBrochureById(targetId);
       
       if (existing) {
-        // Update existing record without queuing
         const now = new Date().toISOString();
         const updateFields = [];
         const values = [];
 
-        Object.entries(savedBrochure).forEach(([key, value]) => {
+        Object.entries({ ...normalizedRecord, id: targetId }).forEach(([key, value]) => {
           if (key !== 'id' && key !== 'created_at' && key !== 'local_changes') {
             updateFields.push(`${key} = ?`);
             values.push(value);
           }
         });
 
-        updateFields.push('updated_at = ?', 'version = version + 1');
-        values.push(now, savedBrochure.id);
+        updateFields.push('updated_at = ?', 'version = version + 1', 'is_deleted = 0');
+        values.push(now, targetId);
 
         await this.db.runAsync(`
           UPDATE saved_brochures SET ${updateFields.join(', ')} WHERE id = ?
         `, values);
       } else {
-        // Create new record directly without queuing
         const now = new Date().toISOString();
         await this.db.runAsync(`
           INSERT INTO saved_brochures (
@@ -4177,19 +4451,19 @@ export class LocalDatabaseService {
             original_brochure_data, saved_at, last_accessed, version, sync_status, is_deleted, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
-          savedBrochure.id,
-          savedBrochure.server_id || null,
-          savedBrochure.mr_id,
-          savedBrochure.brochure_id,
-          savedBrochure.brochure_title,
-          savedBrochure.custom_title,
-          savedBrochure.original_brochure_data,
-          savedBrochure.saved_at || now,
-          savedBrochure.last_accessed || now,
-          savedBrochure.version || 1,
-          savedBrochure.sync_status || 'synced',
-          savedBrochure.is_deleted ? 1 : 0,
-          savedBrochure.created_at || now
+          normalizedRecord.id,
+          normalizedRecord.server_id || null,
+          normalizedRecord.mr_id,
+          canonicalBrochureId,
+          normalizedRecord.brochure_title,
+          normalizedRecord.custom_title,
+          normalizedRecord.original_brochure_data,
+          normalizedRecord.saved_at || now,
+          normalizedRecord.last_accessed || now,
+          normalizedRecord.version || 1,
+          normalizedRecord.sync_status || 'synced',
+          normalizedRecord.is_deleted ? 1 : 0,
+          normalizedRecord.created_at || now
         ]);
       }
       
@@ -4200,13 +4474,93 @@ export class LocalDatabaseService {
     }
   }
 
+  static async applyServerSavedBrochureDeletion(
+    mrId: string,
+    serverId: string,
+    canonicalBrochureId: string,
+  ): Promise<void> {
+    await this.initialize();
+
+    if (this.isUsingAsyncStorage() || !this.db) {
+      return;
+    }
+
+    const record = await this.db.getFirstAsync(`
+      SELECT id FROM saved_brochures
+      WHERE mr_id = ?
+        AND is_deleted = 0
+        AND (server_id = ? OR brochure_id = ? OR brochure_id LIKE ?)
+      LIMIT 1
+    `, [mrId, serverId, canonicalBrochureId, `${canonicalBrochureId}_%`]) as { id: string } | null;
+
+    if (!record?.id) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    await this.db.runAsync(`
+      UPDATE saved_brochures
+      SET is_deleted = 1, sync_status = 'synced', updated_at = ?, server_id = COALESCE(server_id, ?)
+      WHERE id = ?
+    `, [now, serverId || null, record.id]);
+  }
+
   /**
    * Delete saved brochure (soft delete)
    */
+  static async getSavedBrochureRecordById(id: string): Promise<LocalSavedBrochure | null> {
+    await this.initialize();
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('saved_brochures');
+        const brochures: LocalSavedBrochure[] = data ? JSON.parse(data) : [];
+        const record = brochures.find((brochure) => brochure.id === id);
+        return record
+          ? { ...record, is_deleted: Boolean(record.is_deleted) }
+          : null;
+      }
+
+      const result = await this.db.getFirstAsync(`
+        SELECT * FROM saved_brochures WHERE id = ?
+      `, [id]);
+
+      if (!result) return null;
+
+      return {
+        ...result,
+        is_deleted: Boolean(result.is_deleted),
+      } as LocalSavedBrochure;
+    } catch (error) {
+      console.error('LocalDB: Failed to get saved brochure record by ID:', error);
+      throw error;
+    }
+  }
+
   static async deleteSavedBrochure(id: string): Promise<void> {
     await this.initialize();
     
     try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('saved_brochures');
+        const brochures: LocalSavedBrochure[] = data ? JSON.parse(data) : [];
+        const existing = brochures.find((brochure) => brochure.id === id);
+        const updated = brochures.filter((brochure) => brochure.id !== id);
+        await AsyncStorage.setItem('saved_brochures', JSON.stringify(updated));
+        if (existing) {
+          await this.addToSyncQueue('delete', 'saved_brochures', id, {
+            server_id: existing.server_id,
+            mr_id: existing.mr_id,
+            brochure_id: resolveServerBrochureId(existing.brochure_id),
+            is_deleted: true,
+          });
+        }
+        console.log('LocalDB: Saved brochure deleted from AsyncStorage:', id);
+        return;
+      }
+
+      await this.ensureSavedBrochuresSchema();
+      const existing = await this.getSavedBrochureRecordById(id);
       const now = new Date().toISOString();
       
       await this.db.runAsync(`
@@ -4215,12 +4569,45 @@ export class LocalDatabaseService {
         WHERE id = ?
       `, [now, 'pending', id]);
 
-      // Add to sync queue
-      await this.addToSyncQueue('delete', 'saved_brochures', id, { id, is_deleted: true });
+      // Add to sync queue with fields required by /api/sync/push/
+      await this.addToSyncQueue('delete', 'saved_brochures', id, {
+        server_id: existing?.server_id,
+        mr_id: existing?.mr_id,
+        brochure_id: resolveServerBrochureId(existing?.brochure_id || ''),
+        is_deleted: true,
+      });
       
       console.log('LocalDB: Saved brochure deleted:', id);
     } catch (error) {
       console.error('LocalDB: Failed to delete saved brochure:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete saved brochure by MR and brochure ID (fallback when local record id is unknown)
+   */
+  static async deleteSavedBrochureByMrAndBrochure(mrId: string, brochureId: string): Promise<void> {
+    await this.initialize();
+
+    try {
+      const canonicalBrochureId = resolveServerBrochureId(brochureId);
+      const rows = await this.db.getAllAsync(`
+        SELECT id, brochure_id FROM saved_brochures
+        WHERE mr_id = ? AND is_deleted = 0
+      `, [mrId]) as Array<{ id: string; brochure_id: string }>;
+
+      const existing = rows.find(
+        (row) => resolveServerBrochureId(row.brochure_id) === canonicalBrochureId,
+      );
+
+      if (!existing?.id) {
+        return;
+      }
+
+      await this.deleteSavedBrochure(existing.id);
+    } catch (error) {
+      console.error('LocalDB: Failed to delete saved brochure by mr/brochure:', error);
       throw error;
     }
   }
@@ -4385,7 +4772,7 @@ export class LocalDatabaseService {
    * Add operation to sync queue
    */
   static async addToSyncQueue(operation: 'create' | 'update' | 'delete', tableName: string, recordId: string, data: any): Promise<void> {
-    await this.initialize();
+    await this.ensureReady();
     
     const queueId = generateUUID();
     const now = new Date().toISOString();
@@ -4401,11 +4788,27 @@ export class LocalDatabaseService {
       }
 
     try {
+      if (!this.isUsingAsyncStorage()) {
+        await this.runSql(`
+          UPDATE sync_operations
+          SET status = 'completed', error_message = 'superseded'
+          WHERE table_name = ? AND record_id = ? AND operation_type = ?
+            AND status IN ('pending', 'failed')
+        `, [tableName, recordId, operation]);
+      }
+
       if (this.isUsingAsyncStorage()) {
-        // Use AsyncStorage fallback
         const syncData = await AsyncStorage.getItem('sync_operations');
-        const syncOps = syncData ? JSON.parse(syncData) : [];
-        syncOps.push({
+        const syncOps: SyncOperation[] = syncData ? JSON.parse(syncData) : [];
+        const superseded = syncOps.map((op) =>
+          op.table_name === tableName &&
+          op.record_id === recordId &&
+          op.operation_type === operation &&
+          (op.status === 'pending' || op.status === 'failed')
+            ? { ...op, status: 'completed' as const, error_message: 'superseded' }
+            : op,
+        );
+        superseded.push({
           id: queueId,
           operation_type: operation,
           table_name: tableName,
@@ -4413,19 +4816,20 @@ export class LocalDatabaseService {
           data: data,
           timestamp: now,
           status: 'pending',
-          retry_count: 0
+          retry_count: 0,
         });
-        await AsyncStorage.setItem('sync_operations', JSON.stringify(syncOps));
-        console.log('✅ SYNC QUEUE DEBUG: Successfully added to AsyncStorage sync queue - Queue ID:', queueId, 'Total items:', syncOps.length);
+        await AsyncStorage.setItem('sync_operations', JSON.stringify(superseded));
+        console.log('✅ SYNC QUEUE DEBUG: Successfully added to AsyncStorage sync queue - Queue ID:', queueId, 'Total items:', superseded.length);
       } else {
-        // Use SQLite
-      await this.db.runAsync(`
+        await this.runSql(`
         INSERT INTO sync_operations (id, operation_type, table_name, record_id, data, timestamp, status, retry_count)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)
       `, [queueId, operation, tableName, recordId, JSON.stringify(data), now]);
       
-      // Get current queue size for logging
-      const queueSizeResult = await this.db.getAllAsync('SELECT COUNT(*) as count FROM sync_operations WHERE status = ?', ['pending']);
+      const queueSizeResult = await this.queryAllSql<{ count: number }>(
+        'SELECT COUNT(*) as count FROM sync_operations WHERE status = ?',
+        ['pending'],
+      );
       const queueSize = queueSizeResult?.[0]?.count || 0;
       console.log('✅ SYNC QUEUE DEBUG: Successfully added to SQLite sync queue - Queue ID:', queueId, 'Current pending queue size:', queueSize);
       }
@@ -4441,16 +4845,20 @@ export class LocalDatabaseService {
    * Get pending sync operations
    */
   static async getPendingSyncOperations(): Promise<SyncOperation[]> {
-    await this.initialize();
-    
+    await this.ensureReady();
+
     try {
-      const result = await this.db.getAllAsync(`
+      if (this.useAsyncStorage) {
+        const data = await AsyncStorage.getItem('sync_operations');
+        const ops: SyncOperation[] = data ? JSON.parse(data) : [];
+        return ops.filter((op) => op.status === 'pending' || op.status === 'failed');
+      }
+
+      return await this.queryAllSql<SyncOperation>(`
         SELECT * FROM sync_operations 
-        WHERE status = 'pending' 
+        WHERE status IN ('pending', 'failed')
         ORDER BY timestamp ASC
       `);
-
-      return result as SyncOperation[];
     } catch (error) {
       console.error('LocalDB: Failed to get pending sync operations:', error);
       throw error;
@@ -4458,15 +4866,81 @@ export class LocalDatabaseService {
   }
 
   /**
+   * Re-queue saved brochure deletes that are still pending locally.
+   * Also resets previously failed delete operations so manual sync can retry them.
+   */
+  static async reconcileSavedBrochureDeleteSync(mrId: string): Promise<number> {
+    await this.ensureReady();
+
+    if (this.useAsyncStorage) {
+      return 0;
+    }
+
+    try {
+      await this.runSql(`
+        UPDATE sync_operations
+        SET status = 'pending', error_message = NULL
+        WHERE table_name = 'saved_brochures'
+          AND operation_type = 'delete'
+          AND status = 'failed'
+      `);
+
+      const deletedRecords = await this.queryAllSql<LocalSavedBrochure>(`
+        SELECT * FROM saved_brochures
+        WHERE mr_id = ? AND is_deleted = 1 AND sync_status = 'pending'
+      `, [mrId]);
+
+      let requeued = 0;
+      for (const record of deletedRecords) {
+        const existingOp = await this.queryFirstSql<{ id: string }>(`
+          SELECT id FROM sync_operations
+          WHERE table_name = 'saved_brochures'
+            AND record_id = ?
+            AND operation_type = 'delete'
+            AND status IN ('pending', 'failed')
+        `, [record.id]);
+
+        if (!existingOp) {
+          await this.addToSyncQueue('delete', 'saved_brochures', record.id, {
+            server_id: record.server_id,
+            mr_id: record.mr_id,
+            brochure_id: resolveServerBrochureId(record.brochure_id),
+            is_deleted: true,
+          });
+          requeued++;
+        }
+      }
+
+      if (requeued > 0) {
+        console.log(`LocalDB: Re-queued ${requeued} saved brochure delete sync operation(s)`);
+      }
+
+      return requeued;
+    } catch (error) {
+      console.error('LocalDB: Failed to reconcile saved brochure delete sync:', error);
+      return 0;
+    }
+  }
+
+  /**
    * Mark sync operation as completed
    */
   static async markOperationCompleted(operationId: string): Promise<void> {
-    await this.initialize();
+    await this.ensureReady();
     
     try {
-      await this.db.runAsync(`
-        UPDATE sync_operations SET status = 'completed' WHERE id = ?
-      `, [operationId]);
+      if (this.useAsyncStorage) {
+        const data = await AsyncStorage.getItem('sync_operations');
+        const ops: SyncOperation[] = data ? JSON.parse(data) : [];
+        const updated = ops.map((op) =>
+          op.id === operationId ? { ...op, status: 'completed' as const } : op,
+        );
+        await AsyncStorage.setItem('sync_operations', JSON.stringify(updated));
+      } else {
+        await this.runSql(`
+          UPDATE sync_operations SET status = 'completed' WHERE id = ?
+        `, [operationId]);
+      }
 
       console.log('LocalDB: Sync operation completed:', operationId);
     } catch (error) {
@@ -4479,14 +4953,30 @@ export class LocalDatabaseService {
    * Mark sync operation as failed
    */
   static async markOperationFailed(operationId: string, errorMessage: string): Promise<void> {
-    await this.initialize();
+    await this.ensureReady();
     
     try {
-      await this.db.runAsync(`
-        UPDATE sync_operations 
-        SET status = 'failed', error_message = ?, retry_count = retry_count + 1 
-        WHERE id = ?
-      `, [errorMessage, operationId]);
+      if (this.useAsyncStorage) {
+        const data = await AsyncStorage.getItem('sync_operations');
+        const ops: SyncOperation[] = data ? JSON.parse(data) : [];
+        const updated = ops.map((op) =>
+          op.id === operationId
+            ? {
+                ...op,
+                status: 'failed' as const,
+                error_message: errorMessage,
+                retry_count: (op.retry_count || 0) + 1,
+              }
+            : op,
+        );
+        await AsyncStorage.setItem('sync_operations', JSON.stringify(updated));
+      } else {
+        await this.runSql(`
+          UPDATE sync_operations 
+          SET status = 'failed', error_message = ?, retry_count = retry_count + 1 
+          WHERE id = ?
+        `, [errorMessage, operationId]);
+      }
 
       console.log('LocalDB: Sync operation failed:', operationId, errorMessage);
     } catch (error) {
@@ -4516,11 +5006,147 @@ export class LocalDatabaseService {
   /**
    * Get sync statistics
    */
-  static async getSyncStats(): Promise<{ pending: number; failed: number; completed: number }> {
-    await this.initialize();
-    
+  /**
+   * Remove queue items that already completed on the server/local DB.
+   */
+  static async cleanupStaleSyncOperations(): Promise<number> {
+    await this.ensureReady();
+
+    if (this.useAsyncStorage) {
+      return 0;
+    }
+
+    let cleaned = 0;
+
     try {
-      if (this.isUsingAsyncStorage()) {
+      cleaned += await this.dedupePendingSyncOperations();
+
+      const ops = await this.queryAllSql<SyncOperation>(`
+        SELECT * FROM sync_operations
+        WHERE status IN ('pending', 'failed')
+      `);
+
+      for (const op of ops) {
+        let stale = false;
+
+        if (op.table_name === 'saved_brochures') {
+          const record = await this.getSavedBrochureRecordById(op.record_id);
+          if (!record) {
+            stale = true;
+          } else if (op.operation_type === 'create' && record.sync_status === 'synced' && !!record.server_id) {
+            stale = true;
+          } else if (op.operation_type === 'delete' && record.is_deleted && record.sync_status === 'synced') {
+            stale = true;
+          } else if (op.operation_type === 'update' && record.sync_status === 'synced') {
+            stale = true;
+          }
+        }
+
+        if (stale) {
+          await this.markOperationCompleted(op.id);
+          cleaned++;
+        }
+      }
+
+      if (cleaned > 0) {
+        console.log(`LocalDB: Cleaned ${cleaned} stale sync operation(s)`);
+      }
+    } catch (error) {
+      console.error('LocalDB: Failed to cleanup stale sync operations:', error);
+    }
+
+    return cleaned;
+  }
+
+  /**
+   * Keep only the newest pending/failed queue item per record + operation.
+   */
+  static async dedupePendingSyncOperations(): Promise<number> {
+    await this.ensureReady();
+
+    if (this.useAsyncStorage) {
+      return 0;
+    }
+
+    let deduped = 0;
+
+    try {
+      const groups = await this.queryAllSql<{
+        table_name: string;
+        record_id: string;
+        operation_type: string;
+      }>(`
+        SELECT table_name, record_id, operation_type
+        FROM sync_operations
+        WHERE status IN ('pending', 'failed')
+        GROUP BY table_name, record_id, operation_type
+        HAVING COUNT(*) > 1
+      `);
+
+      for (const group of groups) {
+        const ops = await this.queryAllSql<SyncOperation>(`
+          SELECT * FROM sync_operations
+          WHERE table_name = ? AND record_id = ? AND operation_type = ?
+            AND status IN ('pending', 'failed')
+          ORDER BY timestamp DESC
+        `, [group.table_name, group.record_id, group.operation_type]);
+
+        for (let i = 1; i < ops.length; i++) {
+          await this.markOperationCompleted(ops[i].id);
+          deduped++;
+        }
+      }
+
+      if (deduped > 0) {
+        console.log(`LocalDB: Deduped ${deduped} redundant sync operation(s)`);
+      }
+    } catch (error) {
+      console.error('LocalDB: Failed to dedupe pending sync operations:', error);
+    }
+
+    return deduped;
+  }
+
+  /**
+   * Pending changes that still need upload — excludes already-synced queue items.
+   */
+  static async getActionableSyncStats(): Promise<{ pending: number; failed: number; completed: number }> {
+    try {
+      await this.cleanupStaleSyncOperations();
+      await this.ensureReady();
+
+      if (this.useAsyncStorage) {
+        const data = await AsyncStorage.getItem('sync_operations');
+        const ops: SyncOperation[] = data ? JSON.parse(data) : [];
+        const pending = ops.filter((op) => op.status === 'pending' || op.status === 'failed').length;
+        return { pending, failed: 0, completed: 0 };
+      }
+
+      const tableRow = await this.queryFirstSql<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
+        ['sync_operations'],
+      );
+      if (!tableRow) {
+        return { pending: 0, failed: 0, completed: 0 };
+      }
+
+      const result = await this.queryFirstSql<{ count: number }>(`
+        SELECT COUNT(*) as count
+        FROM sync_operations
+        WHERE status IN ('pending', 'failed')
+      `);
+
+      const pending = result?.count || 0;
+      return { pending, failed: 0, completed: 0 };
+    } catch (error) {
+      console.error('LocalDB: Failed to get actionable sync stats:', error);
+      return { pending: 0, failed: 0, completed: 0 };
+    }
+  }
+
+  static async getSyncStats(retry = true): Promise<{ pending: number; failed: number; completed: number }> {
+    try {
+      if (this.useAsyncStorage) {
         const data = await AsyncStorage.getItem('sync_operations');
         const ops: SyncOperation[] = data ? JSON.parse(data) : [];
         const stats = { pending: 0, failed: 0, completed: 0 };
@@ -4532,22 +5158,30 @@ export class LocalDatabaseService {
         return stats;
       }
 
-      const result = await this.db.getAllAsync(`
-        SELECT 
-          status,
-          COUNT(*) as count
+      const result = await this.queryAllSql<{ status: string; count: number }>(`
+        SELECT status, COUNT(*) as count
         FROM sync_operations 
         GROUP BY status
       `);
 
       const stats = { pending: 0, failed: 0, completed: 0 };
-      result.forEach((row: any) => {
-        stats[row.status as keyof typeof stats] = row.count;
+      result.forEach((row) => {
+        if (row.status === 'pending') stats.pending = row.count;
+        else if (row.status === 'failed') stats.failed = row.count;
+        else if (row.status === 'completed') stats.completed = row.count;
       });
 
       return stats;
     } catch (error) {
       console.error('LocalDB: Failed to get sync stats:', error);
+      if (retry) {
+        try {
+          await this.reinitializeConnection();
+          return this.getSyncStats(false);
+        } catch (reinitError) {
+          console.error('LocalDB: Failed to recover database for sync stats:', reinitError);
+        }
+      }
       return { pending: 0, failed: 0, completed: 0 };
     }
   }
@@ -4972,6 +5606,90 @@ export class LocalDatabaseService {
     ]);
   }
 
+  /**
+   * Replace local available brochures with the current server list.
+   * Brochures removed on the server are marked inactive locally.
+   */
+  static async syncBrochuresFromServer(
+    serverBrochures: Array<{
+      id?: string
+      brochure_id?: string
+      title: string
+      category?: string
+      description?: string
+      file_url?: string
+      thumbnail_url?: string
+      file_name?: string
+      file_type?: string
+      view_count?: number
+      download_count?: number
+      uploaded_by_name?: string
+      created_at?: string
+      updated_at?: string
+    }>,
+  ): Promise<void> {
+    await this.initialize()
+    const now = new Date().toISOString()
+    const serverIds = new Set<string>()
+
+    for (const brochure of serverBrochures) {
+      const id = brochure.brochure_id || brochure.id
+      if (!id) continue
+      serverIds.add(id)
+
+      await this.upsertBrochure({
+        id,
+        title: brochure.title,
+        category: brochure.category || 'General',
+        description: brochure.description,
+        file_url: brochure.file_url || '',
+        thumbnail_url: brochure.thumbnail_url,
+        file_name: brochure.file_name,
+        file_type: brochure.file_type,
+        pages: undefined,
+        file_size: undefined,
+        status: 'active',
+        assigned_by: brochure.uploaded_by_name,
+        download_count: brochure.download_count || 0,
+        view_count: brochure.view_count || 0,
+        created_at: brochure.created_at || now,
+        updated_at: brochure.updated_at || now,
+        uploaded_by: brochure.uploaded_by_name,
+        is_public: true,
+        tags: undefined,
+        version: '1',
+        category_id: undefined,
+        sync_status: 'synced',
+        local_changes: null,
+        last_synced_at: now,
+        needs_sync: false,
+      })
+    }
+
+    if (this.isUsingAsyncStorage()) {
+      const data = await AsyncStorage.getItem('brochures')
+      const brochures: LocalBrochure[] = data ? JSON.parse(data) : []
+      const updated = brochures.map((brochure) => ({
+        ...brochure,
+        status: serverIds.has(brochure.id) ? 'active' : 'inactive',
+        updated_at: now,
+      }))
+      await AsyncStorage.setItem('brochures', JSON.stringify(updated))
+      return
+    }
+
+    if (serverIds.size === 0) {
+      await this.db.runAsync(`UPDATE brochures SET status = 'inactive', updated_at = ?`, [now])
+      return
+    }
+
+    const placeholders = Array.from(serverIds).map(() => '?').join(', ')
+    await this.db.runAsync(
+      `UPDATE brochures SET status = 'inactive', updated_at = ? WHERE id NOT IN (${placeholders})`,
+      [now, ...Array.from(serverIds)],
+    )
+  }
+
   // ==================== DOCTOR ASSIGNMENTS CRUD ====================
 
   static async upsertDoctorAssignment(assignment: LocalDoctorAssignment): Promise<void> {
@@ -5232,9 +5950,10 @@ export class LocalDatabaseService {
     }
     
     try {
+      await this.ensureUsersTable();
       await this.db.runAsync(`
         INSERT INTO users (id, email, role, first_name, last_name, phone, profile_image_url, is_active, created_at, updated_at, sync_status, local_changes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           email = excluded.email,
           role = excluded.role,
@@ -5263,7 +5982,11 @@ export class LocalDatabaseService {
       console.log('✅ USER PROFILE DEBUG: User profile saved to SQLite database');
     } catch (error) {
       console.error('❌ USER PROFILE DEBUG: Failed to upsert user profile:', error);
-      throw error;
+      console.log('LocalDB: Falling back to AsyncStorage for user profile');
+      this.db = null;
+      this.useAsyncStorage = true;
+      await AsyncStorage.setItem('user_profile', JSON.stringify(user));
+      console.log('✅ USER PROFILE DEBUG: User profile saved to AsyncStorage fallback');
     }
   }
 
@@ -5319,14 +6042,25 @@ export class LocalDatabaseService {
       await AsyncStorage.setItem(`user_credentials_${email}`, JSON.stringify(credentials));
       return;
     }
-    await this.db.runAsync(`
-      INSERT INTO user_credentials (user_id, email, password_hash, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET
-        email = excluded.email,
-        password_hash = excluded.password_hash,
-        updated_at = excluded.updated_at;
-    `, [userId, email, passwordHash, now]);
+    try {
+      if (!(await this.tableExists('user_credentials'))) {
+        await this.createTables();
+      }
+      await this.db.runAsync(`
+        INSERT INTO user_credentials (user_id, email, password_hash, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          email = excluded.email,
+          password_hash = excluded.password_hash,
+          updated_at = excluded.updated_at;
+      `, [userId, email, passwordHash, now]);
+    } catch (error) {
+      console.error('LocalDB: Failed to save credentials to SQLite, using AsyncStorage:', error);
+      this.db = null;
+      this.useAsyncStorage = true;
+      const credentials = { user_id: userId, email, password_hash: passwordHash, updated_at: now };
+      await AsyncStorage.setItem(`user_credentials_${email}`, JSON.stringify(credentials));
+    }
   }
 
   static async getUserCredentialsByEmail(email: string): Promise<{ user_id: string; password_hash: string } | null> {

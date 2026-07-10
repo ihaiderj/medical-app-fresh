@@ -66,7 +66,7 @@ export class ExtendedAuthService {
         userId: userResult.user.id,
         email: userResult.user.email,
         role: userResult.user.role,
-        fullName: userResult.user.full_name || '',
+        fullName: `${userResult.user.first_name} ${userResult.user.last_name}`.trim(),
         createdAt: now,
         expiresAt: now + this.OFFLINE_SESSION_DURATION,
         lastOnlineSync: now,
@@ -97,28 +97,51 @@ export class ExtendedAuthService {
    */
   static async authenticate(email: string, password: string): Promise<AuthResult> {
     try {
-      console.log('ExtendedAuth: Attempting authentication...');
+      console.log('ExtendedAuth: Attempting authentication...')
 
-      // Try online authentication first
-      if (await NetworkService.isOnline()) {
-        console.log('ExtendedAuth: Online - attempting server authentication');
-        const onlineResult = await AuthService.login(email, password);
-        
+      const isOnline = await NetworkService.isOnline()
+
+      if (isOnline) {
+        console.log('ExtendedAuth: Online - attempting server authentication')
+        const onlineResult = await AuthService.login(email, password)
+
         if (onlineResult.success && onlineResult.user) {
-          // Enable extended offline mode automatically on successful online login
-          await this.enableExtendedOfflineMode();
-          
+          await this.enableExtendedOfflineMode(password)
+
           return {
             success: true,
-            user: onlineResult.user,
-            isOfflineAuth: false
-          };
+            user: {
+              id: onlineResult.user.id,
+              email: onlineResult.user.email,
+              role: onlineResult.user.role,
+              full_name: `${onlineResult.user.first_name} ${onlineResult.user.last_name}`.trim(),
+            },
+            isOfflineAuth: false,
+          }
+        }
+
+        return {
+          success: false,
+          error: onlineResult.error || 'Invalid email or password',
         }
       }
 
-      // Fallback to offline authentication
-      console.log('ExtendedAuth: Attempting offline authentication');
-      return await this.authenticateOffline(email, password);
+      console.log('ExtendedAuth: Offline - attempting local authentication')
+      const offlineResult = await AuthService.login(email, password)
+      if (offlineResult.success && offlineResult.user) {
+        return {
+          success: true,
+          user: {
+            id: offlineResult.user.id,
+            email: offlineResult.user.email,
+            role: offlineResult.user.role,
+            full_name: `${offlineResult.user.first_name} ${offlineResult.user.last_name}`.trim(),
+          },
+          isOfflineAuth: true,
+        }
+      }
+
+      return await this.authenticateOffline(email, password)
 
     } catch (error) {
       console.error('ExtendedAuth: Authentication error:', error);

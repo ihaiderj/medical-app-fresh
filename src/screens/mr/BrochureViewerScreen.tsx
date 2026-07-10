@@ -13,6 +13,7 @@ import {
   Modal,
   TextInput,
   ActivityIndicator,
+  Platform,
 } from "react-native"
 import { PinchGestureHandler, State, GestureHandlerRootView } from 'react-native-gesture-handler'
 import { Gesture, GestureDetector } from 'react-native-gesture-handler'
@@ -22,6 +23,22 @@ import { StatusBar } from "expo-status-bar"
 import * as ScreenOrientation from 'expo-screen-orientation'
 import { PDFConversionService, PresentationData } from "../../services/pdfConversionService"
 import { getModalWidth, getModalMaxHeight, getModalBorderRadius } from "../../utils/responsive"
+
+let Pdf: React.ComponentType<{
+  source: { uri: string; cache?: boolean }
+  style?: object
+  page?: number
+  onLoadComplete?: (numberOfPages: number) => void
+  onPageChanged?: (page: number) => void
+  trustAllCerts?: boolean
+}> | null = null
+if (Platform.OS !== 'web') {
+  try {
+    Pdf = require('react-native-pdf').default
+  } catch {
+    console.warn('react-native-pdf not available')
+  }
+}
 
 interface BrochureViewerScreenProps {
   navigation: any
@@ -48,6 +65,8 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
   const [dimensions, setDimensions] = useState(Dimensions.get('window'))
   const [showNotesModal, setShowNotesModal] = useState(false)
   const [noteText, setNoteText] = useState('')
+  const [useDirectPdfViewer, setUseDirectPdfViewer] = useState(false)
+  const [pdfPageCount, setPdfPageCount] = useState(0)
   
   // Zoom functionality
   const scale = useRef(new Animated.Value(1)).current
@@ -118,8 +137,28 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
     try {
       setIsLoading(true)
       console.log('Loading converted presentation for brochure:', brochureId)
-      
-      const presentationData = await PDFConversionService.getPresentationData(brochureId.toString())
+
+      let presentationData = await PDFConversionService.getPresentationData(brochureId.toString())
+
+      if (!presentationData && brochureFile && (
+        brochureFile.toLowerCase().endsWith('.pdf') || brochureFile.includes('.pdf')
+      )) {
+        console.log('No converted presentation found, converting PDF on demand:', brochureFile)
+        try {
+          presentationData = await PDFConversionService.convertPDFToImages(
+            brochureId.toString(),
+            brochureTitle || 'Brochure',
+            brochureFile,
+          )
+        } catch (conversionError) {
+          console.warn('PDF conversion failed, using direct PDF viewer:', conversionError)
+          if (Pdf) {
+            setUseDirectPdfViewer(true)
+            setIsLoading(false)
+            return
+          }
+        }
+      }
       
       if (presentationData) {
         console.log('Found converted presentation:', presentationData)
@@ -138,12 +177,20 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
         console.log('Loaded slides:', convertedSlides.length)
         console.log('First slide:', convertedSlides[0])
       } else {
-        console.log('No converted presentation found, creating fallback slides')
-        createFallbackSlides()
+        console.log('No converted presentation found')
+        if (brochureFile && (brochureFile.toLowerCase().endsWith('.pdf') || brochureFile.includes('.pdf')) && Pdf) {
+          setUseDirectPdfViewer(true)
+        } else {
+          createFallbackSlides()
+        }
       }
     } catch (error) {
       console.error('Failed to load converted presentation:', error)
-      createFallbackSlides()
+      if (brochureFile && (brochureFile.toLowerCase().endsWith('.pdf') || brochureFile.includes('.pdf')) && Pdf) {
+        setUseDirectPdfViewer(true)
+      } else {
+        createFallbackSlides()
+      }
     } finally {
       setIsLoading(false)
     }
@@ -414,8 +461,35 @@ export default function BrochureViewerScreen({ navigation, route }: BrochureView
           ]}>
             {isLoading ? (
               <View style={styles.loadingContainer}>
-                <Text style={styles.loadingText}>Loading PDF Images...</Text>
+                <Text style={styles.loadingText}>Loading PDF...</Text>
               </View>
+            ) : useDirectPdfViewer && Pdf && brochureFile ? (
+              <>
+                <Pdf
+                  source={{ uri: brochureFile, cache: true }}
+                  style={[
+                    styles.mainSlideImage,
+                    currentOrientation === 'portrait' ? styles.mainSlideImagePortrait : styles.mainSlideImageLandscape,
+                  ]}
+                  page={selectedSlideIndex + 1}
+                  trustAllCerts={false}
+                  onLoadComplete={(numberOfPages) => {
+                    setPdfPageCount(numberOfPages)
+                    setSlides(Array.from({ length: numberOfPages }, (_, i) => ({
+                      id: `pdf-page-${i + 1}`,
+                      title: `Page ${i + 1}`,
+                      image: '',
+                      pageNumber: i + 1,
+                    })))
+                  }}
+                  onPageChanged={(page) => setSelectedSlideIndex(page - 1)}
+                />
+                <View style={styles.slideCounterOverlay}>
+                  <Text style={styles.slideCounterText}>
+                    {selectedSlideIndex + 1} / {pdfPageCount || '?'}
+                  </Text>
+                </View>
+              </>
             ) : currentSlide ? (
               <>
                 <Image 

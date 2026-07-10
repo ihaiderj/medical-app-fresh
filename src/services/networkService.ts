@@ -18,6 +18,15 @@ export class NetworkService {
     isInternetReachable: false
   };
 
+  /** NetInfo often reports null for isInternetReachable on Android while connected */
+  private static isReachable(isInternetReachable: boolean | null | undefined): boolean {
+    return isInternetReachable !== false;
+  }
+
+  private static isOnlineState(state: { isConnected?: boolean | null; isInternetReachable?: boolean | null }): boolean {
+    return (state.isConnected ?? false) && this.isReachable(state.isInternetReachable);
+  }
+
   /**
    * Initialize network monitoring
    */
@@ -28,7 +37,7 @@ export class NetworkService {
       this.currentState = {
         isConnected: state.isConnected ?? false,
         type: state.type,
-        isInternetReachable: state.isInternetReachable ?? false
+        isInternetReachable: this.isReachable(state.isInternetReachable)
       };
 
       // Set up network state listener
@@ -36,11 +45,11 @@ export class NetworkService {
         const newState: NetworkState = {
           isConnected: state.isConnected ?? false,
           type: state.type,
-          isInternetReachable: state.isInternetReachable ?? false
+          isInternetReachable: this.isReachable(state.isInternetReachable)
         };
 
-        const wasOnline = this.currentState.isConnected && this.currentState.isInternetReachable;
-        const isNowOnline = newState.isConnected && newState.isInternetReachable;
+        const wasOnline = this.isOnlineState(this.currentState);
+        const isNowOnline = this.isOnlineState(newState);
 
         this.currentState = newState;
 
@@ -65,7 +74,7 @@ export class NetworkService {
   static async isOnline(): Promise<boolean> {
     try {
       const state = await NetInfo.fetch();
-      return (state.isConnected ?? false) && (state.isInternetReachable ?? false);
+      return this.isOnlineState(state);
     } catch (error) {
       console.error('Network: Failed to check online status:', error);
       return false;
@@ -107,7 +116,7 @@ export class NetworkService {
   static async waitForConnection(timeoutMs: number = 30000): Promise<boolean> {
     return new Promise((resolve) => {
       // Check if already online
-      if (this.currentState.isConnected && this.currentState.isInternetReachable) {
+      if (this.isOnlineState(this.currentState)) {
         resolve(true);
         return;
       }
@@ -119,7 +128,7 @@ export class NetworkService {
 
       // Listen for connection
       const unsubscribe = this.addListener((state) => {
-        if (state.isConnected && state.isInternetReachable) {
+        if (this.isOnlineState(state)) {
           clearTimeout(timeout);
           unsubscribe();
           resolve(true);

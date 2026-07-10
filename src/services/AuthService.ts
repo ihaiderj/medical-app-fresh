@@ -1,4 +1,5 @@
 import { apiClient, ApiError } from './apiClient'
+import { API_BASE_URL } from '../config/apiConfig'
 import { TokenStorage } from './tokenStorage'
 import { PersistentAuthService } from './persistentAuthService'
 import { SessionManagementService } from './sessionManagementService'
@@ -69,12 +70,7 @@ export class AuthService {
         return this.handleOfflineLogin(email, password, rememberMe)
       }
 
-      const onlineResult = await this.tryApiLogin(email, password, rememberMe)
-      if (onlineResult.success) {
-        return onlineResult
-      }
-
-      return this.handleOfflineLogin(email, password, rememberMe)
+      return this.tryApiLogin(email, password, rememberMe)
     } catch (error) {
       console.log('AuthService error:', error)
       return { success: false, error: 'An unexpected error occurred' }
@@ -160,6 +156,12 @@ export class AuthService {
       return this.finalizeOnlineLogin(data.user, email, password, rememberMe)
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Invalid email or password'
+      if (message.includes('fetch') || message.includes('Network') || message.includes('Failed')) {
+        return {
+          success: false,
+          error: `Cannot reach server at ${API_BASE_URL}. Check that Django is running and your phone is on the same WiFi.`,
+        } as AuthResult
+      }
       return { success: false, error: message } as AuthResult
     }
   }

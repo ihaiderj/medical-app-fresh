@@ -6,6 +6,7 @@ import { FileStorageService } from './fileStorageService'
 import { BrochureManagementService } from './brochureManagementService'
 import { apiClient } from './apiClient'
 import { TokenStorage } from './tokenStorage'
+import { resolveServerBrochureId } from '../utils/brochureTypeUtils'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as FileSystem from 'expo-file-system'
 
@@ -93,6 +94,11 @@ export class SyncService {
 
       // Get pending operations
       await LocalDatabaseService.ensureReady()
+      await LocalDatabaseService.cleanupStaleSyncOperations()
+      const requeuedDeletes = await LocalDatabaseService.reconcileSavedBrochureDeleteSync(userId)
+      if (requeuedDeletes > 0) {
+        console.log(`🔄 SYNC UP: Re-queued ${requeuedDeletes} saved brochure delete(s)`)
+      }
       const pendingOps = await LocalDatabaseService.getPendingSyncOperations()
       
       if (pendingOps.length === 0) {
@@ -110,6 +116,7 @@ export class SyncService {
       const sortedOps = this.sortOperationsByDependency(pendingOps)
       const bulkResult = await this.syncUpViaPush(sortedOps, userId)
       if (bulkResult) {
+        await LocalDatabaseService.cleanupStaleSyncOperations()
         return bulkResult
       }
 
@@ -193,6 +200,8 @@ export class SyncService {
 
       const message = `Synced: ${synced}, Failed: ${failed}`
       console.log(`🔄 SYNC UP: Completed - ${message}`)
+
+      await LocalDatabaseService.cleanupStaleSyncOperations()
 
       this.reportProgress('Complete', message, 100, sortedOps.length, sortedOps.length)
 
@@ -536,6 +545,47 @@ export class SyncService {
     }
   }
 
+  private static async applySavedBrochureDelete(op: any, userId: string): Promise<boolean> {
+    const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
+    let brochureId = data.brochure_id as string | undefined
+    let serverId = data.server_id as string | undefined
+
+    if (!brochureId || !serverId) {
+      const local = await LocalDatabaseService.getSavedBrochureRecordById(op.record_id)
+      brochureId = brochureId || local?.brochure_id
+      serverId = serverId || local?.server_id
+    }
+
+    if (!serverId && !brochureId) {
+      const local = await LocalDatabaseService.getSavedBrochureRecordById(op.record_id)
+      if (!local?.server_id) {
+        console.log('✅ SYNC SAVED BROCHURE: Skipping server delete — record was never synced')
+        await LocalDatabaseService.updateSavedBrochure(op.record_id, {
+          sync_status: 'synced',
+          skipSyncQueue: true,
+        })
+        return true
+      }
+      console.warn('⚠️ SYNC SAVED BROCHURE: Cannot delete saved brochure without identifiers')
+      return false
+    }
+
+    const result = await MRService.removeSavedBrochureWithIdentifiers({
+      server_id: serverId,
+      brochure_id: brochureId,
+    })
+
+    if (result.success) {
+      await LocalDatabaseService.updateSavedBrochure(op.record_id, {
+        sync_status: 'synced',
+        skipSyncQueue: true,
+      })
+      return true
+    }
+
+    return false
+  }
+
   /**
    * Sync saved brochure operation
    */
@@ -547,52 +597,52 @@ export class SyncService {
       if (op.operation_type === 'create') {
         const result = await MRService.saveBrochureForMr(
           userId,
-          data.brochure_id,
-          data.custom_title
+          String(data.brochure_id || ''),
+          String(data.custom_title || data.brochure_title || ''),
         )
 
         if (result.success && result.data) {
           await LocalDatabaseService.updateSavedBrochure(op.record_id, {
             server_id: result.data.id,
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            brochure_id: resolveServerBrochureId(String(data.brochure_id || '')),
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'update') {
-        // For updates, we need brochure_id from data
-        if (!data.brochure_id) {
-          console.warn('⚠️ SYNC SAVED BROCHURE: Cannot update saved brochure without brochure_id')
+        const local = await LocalDatabaseService.getSavedBrochureRecordById(op.record_id)
+        const targetId =
+          data.server_id ||
+          local?.server_id ||
+          resolveServerBrochureId(String(data.brochure_id || local?.brochure_id || ''))
+
+        if (!targetId) {
+          console.warn('⚠️ SYNC SAVED BROCHURE: Cannot update saved brochure without server_id or brochure_id')
           return false
+        }
+
+        if (data.is_deleted) {
+          return this.applySavedBrochureDelete(op, userId)
         }
 
         const result = await MRService.updateSavedBrochureTitle(
           userId,
-          data.brochure_id,
-          data.custom_title
+          String(targetId),
+          String(data.custom_title || local?.custom_title || ''),
         )
 
         if (result.success) {
           await LocalDatabaseService.updateSavedBrochure(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'delete') {
-        if (!data.brochure_id) {
-          console.warn('⚠️ SYNC SAVED BROCHURE: Cannot delete saved brochure without brochure_id')
-          return false
-        }
-
-        const result = await MRService.removeSavedBrochureForMr(userId, data.brochure_id)
-        if (result.success) {
-          await LocalDatabaseService.updateSavedBrochure(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
-          return true
-        }
-        return false
+        return this.applySavedBrochureDelete(op, userId)
       }
       return false
     } catch (error) {
@@ -937,6 +987,22 @@ export class SyncService {
         console.error('❌ SYNC DOWN: Failed to download follow-ups:', error)
       }
 
+      // Download available brochures and sync local cache
+      this.reportProgress('Downloading', 'Downloading available brochures...', 55)
+      console.log('⬇️ SYNC DOWN: Downloading available brochures...')
+      try {
+        const brochuresResult = await MRService.getAssignedBrochures(userId)
+        if (brochuresResult.success) {
+          const brochures = brochuresResult.data || []
+          await LocalDatabaseService.syncBrochuresFromServer(brochures)
+          const { OfflineBrochureService } = await import('./offlineBrochureService')
+          await OfflineBrochureService.cacheBrochures(userId, brochures)
+          console.log(`✅ SYNC DOWN: Synced ${brochures.length} available brochures`)
+        }
+      } catch (error) {
+        console.error('❌ SYNC DOWN: Failed to download available brochures:', error)
+      }
+
       // Download saved brochures
       this.reportProgress('Downloading', 'Downloading saved brochures...', 70)
       console.log('⬇️ SYNC DOWN: Downloading saved brochures...')
@@ -946,10 +1012,10 @@ export class SyncService {
           for (const savedBrochure of savedBrochuresResult.data) {
             try {
               await LocalDatabaseService.upsertSavedBrochure({
-                id: `saved_${userId}_${savedBrochure.brochure_id}`,
+                id: `saved_${userId}_${resolveServerBrochureId(String(savedBrochure.brochure_id || ''))}`,
                 server_id: savedBrochure.id,
                 mr_id: userId,
-                brochure_id: savedBrochure.brochure_id,
+                brochure_id: resolveServerBrochureId(String(savedBrochure.brochure_id || '')),
                 brochure_title: savedBrochure.brochure_title,
                 custom_title: savedBrochure.custom_title,
                 original_brochure_data: JSON.stringify(savedBrochure.original_brochure_data),
@@ -967,6 +1033,18 @@ export class SyncService {
               errors.push(`Failed to upsert saved brochure ${savedBrochure.brochure_id}: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
+
+          // Remove saved brochures that no longer exist on the server
+          const localSaved = await LocalDatabaseService.getSavedBrochures(userId)
+          for (const localSavedBrochure of localSaved) {
+            const onServer = savedBrochuresResult.data.some(
+              (serverBrochure) => serverBrochure.brochure_id === localSavedBrochure.brochure_id,
+            )
+            if (!onServer && localSavedBrochure.server_id) {
+              await LocalDatabaseService.deleteSavedBrochure(localSavedBrochure.id)
+            }
+          }
+
           console.log(`✅ SYNC DOWN: Downloaded ${savedBrochuresResult.data.length} saved brochures`)
         } else if (savedBrochuresResult.error) {
           throw new Error(savedBrochuresResult.error)
@@ -1058,17 +1136,75 @@ export class SyncService {
     return mapping[tableName] || null
   }
 
+  private static async enrichSavedBrochurePushData(op: any, data: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (op.table_name !== 'saved_brochures') {
+      return data
+    }
+
+    const enriched: Record<string, unknown> = { ...data }
+    const local = await LocalDatabaseService.getSavedBrochureRecordById(op.record_id)
+    if (local) {
+      enriched.mr_id = enriched.mr_id || local.mr_id
+      enriched.server_id = enriched.server_id || local.server_id
+      enriched.brochure_id = enriched.brochure_id || local.brochure_id
+      enriched.brochure_title = enriched.brochure_title || local.brochure_title
+      enriched.custom_title = enriched.custom_title || local.custom_title
+      enriched.original_brochure_data = enriched.original_brochure_data || local.original_brochure_data
+    }
+
+    const resolvedBrochureId = resolveServerBrochureId(String(enriched.brochure_id || ''))
+
+    if (op.operation_type === 'create') {
+      return {
+        mr_id: enriched.mr_id,
+        brochure_id: resolvedBrochureId,
+        brochure_title: enriched.brochure_title,
+        custom_title: enriched.custom_title,
+        original_brochure_data: enriched.original_brochure_data,
+      }
+    }
+
+    if (op.operation_type === 'delete') {
+      return {
+        mr_id: enriched.mr_id,
+        server_id: enriched.server_id,
+        brochure_id: resolveServerBrochureId(String(enriched.brochure_id || '')),
+        is_deleted: true,
+      }
+    }
+
+    return {
+      mr_id: enriched.mr_id,
+      server_id: enriched.server_id,
+      brochure_id: resolvedBrochureId,
+      custom_title: enriched.custom_title,
+    }
+  }
+
   private static async syncUpViaPush(ops: any[], userId: string): Promise<SyncResult | null> {
     const brochureSyncOps = ops.filter((op) => op.table_name === 'brochure_sync')
-    const bulkOps = ops.filter((op) => op.table_name !== 'brochure_sync')
+    const savedBrochureOps = ops.filter((op) => op.table_name === 'saved_brochures')
+    const bulkOps = ops.filter((op) => op.table_name !== 'brochure_sync' && op.table_name !== 'saved_brochures')
 
-    if (bulkOps.length === 0 && brochureSyncOps.length === 0) {
+    if (bulkOps.length === 0 && brochureSyncOps.length === 0 && savedBrochureOps.length === 0) {
       return null
     }
 
     let synced = 0
     let failed = 0
     const errors: string[] = []
+
+    for (const op of savedBrochureOps) {
+      const success = await this.syncSavedBrochure(op, userId)
+      if (success) {
+        await LocalDatabaseService.markOperationCompleted(op.id)
+        synced++
+      } else {
+        await LocalDatabaseService.markOperationFailed(op.id, 'Failed to sync saved brochure')
+        failed++
+        errors.push(`Failed saved_brochures ${op.id}`)
+      }
+    }
 
     if (bulkOps.length > 0) {
       try {
@@ -1078,11 +1214,12 @@ export class SyncService {
           if (!entity) continue
 
           const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
+          const pushData = await this.enrichSavedBrochurePushData(op, data)
           operations.push({
             local_id: String(op.id),
             entity,
             action: op.operation_type,
-            data,
+            data: pushData,
           })
         }
 
@@ -1098,6 +1235,13 @@ export class SyncService {
 
             if (result.success) {
               await this.applyPushSuccess(op, result.server_id, userId)
+              await LocalDatabaseService.markOperationCompleted(op.id)
+              synced++
+            } else if (
+              op.table_name === 'saved_brochures' &&
+              op.operation_type === 'delete' &&
+              await this.applySavedBrochureDelete(op, userId)
+            ) {
               await LocalDatabaseService.markOperationCompleted(op.id)
               synced++
             } else {
@@ -1125,6 +1269,16 @@ export class SyncService {
       }
     }
 
+    if (bulkOps.length === 0 && brochureSyncOps.length > 0 && savedBrochureOps.length > 0) {
+      return {
+        success: failed === 0,
+        synced,
+        failed,
+        message: `Synced: ${synced}, Failed: ${failed}`,
+        errors: errors.length > 0 ? errors : undefined,
+      }
+    }
+
     if (bulkOps.length === 0 && brochureSyncOps.length > 0) {
       return {
         success: failed === 0,
@@ -1136,6 +1290,16 @@ export class SyncService {
     }
 
     if (bulkOps.length > 0) {
+      return {
+        success: failed === 0,
+        synced,
+        failed,
+        message: `Synced: ${synced}, Failed: ${failed}`,
+        errors: errors.length > 0 ? errors : undefined,
+      }
+    }
+
+    if (savedBrochureOps.length > 0) {
       return {
         success: failed === 0,
         synced,
@@ -1174,8 +1338,10 @@ export class SyncService {
         }
         break
       case 'saved_brochures':
-        if (serverId) {
-          await LocalDatabaseService.updateSavedBrochure(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        if (op.operation_type === 'delete') {
+          await LocalDatabaseService.updateSavedBrochure(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+        } else if (serverId) {
+          await LocalDatabaseService.updateSavedBrochure(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
         }
         break
       case 'activity_logs':
@@ -1273,6 +1439,80 @@ export class SyncService {
           failed++
           errors.push(`Meeting ${meeting.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
         }
+      }
+
+      for (const savedBrochure of data.saved_brochures || []) {
+        try {
+          const canonicalBrochureId = resolveServerBrochureId(String(savedBrochure.brochure_id || ''))
+          if (savedBrochure.is_deleted) {
+            await LocalDatabaseService.applyServerSavedBrochureDeletion(
+              userId,
+              String(savedBrochure.id || ''),
+              canonicalBrochureId,
+            )
+            synced++
+            continue
+          }
+
+          await LocalDatabaseService.upsertSavedBrochure({
+            id: `saved_${userId}_${canonicalBrochureId}`,
+            server_id: savedBrochure.id,
+            mr_id: userId,
+            brochure_id: canonicalBrochureId,
+            brochure_title: savedBrochure.brochure_title,
+            custom_title: savedBrochure.custom_title,
+            original_brochure_data: JSON.stringify(savedBrochure.original_brochure_data || {}),
+            saved_at: savedBrochure.saved_at || savedBrochure.created_at,
+            last_accessed: savedBrochure.last_accessed || savedBrochure.saved_at,
+            created_at: savedBrochure.saved_at || savedBrochure.created_at,
+            version: 1,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Saved brochure ${savedBrochure.brochure_id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      for (const followUp of data.meeting_followups || []) {
+        if (followUp.is_deleted) continue
+        try {
+          const meeting = await LocalDatabaseService.getMeetingByServerId(followUp.meeting_id)
+          if (!meeting) {
+            failed++
+            continue
+          }
+          await LocalDatabaseService.upsertMeetingFollowUp({
+            id: `followup_${followUp.id}`,
+            server_id: followUp.id,
+            meeting_id: meeting.id,
+            meeting_server_id: followUp.meeting_id,
+            follow_up_date: followUp.follow_up_date,
+            follow_up_time: followUp.follow_up_time,
+            follow_up_notes: followUp.follow_up_notes || null,
+            created_at: followUp.created_at,
+            updated_at: followUp.updated_at || followUp.created_at,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Follow-up ${followUp.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      try {
+        const brochuresResult = await MRService.getAssignedBrochures(userId)
+        if (brochuresResult.success) {
+          await LocalDatabaseService.syncBrochuresFromServer(brochuresResult.data || [])
+          const { OfflineBrochureService } = await import('./offlineBrochureService')
+          await OfflineBrochureService.cacheBrochures(userId, brochuresResult.data || [])
+        }
+      } catch (error) {
+        console.warn('⚠️ SYNC PULL: Failed to refresh available brochures:', error)
       }
 
       if (data.sync_timestamp) {
