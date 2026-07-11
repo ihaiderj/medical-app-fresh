@@ -51,6 +51,7 @@ export interface SlideGroup {
   createdAt: string
   updatedAt: string
   doctorId?: string  // Optional doctor ID for doctor-based groups
+  server_id?: string // Server group id when synced from backend
 }
 
 export interface BrochureData {

@@ -414,7 +414,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                   }, 1000)
                 }
               });
-              const syncResult = await SyncService.syncDown(result.user.id);
+              const syncResult = await SyncService.syncDownInitial(result.user.id);
               if (syncResult.success) {
                 console.log('✅ LOGIN DEBUG: Comprehensive sync completed successfully');
                 console.log('📊 LOGIN DEBUG: Synced tables:', syncResult.syncedTables);
@@ -463,9 +463,8 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
               }
             }
           } else {
-            console.log('🔍 LOGIN DEBUG: Not first time login - performing regular sync');
+            console.log('🔍 LOGIN DEBUG: Not first time login - backing up local data to server (no sync down)');
             
-            // TODO: Replace with SyncService.syncDown()
             // Set up progress callback for regular sync
             // CompleteDataSyncService.setProgressCallback((progress) => {
             //   console.log('🔍 LOGIN DEBUG: Regular sync progress:', progress);
@@ -489,7 +488,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
             
             // Perform regular data sync using SyncService
             try {
-              console.log('🚀 LOGIN DEBUG: Starting regular data sync for user:', result.user.id);
+              console.log('🚀 LOGIN DEBUG: Starting backup sync (sync up) for user:', result.user.id);
               
               SyncService.onProgress((progress) => {
                 setSyncProgress({
@@ -509,9 +508,9 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                 }
               });
               
-              const syncResult = await SyncService.syncDown(result.user.id);
+              const syncResult = await SyncService.syncUpFull(result.user.id);
               if (syncResult.success) {
-                console.log('✅ LOGIN DEBUG: Regular sync completed successfully');
+                console.log('✅ LOGIN DEBUG: Backup sync completed successfully');
                 
                 // Store sync timestamp
                 await AsyncStorage.setItem(`last_sync_time_${result.user.id}`, Date.now().toString())

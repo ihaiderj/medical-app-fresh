@@ -30,6 +30,14 @@ export function isPdfBrochure(
  * Legacy local saves may append _<timestamp> to brochure_id for duplicate downloads.
  * The server expects the original brochure UUID.
  */
+/** Local filesystem key for an MR's saved copy (slide data lives under brochures/{storageId}/). */
+export function getSavedBrochureStorageId(record: {
+  id: string
+  storage_id?: string | null
+}): string {
+  return record.storage_id || record.id
+}
+
 export function resolveServerBrochureId(brochureId: string | undefined | null): string {
   if (!brochureId) return ''
 

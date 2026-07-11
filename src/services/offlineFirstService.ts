@@ -695,14 +695,34 @@ export class OfflineFirstService {
   /**
    * Get sync statistics
    */
-  static async getSyncStats(): Promise<ServiceResponse<{ pending: number; failed: number; completed: number }>> {
+  static async getSyncStats(): Promise<ServiceResponse<{ pending: number; failed: number; completed: number; unbackedUp: number }>> {
     try {
-      const stats = await LocalDatabaseService.getActionableSyncStats();
+      const userId = await this.getCurrentUserId();
+      const queueStats = await LocalDatabaseService.getActionableSyncStats();
       const isOnline = await NetworkService.isOnline();
+
+      let unbackedUp = queueStats.pending;
+      if (userId) {
+        await LocalDatabaseService.reconcileActivityLogSyncState(userId);
+        const gaps = await LocalDatabaseService.getBackupGapCounts(userId);
+        const entityTotal =
+          gaps.saved_brochures +
+          gaps.doctors +
+          gaps.meetings +
+          gaps.meeting_followups +
+          gaps.meeting_notes +
+          gaps.brochure_sync +
+          gaps.activity_logs +
+          gaps.doctor_photos;
+        unbackedUp = Math.max(entityTotal, queueStats.pending);
+      }
       
       return { 
         success: true, 
-        data: stats,
+        data: {
+          ...queueStats,
+          unbackedUp,
+        },
         isOffline: !isOnline
       };
     } catch (error) {

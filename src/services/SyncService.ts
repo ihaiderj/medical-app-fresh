@@ -7,6 +7,8 @@ import { BrochureManagementService } from './brochureManagementService'
 import { apiClient } from './apiClient'
 import { TokenStorage } from './tokenStorage'
 import { resolveServerBrochureId } from '../utils/brochureTypeUtils'
+import { SyncReconciliationService } from './syncReconciliationService'
+import { FirstTimeLoginService } from './firstTimeLoginService'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as FileSystem from 'expo-file-system'
 
@@ -16,6 +18,10 @@ export interface SyncResult {
   failed: number
   message: string
   errors?: string[]
+  /** Records queued during reconciliation before upload */
+  reconciled?: number
+  /** Local rows still missing server backup after sync */
+  backupGapsRemaining?: number
 }
 
 export interface SyncProgress {
@@ -44,6 +50,110 @@ export class SyncService {
     if (this.progressCallback) {
       this.progressCallback({ step, message, progress, current, total })
     }
+  }
+
+  /**
+   * Full sync up: reconcile local records with server, then upload the sync queue.
+   * Use this for manual sync and (future) auto sync — not queue-only syncUp().
+   */
+  static async syncUpFull(userIdOverride?: string): Promise<SyncResult> {
+    console.log('🔄 SYNC UP FULL: Starting full backup sync...')
+
+    let userId = userIdOverride
+    if (!userId) {
+      const userResult = await AuthService.getCurrentUser()
+      if (!userResult.success || !userResult.user) {
+        return {
+          success: false,
+          synced: 0,
+          failed: 0,
+          message: 'User not authenticated',
+          errors: ['User not authenticated — please sign in again'],
+        }
+      }
+      userId = userResult.user.id
+    }
+
+    if (!(await TokenStorage.hasTokens())) {
+      return {
+        success: false,
+        synced: 0,
+        failed: 0,
+        message: 'API session expired — please sign in again',
+        errors: ['No API tokens — please sign in again'],
+      }
+    }
+
+    if (!(await NetworkService.isOnline())) {
+      return {
+        success: false,
+        synced: 0,
+        failed: 0,
+        message: 'Device is offline. Please connect to the internet and try again.',
+      }
+    }
+
+    this.reportProgress('Reconciling', 'Checking local data against server...', 15)
+
+    const reconcileResult = await SyncReconciliationService.reconcileLocalToServer(userId)
+    console.log('🔄 SYNC UP FULL: Reconciliation:', reconcileResult.message)
+
+    if (reconcileResult.errors.length > 0) {
+      console.warn('⚠️ SYNC UP FULL: Reconciliation warnings:', reconcileResult.errors)
+    }
+
+    this.reportProgress('Uploading', 'Uploading changes to server...', 45)
+
+    const uploadResult = await this.syncUp()
+
+    const gapStats = await SyncReconciliationService.getBackupGapStats(userId)
+
+    const combinedMessage = [
+      reconcileResult.message,
+      uploadResult.message,
+      gapStats.total > 0
+        ? `${gapStats.total} item(s) still need backup`
+        : 'All metadata backed up to server',
+    ].join('. ')
+
+    return {
+      success: uploadResult.success && reconcileResult.errors.length === 0,
+      synced: uploadResult.synced,
+      failed: uploadResult.failed,
+      message: combinedMessage,
+      errors: [
+        ...(reconcileResult.errors.length > 0 ? reconcileResult.errors : []),
+        ...(uploadResult.errors || []),
+      ].filter(Boolean),
+      reconciled: reconcileResult.queued,
+      backupGapsRemaining: gapStats.total,
+    }
+  }
+
+  /**
+   * Sync down for new/empty device only. Skips if local DB already has MR data.
+   */
+  static async syncDownInitial(userId: string): Promise<SyncResult> {
+    const firstTimeInfo = await FirstTimeLoginService.isFirstTimeLogin(userId)
+    if (!firstTimeInfo.isFirstTime) {
+      console.log('⬇️ SYNC DOWN INITIAL: Skipped — local database is not empty')
+      return {
+        success: true,
+        synced: 0,
+        failed: 0,
+        message: 'Skipped initial sync down — local data already exists',
+      }
+    }
+    console.log('⬇️ SYNC DOWN INITIAL: Empty local DB — pulling server data')
+    return this.syncDown(userId)
+  }
+
+  /**
+   * Incremental sync down (explicit pull). Uses last sync timestamp when available.
+   */
+  static async syncDownIncremental(userId: string): Promise<SyncResult> {
+    console.log('⬇️ SYNC DOWN INCREMENTAL: Pulling server changes')
+    return this.syncDown(userId)
   }
 
   /**
@@ -586,6 +696,59 @@ export class SyncService {
     return false
   }
 
+  private static async pushSavedBrochureCreate(
+    opRecordId: string,
+    userId: string,
+    brochureId: string,
+    customTitle: string,
+    logLabel: string,
+  ): Promise<boolean> {
+    // Re-read local — a prior queue op may have already created the server row.
+    const local = await LocalDatabaseService.getSavedBrochureRecordById(opRecordId)
+    if (local?.server_id) {
+      const title = String(customTitle || local.custom_title || local.brochure_title || '')
+      console.log(
+        `⏭️ SYNC SAVED BROCHURE: Skip duplicate create for ${opRecordId} — already has server_id ${local.server_id}`,
+      )
+      if (title) {
+        const updateResult = await MRService.updateSavedBrochureTitle(userId, String(local.server_id), title)
+        if (updateResult.success) {
+          await LocalDatabaseService.updateSavedBrochure(opRecordId, {
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
+          return true
+        }
+      }
+      await LocalDatabaseService.updateSavedBrochure(opRecordId, {
+        sync_status: 'synced',
+        skipSyncQueue: true,
+      })
+      return true
+    }
+
+    const resolvedBrochureId = brochureId || String(local?.brochure_id || '')
+    const resolvedTitle = String(
+      customTitle || local?.custom_title || local?.brochure_title || '',
+    )
+
+    const result = await MRService.saveBrochureForMr(userId, resolvedBrochureId, resolvedTitle)
+
+    if (result.success && result.data) {
+      await LocalDatabaseService.updateSavedBrochure(opRecordId, {
+        server_id: result.data.id,
+        sync_status: 'synced',
+        brochure_id: resolveServerBrochureId(resolvedBrochureId),
+        skipSyncQueue: true,
+      })
+      console.log(`✅ SYNC SAVED BROCHURE: ${logLabel} with id ${result.data.id}`)
+      return true
+    }
+
+    console.warn(`⚠️ SYNC SAVED BROCHURE: ${logLabel} failed:`, result.error)
+    return false
+  }
+
   /**
    * Sync saved brochure operation
    */
@@ -595,42 +758,40 @@ export class SyncService {
       console.log(`🔄 SYNC SAVED BROCHURE: ${op.operation_type}`, data)
 
       if (op.operation_type === 'create') {
-        const result = await MRService.saveBrochureForMr(
+        return this.pushSavedBrochureCreate(
+          op.record_id,
           userId,
           String(data.brochure_id || ''),
           String(data.custom_title || data.brochure_title || ''),
+          'Created on server',
         )
-
-        if (result.success && result.data) {
-          await LocalDatabaseService.updateSavedBrochure(op.record_id, {
-            server_id: result.data.id,
-            sync_status: 'synced',
-            brochure_id: resolveServerBrochureId(String(data.brochure_id || '')),
-            skipSyncQueue: true,
-          })
-          return true
-        }
-        return false
       } else if (op.operation_type === 'update') {
         const local = await LocalDatabaseService.getSavedBrochureRecordById(op.record_id)
-        const targetId =
-          data.server_id ||
-          local?.server_id ||
-          resolveServerBrochureId(String(data.brochure_id || local?.brochure_id || ''))
-
-        if (!targetId) {
-          console.warn('⚠️ SYNC SAVED BROCHURE: Cannot update saved brochure without server_id or brochure_id')
-          return false
-        }
 
         if (data.is_deleted) {
           return this.applySavedBrochureDelete(op, userId)
         }
 
+        const brochureId = String(data.brochure_id || local?.brochure_id || '')
+        const customTitle = String(data.custom_title || local?.custom_title || local?.brochure_title || '')
+        const serverId = data.server_id || local?.server_id
+
+        // Title/metadata updates must target the saved-brochure server UUID.
+        // If never synced, push as create instead of PATCHing by source brochure_id.
+        if (!serverId) {
+          return this.pushSavedBrochureCreate(
+            op.record_id,
+            userId,
+            brochureId,
+            customTitle,
+            'Created on server (from update)',
+          )
+        }
+
         const result = await MRService.updateSavedBrochureTitle(
           userId,
-          String(targetId),
-          String(data.custom_title || local?.custom_title || ''),
+          String(serverId),
+          customTitle,
         )
 
         if (result.success) {
@@ -638,8 +799,29 @@ export class SyncService {
             sync_status: 'synced',
             skipSyncQueue: true,
           })
+          console.log(`✅ SYNC SAVED BROCHURE: Updated title on server for ${serverId}`)
           return true
         }
+
+        // Stale server_id (e.g. admin deleted the row) — recreate on server.
+        if (result.notFound) {
+          console.log(
+            `⚠️ SYNC SAVED BROCHURE: Server record ${serverId} not found — recreating local copy ${op.record_id}`,
+          )
+          await LocalDatabaseService.updateSavedBrochure(op.record_id, {
+            server_id: null,
+            skipSyncQueue: true,
+          })
+          return this.pushSavedBrochureCreate(
+            op.record_id,
+            userId,
+            brochureId,
+            customTitle,
+            'Recreated on server after stale server_id',
+          )
+        }
+
+        console.warn('⚠️ SYNC SAVED BROCHURE: Update failed:', result.error)
         return false
       } else if (op.operation_type === 'delete') {
         return this.applySavedBrochureDelete(op, userId)
@@ -792,6 +974,18 @@ export class SyncService {
     }
   }
 
+  private static extractActivityLogServerId(data: unknown): string | undefined {
+    if (!data || typeof data !== 'object') return undefined;
+    const payload = data as Record<string, unknown>;
+    const candidates = [payload.id, payload.activity_id, payload.server_id];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+
   /**
    * Sync activity log operation
    */
@@ -801,16 +995,34 @@ export class SyncService {
       console.log(`🔄 SYNC ACTIVITY LOG: ${op.operation_type}`, data)
 
       if (op.operation_type === 'create') {
+        // Prefer live local row (correct field mapping); fall back to queue payload aliases.
+        const local = await LocalDatabaseService.getActivityLogById(op.record_id)
+        const activityType = String(
+          local?.activity_type || data.activity_type || data.action || '',
+        ).trim()
+        const description = String(
+          local?.description || data.description || data.details || '',
+        ).trim()
+        const metadata = local?.metadata ?? data.metadata
+
+        if (!activityType && !description) {
+          console.warn(
+            `⚠️ SYNC ACTIVITY LOG: Skipping empty activity ${op.record_id} (no type/description)`,
+          )
+          await LocalDatabaseService.markActivityLogSynced(op.record_id)
+          return true
+        }
+
         const result = await MRService.logActivity(
           userId,
-          data.activity_type,
-          data.description,
-          data.metadata
+          activityType || 'activity',
+          description || activityType,
+          metadata,
         )
 
         if (result.success) {
-          // Mark local activity as synced
-          // TODO: Update local activity log sync status if method exists
+          const serverId = this.extractActivityLogServerId(result.data)
+          await LocalDatabaseService.markActivityLogSynced(op.record_id, serverId)
           return true
         }
         return false
@@ -1011,9 +1223,11 @@ export class SyncService {
         if (savedBrochuresResult.success && savedBrochuresResult.data) {
           for (const savedBrochure of savedBrochuresResult.data) {
             try {
+              const serverSavedId = String(savedBrochure.id || '')
               await LocalDatabaseService.upsertSavedBrochure({
-                id: `saved_${userId}_${resolveServerBrochureId(String(savedBrochure.brochure_id || ''))}`,
-                server_id: savedBrochure.id,
+                id: serverSavedId,
+                server_id: serverSavedId,
+                storage_id: serverSavedId,
                 mr_id: userId,
                 brochure_id: resolveServerBrochureId(String(savedBrochure.brochure_id || '')),
                 brochure_title: savedBrochure.brochure_title,
@@ -1028,20 +1242,23 @@ export class SyncService {
               })
               synced++
             } catch (error) {
-              console.error(`❌ SYNC DOWN: Failed to upsert saved brochure ${savedBrochure.brochure_id}:`, error)
+              console.error(`❌ SYNC DOWN: Failed to upsert saved brochure ${savedBrochure.id}:`, error)
               failed++
-              errors.push(`Failed to upsert saved brochure ${savedBrochure.brochure_id}: ${error instanceof Error ? error.message : String(error)}`)
+              errors.push(`Failed to upsert saved brochure ${savedBrochure.id}: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
 
-          // Remove saved brochures that no longer exist on the server
-          const localSaved = await LocalDatabaseService.getSavedBrochures(userId)
-          for (const localSavedBrochure of localSaved) {
-            const onServer = savedBrochuresResult.data.some(
-              (serverBrochure) => serverBrochure.brochure_id === localSavedBrochure.brochure_id,
-            )
-            if (!onServer && localSavedBrochure.server_id) {
-              await LocalDatabaseService.deleteSavedBrochure(localSavedBrochure.id)
+          // Tombstone deletions only — never delete local copies just because server has fewer rows.
+          // Local is source of truth; unmatched locals are pushed via syncUpFull reconciliation.
+          for (const savedBrochure of savedBrochuresResult.data) {
+            if (savedBrochure.is_deleted) {
+              const serverSavedId = String(savedBrochure.id || '')
+              const canonicalBrochureId = resolveServerBrochureId(String(savedBrochure.brochure_id || ''))
+              await LocalDatabaseService.applyServerSavedBrochureDeletion(
+                userId,
+                serverSavedId,
+                canonicalBrochureId,
+              )
             }
           }
 
@@ -1345,6 +1562,7 @@ export class SyncService {
         }
         break
       case 'activity_logs':
+        await LocalDatabaseService.markActivityLogSynced(op.record_id, serverId)
         break
       default:
         break
@@ -1454,9 +1672,11 @@ export class SyncService {
             continue
           }
 
+          const serverSavedId = String(savedBrochure.id || '')
           await LocalDatabaseService.upsertSavedBrochure({
-            id: `saved_${userId}_${canonicalBrochureId}`,
-            server_id: savedBrochure.id,
+            id: serverSavedId || `saved_${userId}_${canonicalBrochureId}`,
+            server_id: serverSavedId || null,
+            storage_id: savedBrochure.storage_id || serverSavedId || undefined,
             mr_id: userId,
             brochure_id: canonicalBrochureId,
             brochure_title: savedBrochure.brochure_title,

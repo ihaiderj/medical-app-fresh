@@ -4,6 +4,7 @@
  * Ensures all screens stay in sync when data is created/updated
  */
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
+import { InteractionManager } from 'react-native';
 import { OfflineFirstService } from '../services/offlineFirstService';
 import { AuthService, UserProfile } from '../services/AuthService';
 import { LocalDoctor, LocalMeeting, LocalMeetingNote } from '../services/localDatabaseService';
@@ -304,8 +305,8 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
 
   const loginUser = (userData: UserProfile) => {
     console.log("AppDataContext: Logging in user and setting profile.", userData.id);
+    AuthService.setCurrentUser(userData);
     setUser(userData);
-    // You might want to trigger data loading for this user here as well
   };
 
   const logoutUser = () => {
@@ -326,15 +327,22 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
         if (userProfile) {
           console.log("AppDataContext: User session loaded from local data, setting user.");
           setUser(userProfile);
+          AuthService.setCurrentUser(userProfile);
           
-          // Fix existing doctors that came from server but have pending status
-          try {
-            await LocalDatabaseService.markServerDoctorsSynced(session.userId);
-            // Clean up stale sync queue entries for server doctors
-            await LocalDatabaseService.cleanupStaleSyncQueueEntries(session.userId);
-          } catch (error) {
-            console.warn('AppDataContext: Failed to fix server doctors sync status:', error);
-          }
+          // Defer non-critical DB maintenance until after first paint
+          InteractionManager.runAfterInteractions(() => {
+            setTimeout(() => {
+              void (async () => {
+                try {
+                  await LocalDatabaseService.ensureReady();
+                  await LocalDatabaseService.markServerDoctorsSynced(session.userId);
+                  await LocalDatabaseService.cleanupStaleSyncQueueEntries(session.userId);
+                } catch (error) {
+                  console.warn('AppDataContext: Failed to fix server doctors sync status:', error);
+                }
+              })();
+            }, 2000);
+          });
         }
       }
     } catch (e) {
@@ -351,12 +359,14 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
 
   // Effect to load data once a user is authenticated
   useEffect(() => {
-    if (!user) return; // Don't load data if there's no user
+    if (!user) return;
 
-    // Load doctors and meetings for the logged-in user (functions use user?.id internally)
-    refreshDoctors();
-    refreshMeetings();
+    const timer = setTimeout(() => {
+      refreshDoctors();
+      refreshMeetings();
+    }, 1500);
 
+    return () => clearTimeout(timer);
   }, [user, refreshDoctors, refreshMeetings]);
 
   // Effect to listen for external data changes

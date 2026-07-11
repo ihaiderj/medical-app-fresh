@@ -26,7 +26,7 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
     type: 'unknown',
     isInternetReachable: false
   });
-  const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0, completed: 0 });
+  const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0, unbackedUp: 0 });
 
   const defaultSyncHandler = React.useCallback(async () => {
     try {
@@ -51,7 +51,7 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
       }
       
       console.log('OfflineStatusBar: Starting sync with userId:', userId);
-      const result = await SyncService.syncUp();
+      const result = await SyncService.syncUpFull();
       console.log('OfflineStatusBar: Sync result:', result);
       
       if (!result.success && result.errors && result.errors.length > 0) {
@@ -100,10 +100,10 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
   };
 
   const isOnline = networkState.isConnected && networkState.isInternetReachable;
-  const hasPendingSync = syncStats.pending > 0;
+  const needsBackup = (syncStats.unbackedUp ?? syncStats.pending) > 0;
   const hasFailedSync = syncStats.failed > 0;
 
-  if (isOnline && !hasPendingSync && !hasFailedSync) {
+  if (isOnline && !needsBackup && !hasFailedSync) {
     // Don't show status bar when everything is normal
     return null;
   }
@@ -119,12 +119,12 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
       )}
 
       {/* Sync Status */}
-      {showSyncStats && (hasPendingSync || hasFailedSync) && (
+      {showSyncStats && (needsBackup || hasFailedSync) && (
         <TouchableOpacity 
           style={styles.statusItem} 
           onPress={onSyncPress || defaultSyncHandler}
         >
-          {hasPendingSync && (
+          {needsBackup && (
             <>
               <Ionicons 
                 name={isOnline ? "sync" : "cloud-upload-outline"} 
@@ -132,7 +132,7 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
                 color={isOnline ? "#4ecdc4" : "#ffa726"} 
               />
               <Text style={[styles.syncText, { color: isOnline ? "#4ecdc4" : "#ffa726" }]}>
-                {syncStats.pending} pending
+                {syncStats.unbackedUp ?? syncStats.pending} need backup
               </Text>
             </>
           )}

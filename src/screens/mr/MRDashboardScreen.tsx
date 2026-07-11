@@ -1,7 +1,7 @@
 import { View, Text, ScrollView, TouchableOpacity, StyleSheet, SafeAreaView, Alert, ActivityIndicator } from "react-native"
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { useFocusEffect } from '@react-navigation/native'
 import { AuthService } from "../../services/AuthService"
 import { MRService, MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from "../../services/MRService"
@@ -18,6 +18,8 @@ import { FirstTimeLoginService } from '../../services/firstTimeLoginService';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SyncService } from '../../services/SyncService';
 import { NetworkService } from '../../services/networkService';
+import { NetworkAlerts } from '../../utils/networkAlerts';
+import { TokenStorage } from '../../services/tokenStorage';
 // import SyncTestPanel from '../../components/SyncTestPanel'; // DELETED
 
 interface MRDashboardScreenProps {
@@ -34,14 +36,35 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [availableBrochuresCount, setAvailableBrochuresCount] = useState(0)
   const [isSyncing, setIsSyncing] = useState(false)
   const [syncProgress, setSyncProgress] = useState<{ step: string; message: string; progress: number } | null>(null)
-  const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0 })
+  const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0, unbackedUp: 0 })
   const [showTestPanel, setShowTestPanel] = useState(false)
+  const loadInFlightRef = useRef(false)
+  const loadRequestIdRef = useRef(0)
+  const hasLoadedOnceRef = useRef(false)
+
+  const withTimeout = async <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
 
   const refreshSyncStats = useCallback(async () => {
     try {
       const result = await OfflineFirstService.getSyncStats();
       if (result.success && result.data) {
-        setSyncStats({ pending: result.data.pending, failed: 0 });
+        setSyncStats({
+          pending: result.data.pending,
+          failed: result.data.failed,
+          unbackedUp: result.data.unbackedUp ?? result.data.pending,
+        });
       }
     } catch (error) {
       console.error('Failed to load sync stats:', error);
@@ -62,142 +85,160 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     }
   }, [user]);
 
-  const loadDashboardData = useCallback(async () => {
-    console.log('🔍 DASHBOARD DEBUG: Starting data load...');
-    console.log('🔍 DASHBOARD DEBUG: User ID:', user?.id);
-    console.log('🔍 DASHBOARD DEBUG: User object:', user);
-    
+  // Reset dashboard load state when user logs out
+  useEffect(() => {
+    if (!user?.id) {
+      hasLoadedOnceRef.current = false;
+      loadInFlightRef.current = false;
+      setIsLoading(false);
+    }
+  }, [user?.id]);
+
+  const loadDashboardData = useCallback(async (options?: { silent?: boolean }) => {
     if (!user?.id) {
       console.log('❌ DASHBOARD DEBUG: No user ID, waiting for user data...');
       return;
     }
-    
-    setIsLoading(true);
-    console.log('🔍 DASHBOARD DEBUG: Loading state set to true');
-    
+
+    if (loadInFlightRef.current) {
+      console.log('🔍 DASHBOARD DEBUG: Load already in progress, skipping duplicate request');
+      return;
+    }
+
+    const requestId = ++loadRequestIdRef.current;
+    loadInFlightRef.current = true;
+    const silent = options?.silent === true || hasLoadedOnceRef.current;
+    console.log('🔍 DASHBOARD DEBUG: Starting data load...', silent ? '(silent)' : '');
+    console.log('🔍 DASHBOARD DEBUG: User ID:', user.id);
+
+    if (!silent) {
+      setIsLoading(true);
+    }
+
     try {
-      // Load user profile from local database
-      console.log('🔍 DASHBOARD DEBUG: Loading user profile...');
+      if (user && !userProfile) {
+        setUserProfile(user);
+      }
+
+      await LocalDatabaseService.ensureReady();
+
+      const loadStats = async () => {
+        const localStats = await LocalDatabaseService.getDashboardStats(user.id);
+        return {
+          doctors_connected: localStats.doctors_connected,
+          scheduled_meetings: localStats.scheduled_meetings,
+          brochures_available: localStats.brochures_available || 0,
+          active_presentations: localStats.active_presentations,
+          monthly_meetings: localStats.monthly_meetings,
+          completed_meetings: localStats.completed_meetings,
+          brochures_uploaded: localStats.brochures_uploaded,
+        } satisfies MRDashboardStats;
+      };
+
+      console.log('🔍 DASHBOARD DEBUG: Loading stats, activities, meetings sequentially...');
+      let statsOutcome: PromiseSettledResult<MRDashboardStats>;
+      let activitiesOutcome: PromiseSettledResult<Array<{ id: string; activity_type: string; description: string; created_at: string }>>;
+      let meetingsOutcome: PromiseSettledResult<Array<{ meeting_id: string; doctor_name: string; hospital: string; scheduled_date: string; status: string; notes?: string }>>;
+
       try {
-        const localUser = await LocalDatabaseService.getUserById(user.id);
-        console.log('🔍 DASHBOARD DEBUG: Local user from DB:', localUser);
-        if (localUser) {
-          setUserProfile(localUser);
-          console.log('✅ DASHBOARD DEBUG: User profile set from local DB');
-        } else if (user) {
-          // Fallback to user from context
-          setUserProfile(user);
-          console.log('✅ DASHBOARD DEBUG: User profile set from context (fallback)');
-        }
-      } catch (error) {
-        console.error('❌ DASHBOARD DEBUG: Failed to load user profile:', error);
-        // Fallback to user from context
-        if (user) {
-          setUserProfile(user);
-          console.log('✅ DASHBOARD DEBUG: User profile set from context (error fallback)');
-        }
+        const stats = await withTimeout(loadStats(), 25000, 'Dashboard stats');
+        statsOutcome = { status: 'fulfilled', value: stats };
+      } catch (reason) {
+        statsOutcome = { status: 'rejected', reason };
       }
 
-      console.log('🔍 DASHBOARD DEBUG: Loading stats...');
-      const statsResult = await OfflineFirstService.getDashboardStats(user.id);
-      console.log('🔍 DASHBOARD DEBUG: Stats result:', statsResult);
-      if (statsResult.success && statsResult.data) {
-        setDashboardStats(statsResult.data);
-        console.log('✅ DASHBOARD DEBUG: Stats loaded successfully:', statsResult.data);
+      try {
+        const activities = await withTimeout(LocalDatabaseService.getRecentActivities(user.id, 5), 25000, 'Dashboard activities');
+        activitiesOutcome = { status: 'fulfilled', value: activities };
+      } catch (reason) {
+        activitiesOutcome = { status: 'rejected', reason };
+      }
+
+      try {
+        const meetings = await withTimeout(LocalDatabaseService.getUpcomingMeetings(user.id, 3), 25000, 'Dashboard meetings');
+        meetingsOutcome = { status: 'fulfilled', value: meetings };
+      } catch (reason) {
+        meetingsOutcome = { status: 'rejected', reason };
+      }
+
+      if (statsOutcome.status === 'fulfilled') {
+        setDashboardStats(statsOutcome.value);
+        console.log('✅ DASHBOARD DEBUG: Stats loaded:', statsOutcome.value);
       } else {
-        console.error('❌ DASHBOARD DEBUG: Failed to load dashboard stats:', statsResult.error);
-        console.log('🔍 DASHBOARD DEBUG: Setting default stats (all zeros)');
-        setDashboardStats({
-          doctors_connected: 0,
-          scheduled_meetings: 0,
-          brochures_available: 0,
-          active_presentations: 0,
-          monthly_meetings: 0,
-          completed_meetings: 0,
-          brochures_uploaded: 0
-        });
+        console.warn('⚠️ DASHBOARD DEBUG: Stats load failed, keeping previous values:', statsOutcome.reason);
       }
-      console.log('🔍 DASHBOARD DEBUG: Stats loading completed.');
 
-      console.log('🔍 DASHBOARD DEBUG: Loading activities...');
-      const activitiesResult = await OfflineFirstService.getRecentActivities(5, user.id);
-      console.log('🔍 DASHBOARD DEBUG: Activities result:', activitiesResult);
-      if (activitiesResult.success && activitiesResult.data) {
-        setRecentActivities(activitiesResult.data);
-        console.log('✅ DASHBOARD DEBUG: Activities loaded successfully:', activitiesResult.data.length, 'items');
+      if (activitiesOutcome.status === 'fulfilled') {
+        const mapped = activitiesOutcome.value.map((row) => ({
+          id: row.id,
+          activity_type: row.activity_type,
+          description: row.description,
+          created_at: row.created_at,
+        }));
+        setRecentActivities(mapped);
+        console.log('✅ DASHBOARD DEBUG: Activities loaded:', mapped.length);
       } else {
-        console.error('❌ DASHBOARD DEBUG: Failed to load recent activities:', activitiesResult.error);
-        console.log('🔍 DASHBOARD DEBUG: Setting empty activities array');
-        setRecentActivities([]);
+        console.warn('⚠️ DASHBOARD DEBUG: Activities load failed, keeping previous values:', activitiesOutcome.reason);
       }
-      console.log('🔍 DASHBOARD DEBUG: Activities loading completed.');
 
-      console.log('🔍 DASHBOARD DEBUG: Loading meetings...');
-      const meetingsResult = await OfflineFirstService.getUpcomingMeetings(3, user.id);
-      console.log('🔍 DASHBOARD DEBUG: Meetings result:', meetingsResult);
-      if (meetingsResult.success && meetingsResult.data) {
-        setUpcomingMeetings(meetingsResult.data);
-        console.log('✅ DASHBOARD DEBUG: Meetings loaded successfully:', meetingsResult.data.length, 'items');
+      if (meetingsOutcome.status === 'fulfilled') {
+        const mapped = meetingsOutcome.value.map((row) => ({
+          meeting_id: row.meeting_id,
+          doctor_name: row.doctor_name,
+          hospital: row.hospital,
+          scheduled_date: row.scheduled_date,
+          status: row.status,
+          notes: row.notes,
+        }));
+        setUpcomingMeetings(mapped);
+        console.log('✅ DASHBOARD DEBUG: Meetings loaded:', mapped.length);
       } else {
-        console.error('❌ DASHBOARD DEBUG: Failed to load upcoming meetings:', meetingsResult.error);
-        console.log('🔍 DASHBOARD DEBUG: Setting empty meetings array');
-        setUpcomingMeetings([]);
+        console.warn('⚠️ DASHBOARD DEBUG: Meetings load failed, keeping previous values:', meetingsOutcome.reason);
       }
-      console.log('🔍 DASHBOARD DEBUG: Meetings loading completed.');
 
-      // Load available brochures count - prefer live server count when online
       console.log('🔍 DASHBOARD DEBUG: Setting brochure count...');
-      let brochureCount = 0
+      let brochureCount = 0;
+      const statsData =
+        statsOutcome.status === 'fulfilled' ? statsOutcome.value : dashboardStats;
       if (user?.id && (await NetworkService.isOnline())) {
-        const liveBrochures = await MRService.getAssignedBrochures(user.id)
-        if (liveBrochures.success && liveBrochures.data) {
-          brochureCount = liveBrochures.data.length
+        try {
+          const liveBrochures = await withTimeout(
+            MRService.getAssignedBrochures(user.id),
+            8000,
+            'Assigned brochures',
+          );
+          if (liveBrochures.success && liveBrochures.data) {
+            brochureCount = liveBrochures.data.length;
+          }
+        } catch (error) {
+          console.warn('🔍 DASHBOARD DEBUG: Live brochure count skipped:', error);
         }
       }
-      if (!brochureCount && statsResult.success && statsResult.data) {
-        brochureCount = statsResult.data.brochures_available || 0
+      if (!brochureCount && statsData) {
+        brochureCount = statsData.brochures_available || 0;
       }
-      setAvailableBrochuresCount(brochureCount)
-      console.log('✅ DASHBOARD DEBUG: Brochure count set to:', brochureCount)
+      setAvailableBrochuresCount(brochureCount);
+      console.log('✅ DASHBOARD DEBUG: Brochure count set to:', brochureCount);
 
     } catch (error) {
-      console.error('❌ DASHBOARD DEBUG: Error loading dashboard data:', error);
-      console.log('🔍 DASHBOARD DEBUG: Setting fallback values due to error');
-      setDashboardStats({
-        doctors_connected: 0,
-        scheduled_meetings: 0,
-        brochures_available: 0,
-        active_presentations: 0,
-        monthly_meetings: 0,
-        completed_meetings: 0,
-        brochures_uploaded: 0
-      });
-      setRecentActivities([]);
-      setUpcomingMeetings([]);
-      setAvailableBrochuresCount(0);
+      console.warn('⚠️ DASHBOARD DEBUG: Unexpected dashboard load error:', error);
     } finally {
-      setIsLoading(false);
-      console.log('🔍 DASHBOARD DEBUG: Loading state set to false');
-      console.log('🔍 DASHBOARD DEBUG: Final state - isLoading:', false);
-      console.log('🔍 DASHBOARD DEBUG: Final state - userProfile:', userProfile);
-      console.log('🔍 DASHBOARD DEBUG: Final state - dashboardStats:', dashboardStats);
-      console.log('🔍 DASHBOARD DEBUG: Final state - recentActivities count:', recentActivities.length);
-      console.log('🔍 DASHBOARD DEBUG: Final state - upcomingMeetings count:', upcomingMeetings.length);
-      console.log('🔍 DASHBOARD DEBUG: Final state - availableBrochuresCount:', availableBrochuresCount);
-      console.log('✅ DASHBOARD DEBUG: Data loading completed.');
+      hasLoadedOnceRef.current = true;
+      if (requestId === loadRequestIdRef.current) {
+        setIsLoading(false);
+        console.log('✅ DASHBOARD DEBUG: Data loading completed.');
+      }
+      loadInFlightRef.current = false;
     }
-  }, [user?.id]);
-
-  // Load dashboard data on component mount
-  useEffect(() => {
-    loadDashboardData()
-  }, [loadDashboardData])
+  }, [user?.id, user, userProfile, dashboardStats]);
 
   useFocusEffect(
     useCallback(() => {
-      if (user?.id) {
-        loadDashboardData()
-      }
+      if (!user?.id) return;
+      const timer = setTimeout(() => {
+        loadDashboardData({ silent: hasLoadedOnceRef.current });
+      }, hasLoadedOnceRef.current ? 0 : 1500);
+      return () => clearTimeout(timer);
     }, [user?.id, loadDashboardData]),
   )
 
@@ -260,28 +301,36 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const handleManualSync = async () => {
     if (!user?.id || isSyncing) return;
 
-    if (!(await NetworkService.isOnline())) {
-      NetworkAlerts.syncRequiresInternet()
-      return
-    }
-
-    const pendingStats = await OfflineFirstService.getSyncStats();
-    if (!pendingStats.success || pendingStats.data.pending === 0) {
-      Alert.alert('Sync', 'Nothing queued to sync to server.');
-      return;
-    }
-    
-    console.log('🚀 MANUAL SYNC DEBUG: Starting manual sync (upload-only) for user:', user.id);
     setIsSyncing(true);
     setSyncProgress({ step: 'Starting', message: 'Preparing sync...', progress: 0 });
-    
+
     try {
-      // Upload local changes to server (this will reduce pending count)
-      setSyncProgress({ step: 'Uploading', message: 'Uploading local changes to server...', progress: 50 });
-      console.log('🚀 MANUAL SYNC DEBUG: Uploading local changes...');
-      
-      // Perform sync using SyncService
-      const syncResult = await SyncService.syncUp();
+      if (!(await NetworkService.isOnline())) {
+        NetworkAlerts.syncRequiresInternet();
+        return;
+      }
+
+      if (!(await TokenStorage.hasTokens())) {
+        Alert.alert(
+          'Sign in required',
+          'Your API session is missing. Please log out and sign in again to sync with the server.',
+        );
+        return;
+      }
+
+      AuthService.setCurrentUser({
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        is_active: user.is_active ?? true,
+      });
+
+      console.log('🚀 MANUAL SYNC DEBUG: Starting full backup sync for user:', user.id);
+      setSyncProgress({ step: 'Reconciling', message: 'Checking local data against server...', progress: 20 });
+
+      const syncResult = await SyncService.syncUpFull(user.id);
       
       if (syncResult.success) {
         console.log('✅ MANUAL SYNC DEBUG: Manual sync completed successfully');
@@ -302,15 +351,19 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         await FirstTimeLoginService.updateLastSyncTimestamp();
         
         // Reload dashboard data to show updated information
-        await loadDashboardData();
+        await loadDashboardData({ silent: true });
         await refreshSyncStats();
         
-        setSyncProgress({ step: 'Complete', message: `Sync completed! ${syncResult.synced} operations synced.`, progress: 100 });
+        setSyncProgress({ step: 'Complete', message: `Sync completed! ${syncResult.synced} operation(s) uploaded.`, progress: 100 });
+        const gapNote =
+          syncResult.backupGapsRemaining && syncResult.backupGapsRemaining > 0
+            ? ` ${syncResult.backupGapsRemaining} item(s) still need backup.`
+            : '';
         Alert.alert(
           'Sync Complete',
-          syncResult.synced > 0
-            ? `${syncResult.synced} change(s) uploaded to the server.`
-            : 'Everything is already synced.',
+          syncResult.synced > 0 || (syncResult.reconciled ?? 0) > 0
+            ? `${syncResult.synced} change(s) uploaded.${syncResult.reconciled ? ` (${syncResult.reconciled} queued by reconciliation)` : ''}${gapNote}`
+            : `Everything is already backed up.${gapNote}`,
         )
         
         // Clear progress after 3 seconds
@@ -333,8 +386,8 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     } catch (error) {
       console.error('❌ MANUAL SYNC DEBUG: Manual sync error:', error);
       setSyncProgress({ step: 'Error', message: `Sync error: ${error instanceof Error ? error.message : 'Unknown error'}`, progress: 0 });
+      Alert.alert('Sync Failed', error instanceof Error ? error.message : 'Unknown error');
       
-      // Clear error after 5 seconds
       setTimeout(() => {
         setSyncProgress(null);
       }, 5000);
@@ -448,6 +501,8 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       case 'brochure_upload': return 'cloud-upload'
       case 'meeting': return 'calendar'
       case 'brochure_download': return 'download'
+      case 'brochure_saved': return 'bookmark'
+      case 'brochure_renamed': return 'create-outline'
       case 'brochure_viewed': return 'eye'
       default: return 'information-circle'
     }
@@ -580,7 +635,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
                 style={[
                   styles.syncButton,
                   isSyncing && styles.syncButtonActive,
-                  syncStats.pending === 0 && !isSyncing && styles.syncButtonIdle,
+                  syncStats.unbackedUp === 0 && !isSyncing && styles.syncButtonIdle,
                 ]} 
                 onPress={handleManualSync}
                 onLongPress={() => {
@@ -599,12 +654,12 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
                 <Ionicons 
                   name={isSyncing ? "sync" : "cloud-upload-outline"} 
                   size={24} 
-                  color={isSyncing ? "#f59e0b" : syncStats.pending > 0 ? "#10b981" : "#94a3b8"} 
+                  color={isSyncing ? "#f59e0b" : syncStats.unbackedUp > 0 ? "#10b981" : "#94a3b8"} 
                 />
               </TouchableOpacity>
-              {syncStats.pending > 0 && (
+              {syncStats.unbackedUp > 0 && (
                 <View style={styles.pendingBadge}>
-                  <Text style={styles.pendingBadgeText}>{syncStats.pending}</Text>
+                  <Text style={styles.pendingBadgeText}>{syncStats.unbackedUp}</Text>
                 </View>
               )}
             </View>

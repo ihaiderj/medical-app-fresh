@@ -32,7 +32,7 @@ import { useNavigation, useFocusEffect } from '@react-navigation/native'
 import { generateUUID } from "../../utils/uuid"
 import { getModalBorderRadius, getModalPadding, isTablet } from "../../utils/responsive"
 import { resolveMediaUrl } from "../../config/apiConfig"
-import { isPdfBrochure, isZipBrochure } from "../../utils/brochureTypeUtils"
+import { isPdfBrochure, isZipBrochure, getSavedBrochureStorageId, resolveServerBrochureId } from "../../utils/brochureTypeUtils"
 import { PDFConversionService } from "../../services/pdfConversionService"
 import { BrochureRefreshService } from "../../services/brochureRefreshService"
 import { ConnectionMode, NetworkAlerts, getConnectionBanner } from "../../utils/networkAlerts"
@@ -50,6 +50,7 @@ interface BrochuresScreenProps {
 
 interface SavedBrochure extends MRAssignedBrochure {
   localId: string
+  storageId: string
   localPath: string
   customTitle: string
   downloadedAt: string
@@ -288,6 +289,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       // Load ONLY from local DB (offline-first principle)
       // NO server calls during app usage
       const { LocalDatabaseService } = await import('../../services/localDatabaseService')
+      await LocalDatabaseService.ensureReady()
       const localBrochures = await LocalDatabaseService.getSavedBrochures(userId)
       
       console.log('Local DB saved brochures:', localBrochures.length)
@@ -308,18 +310,26 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
             originalBrochureData = {}
           }
           
+          let storageId = getSavedBrochureStorageId(localBrochure)
+          
+          let brochureDataResult = await BrochureManagementService.getBrochureData(storageId)
+          // Legacy copies stored slides under source brochure_id before independent-copy support
+          if (!brochureDataResult.success && localBrochure.brochure_id !== storageId) {
+            const legacyResult = await BrochureManagementService.getBrochureData(localBrochure.brochure_id)
+            if (legacyResult.success) {
+              storageId = localBrochure.brochure_id
+              brochureDataResult = legacyResult
+            }
+          }
           // Check if file exists locally
           const downloadDir = FileSystem.documentDirectory + `mr_downloads/${userId}/`
           const expectedFiles = await FileSystem.readDirectoryAsync(downloadDir).catch(() => [])
           
-          // Find matching local file by brochure ID
+          // Find matching local file by storage id or custom title
           const matchingFile = expectedFiles.find(file => 
-            file.includes(localBrochure.brochure_id) || 
+            file.includes(storageId) || 
             file.includes(localBrochure.custom_title.replace(/[^a-zA-Z0-9]/g, '_'))
           )
-          
-          // Also check if brochure data exists (more reliable than file check)
-          const brochureDataResult = await BrochureManagementService.getBrochureData(localBrochure.brochure_id)
           
           const localPath = matchingFile ? downloadDir + matchingFile : ''
           let hasLocalFile = false
@@ -328,11 +338,9 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
             hasLocalFile = fileInfo.exists
           }
           
-          // If brochure data exists, the file is available
           if (brochureDataResult.success) {
             hasLocalFile = true
-            // Try to find the actual file path from brochure data directory
-            const brochureDir = FileSystem.documentDirectory + `brochures/${localBrochure.brochure_id}/`
+            const brochureDir = FileSystem.documentDirectory + `brochures/${storageId}/`
             const brochureFiles = await FileSystem.readDirectoryAsync(brochureDir).catch(() => [])
             const zipFile = brochureFiles.find(f => f.endsWith('.zip'))
             if (zipFile) {
@@ -341,17 +349,18 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           }
           
           console.log('LoadSaved: Processing:', localBrochure.custom_title)
-          console.log('  - Brochure ID:', localBrochure.brochure_id)
+          console.log('  - Source brochure ID:', localBrochure.brochure_id)
+          console.log('  - Storage ID:', storageId)
           console.log('  - File match:', !!matchingFile)
           console.log('  - File exists:', hasLocalFile)
           console.log('  - Data exists:', brochureDataResult.success)
           
-          // Create saved brochure entry
           const savedBrochureEntry: SavedBrochure = {
             ...originalBrochureData,
             brochure_id: localBrochure.brochure_id,
             id: localBrochure.brochure_id,
             localId: localBrochure.id,
+            storageId,
             localPath: hasLocalFile ? localPath : '',
             customTitle: localBrochure.custom_title || localBrochure.brochure_title || 'Untitled Brochure',
             downloadedAt: localBrochure.saved_at || localBrochure.created_at || new Date().toISOString(),
@@ -459,33 +468,33 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       
       for (const brochure of brochures) {
         try {
-          const brochureId = brochure.brochure_id || brochure.id
-          if (!brochureId) continue
+          const storageId = brochure.storageId || brochure.localId || brochure.brochure_id || brochure.id
+          if (!storageId) continue
 
-          const result = await BrochureManagementService.getBrochureData(brochureId)
+          const result = await BrochureManagementService.getBrochureData(storageId)
           if (result.success && result.data) {
             if (isZipBrochure(brochure, brochure.localPath)) {
-              const thumbnailResult = await BrochureManagementService.regenerateThumbnail(brochureId)
+              const thumbnailResult = await BrochureManagementService.regenerateThumbnail(storageId)
               if (thumbnailResult.success && thumbnailResult.thumbnailUri) {
-                thumbnails[brochureId] = thumbnailResult.thumbnailUri
+                thumbnails[storageId] = thumbnailResult.thumbnailUri
               }
             } else if (result.data.thumbnailUri) {
-              thumbnails[brochureId] = result.data.thumbnailUri
+              thumbnails[storageId] = result.data.thumbnailUri
             }
           } else if (isPdfBrochure(brochure, brochure.localPath) && brochure.localPath) {
             const processResult = await BrochureManagementService.processPdfFile(
-              brochureId,
+              storageId,
               brochure.localPath,
               brochure.customTitle || brochure.title,
             )
             if (processResult.success && processResult.thumbnailUri) {
-              thumbnails[brochureId] = processResult.thumbnailUri
+              thumbnails[storageId] = processResult.thumbnailUri
             }
           } else if (brochure.thumbnail_url) {
-            thumbnails[brochureId] = resolveMediaUrl(brochure.thumbnail_url)
+            thumbnails[storageId] = resolveMediaUrl(brochure.thumbnail_url)
           }
         } catch (error) {
-          console.log('Could not load thumbnail for saved brochure:', brochure.brochure_id, error)
+          console.log('Could not load thumbnail for saved brochure:', brochure.localId, error)
         }
       }
       
@@ -527,51 +536,40 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         return;
       }
 
-      // Use the server brochure ID for storage and sync; local DB row id stays unique.
+      // Each download creates an independent saved copy with its own storage folder.
       const originalBrochureId = brochure.brochure_id || brochure.id
       const downloadKey = originalBrochureId || brochure.title
+      const savedBrochureDbId = generateUUID()
+      const storageId = savedBrochureDbId
       
       console.log('=== DOWNLOAD DEBUG ===')
-      console.log('Brochure ID for storage/sync:', originalBrochureId)
+      console.log('Source brochure ID:', originalBrochureId)
+      console.log('New saved copy ID:', savedBrochureDbId)
+      console.log('Storage ID:', storageId)
       console.log('Download key for UI:', downloadKey)
       
       setDownloadingBrochures(prev => new Set([...prev, downloadKey]))
 
-      // Check if file already exists locally (from sync)
       const downloadDir = FileSystem.documentDirectory + `mr_downloads/${userId}/`
-      const brochureDataResult = await BrochureManagementService.getBrochureData(originalBrochureId)
-      
       let localPath = ''
-      let fileExists = false
       
-      // Check if brochure data exists (more reliable than file check)
-      if (brochureDataResult.success && brochureDataResult.data) {
-        // Brochure data exists, check for actual file
-        const brochureDir = FileSystem.documentDirectory + `brochures/${originalBrochureId}/`
-        const brochureFiles = await FileSystem.readDirectoryAsync(brochureDir).catch(() => [])
-        const zipFile = brochureFiles.find(f => f.endsWith('.zip') || f.endsWith('.pdf'))
-        if (zipFile) {
-          localPath = brochureDir + zipFile
-          const fileInfo = await FileSystem.getInfoAsync(localPath).catch(() => ({ exists: false }))
-          fileExists = fileInfo.exists
+      const expectedFiles = await FileSystem.readDirectoryAsync(downloadDir).catch(() => [])
+      const sourceZipFile = expectedFiles.find(file =>
+        file.includes(originalBrochureId) ||
+        file.includes(brochure.title.replace(/[^a-zA-Z0-9]/g, '_'))
+      )
+      if (sourceZipFile) {
+        localPath = downloadDir + sourceZipFile
+      } else {
+        const sourceBrochureDir = FileSystem.documentDirectory + `brochures/${originalBrochureId}/`
+        const sourceBrochureFiles = await FileSystem.readDirectoryAsync(sourceBrochureDir).catch(() => [])
+        const sourceZipInBrochureDir = sourceBrochureFiles.find(f => f.endsWith('.zip') || f.endsWith('.pdf'))
+        if (sourceZipInBrochureDir) {
+          localPath = sourceBrochureDir + sourceZipInBrochureDir
         }
       }
       
-      // Also check in mr_downloads directory
-      if (!fileExists) {
-        const expectedFiles = await FileSystem.readDirectoryAsync(downloadDir).catch(() => [])
-        const matchingFile = expectedFiles.find(file => 
-          file.includes(originalBrochureId) || 
-          file.includes(brochure.title.replace(/[^a-zA-Z0-9]/g, '_'))
-        )
-        if (matchingFile) {
-          localPath = downloadDir + matchingFile
-          const fileInfo = await FileSystem.getInfoAsync(localPath).catch(() => ({ exists: false }))
-          fileExists = fileInfo.exists
-        }
-      }
-      
-      if (!fileExists) {
+      if (!localPath) {
         // File doesn't exist locally - check if online and download from server
         const isOnline = await NetworkService.isOnline();
         
@@ -628,7 +626,6 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           if (downloadResult.success && downloadResult.localPath) {
             console.log('Brochure downloaded successfully from server:', downloadResult.localPath)
             localPath = downloadResult.localPath
-            fileExists = true
           } else {
             Alert.alert("Error", downloadResult.error || "Failed to download brochure. Please try again.")
             setDownloadingBrochures(prev => {
@@ -648,64 +645,63 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           })
           return
         }
+      } else {
+        console.log('Using existing source file for new copy:', localPath)
       }
       
-      // File exists locally - use it
-      console.log('Using existing local file:', localPath)
-      
-      // Generate custom title with suffix
-      const existingBrochuresWithSameTitle = savedBrochures.filter(b => 
-        b.title === brochure.title
-      ).length
+      const existingCopies = savedBrochures.filter(b => {
+        const sourceId = b.brochure_id || b.id
+        return resolveServerBrochureId(sourceId) === resolveServerBrochureId(originalBrochureId)
+      }).length
       
       let customTitle = brochure.title
-      if (existingBrochuresWithSameTitle > 0) {
-        customTitle = `${brochure.title} (${existingBrochuresWithSameTitle + 1})`
+      if (existingCopies > 0) {
+        customTitle = `${brochure.title} (${existingCopies + 1})`
       }
 
-      // Process by file type after download
       if (isZipBrochure(brochure, localPath)) {
-        console.log('Processing ZIP file for future viewing')
+        console.log('Processing ZIP file into independent copy folder:', storageId)
         try {
           const zipResult = await BrochureManagementService.processZipFile(
-            originalBrochureId,
+            storageId,
             localPath,
             customTitle,
           )
           if (zipResult.success && zipResult.brochureData?.thumbnailUri) {
             setBrochureThumbnails(prev => ({
               ...prev,
-              [originalBrochureId]: zipResult.brochureData!.thumbnailUri!,
+              [storageId]: zipResult.brochureData!.thumbnailUri!,
             }))
           }
-          console.log('ZIP file processed successfully')
+          console.log('ZIP file processed successfully for copy:', storageId)
         } catch (error) {
           console.log('ZIP processing failed, will process on first view:', error)
         }
       } else if (isPdfBrochure(brochure, localPath)) {
-        console.log('Processing PDF file for future viewing')
+        console.log('Processing PDF file into independent copy folder:', storageId)
         try {
           const pdfResult = await BrochureManagementService.processPdfFile(
-            originalBrochureId,
+            storageId,
             localPath,
             customTitle,
           )
           if (pdfResult.success && pdfResult.thumbnailUri) {
             setBrochureThumbnails(prev => ({
               ...prev,
-              [originalBrochureId]: pdfResult.thumbnailUri!,
+              [storageId]: pdfResult.thumbnailUri!,
             }))
           }
-          console.log('PDF file processed successfully')
+          console.log('PDF file processed successfully for copy:', storageId)
         } catch (error) {
           console.log('PDF processing failed, will process on first view:', error)
         }
       }
 
-      // Save to local DB immediately (offline-first principle)
       const { LocalDatabaseService } = await import('../../services/localDatabaseService')
-      const savedBrochureDbId = await LocalDatabaseService.createSavedBrochure({
-        server_id: undefined, // Will be set when synced to server
+      await LocalDatabaseService.createSavedBrochure({
+        id: savedBrochureDbId,
+        storage_id: storageId,
+        server_id: undefined,
         mr_id: userId,
         brochure_id: originalBrochureId,
         brochure_title: brochure.title,
@@ -715,12 +711,12 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         last_accessed: new Date().toISOString()
       })
 
-      // Create saved brochure record
       const savedBrochure: SavedBrochure = {
         ...brochure,
         brochure_id: originalBrochureId,
-        id: savedBrochureDbId,
+        id: originalBrochureId,
         localId: savedBrochureDbId,
+        storageId,
         localPath,
         customTitle,
         downloadedAt: new Date().toISOString(),
@@ -734,7 +730,12 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         mr_id: userId,
         activity_type: 'brochure_download',
         description: `Downloaded ${customTitle}`,
-        metadata: JSON.stringify({ related_id: originalBrochureId, related_type: 'brochure' }),
+        metadata: JSON.stringify({
+          related_id: originalBrochureId,
+          saved_brochure_id: savedBrochureDbId,
+          storage_id: storageId,
+          related_type: 'brochure',
+        }),
         is_deleted: false
       })
 
@@ -1134,7 +1135,9 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           
           // Update local brochure view count
           // Get brochure from local DB and increment view count
-          const localBrochure = await LocalDatabaseService.getSavedBrochureById(brochureId).catch(() => null)
+          const localBrochure = await LocalDatabaseService.getSavedBrochureById(
+            (brochure as SavedBrochure).localId,
+          ).catch(() => null)
           if (localBrochure) {
             // Update view count locally (could add a view_count field to saved_brochures table)
             // For now, just track in local state
@@ -1182,23 +1185,27 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       let isOffline = false
       
       if ('localId' in brochure) {
+        const saved = brochure as SavedBrochure
+        const storageId = saved.storageId || saved.localId
         const downloadDir = FileSystem.documentDirectory + `mr_downloads/${userId}/`
         const downloadFiles = await FileSystem.readDirectoryAsync(downloadDir).catch(() => [])
-        const matchingDownload = downloadFiles.find((file) => file.includes(brochureId))
+        const matchingDownload = downloadFiles.find((file) =>
+          file.includes(storageId) || (saved.localPath ? file.includes(saved.localPath.split('/').pop() || '') : false),
+        )
         if (matchingDownload) {
           fileUrl = downloadDir + matchingDownload
           isOffline = true
         } else {
-          const brochureDir = FileSystem.documentDirectory + `brochures/${brochureId}/`
+          const brochureDir = FileSystem.documentDirectory + `brochures/${storageId}/`
           const brochureFiles = await FileSystem.readDirectoryAsync(brochureDir).catch(() => [])
           const brochureFile = brochureFiles.find((file) => file.endsWith('.zip') || file.endsWith('.pdf'))
           if (brochureFile) {
             fileUrl = brochureDir + brochureFile
             isOffline = true
-          } else if ((brochure as SavedBrochure).localPath) {
-            const fileInfo = await FileSystem.getInfoAsync((brochure as SavedBrochure).localPath).catch(() => ({ exists: false }))
+          } else if (saved.localPath) {
+            const fileInfo = await FileSystem.getInfoAsync(saved.localPath).catch(() => ({ exists: false }))
             if (fileInfo.exists) {
-              fileUrl = (brochure as SavedBrochure).localPath
+              fileUrl = saved.localPath
               isOffline = true
             }
           }
@@ -1245,6 +1252,9 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
   ) => {
     try {
       const isSavedBrochure = 'localId' in brochure
+      const storageId = isSavedBrochure
+        ? ((brochure as SavedBrochure).storageId || (brochure as SavedBrochure).localId)
+        : brochureId
       const localPath = isSavedBrochure ? (brochure as SavedBrochure).localPath : fileUrl
       const brochureTitle = ('customTitle' in brochure && brochure.customTitle)
         ? brochure.customTitle
@@ -1254,11 +1264,11 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       const pdfBrochure = isPdfBrochure(brochure, localPath)
 
       if (zipBrochure) {
-        if (isOffline && localPath && brochureId) {
-          const result = await BrochureManagementService.getBrochureData(brochureId)
+        if (localPath && storageId) {
+          const result = await BrochureManagementService.getBrochureData(storageId)
           if (!result.success) {
             const processResult = await BrochureManagementService.processZipFile(
-              brochureId,
+              storageId,
               localPath,
               brochureTitle,
             )
@@ -1270,19 +1280,20 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         }
 
         navigation.navigate('SlideManagement', {
-          brochureId,
+          brochureId: storageId,
           brochureTitle,
           isOffline,
+          sourceBrochureId: brochureId,
         })
         return
       }
 
       if (pdfBrochure) {
-        if (isOffline && localPath && brochureId) {
-          const converted = await PDFConversionService.isPresentationConverted(brochureId)
+        if (localPath && storageId) {
+          const converted = await PDFConversionService.isPresentationConverted(storageId)
           if (!converted) {
             const processResult = await BrochureManagementService.processPdfFile(
-              brochureId,
+              storageId,
               localPath,
               brochureTitle,
             )
@@ -1293,7 +1304,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         }
 
         navigation.navigate('BrochureViewer', {
-          brochureId,
+          brochureId: storageId,
           brochureTitle,
           brochureFile: localPath || fileUrl,
           isOffline,
@@ -1302,7 +1313,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       }
 
       navigation.navigate('BrochureViewer', {
-        brochureId,
+        brochureId: storageId,
         brochureTitle,
         brochureFile: fileUrl,
         isOffline,
@@ -1340,43 +1351,32 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         return;
       }
 
-      // Update database entry if it exists (for sync queue)
+      // Update local DB and queue title change for sync (do not mark synced here)
       try {
         const { LocalDatabaseService } = await import('../../services/localDatabaseService');
         const savedBrochure = await LocalDatabaseService.getSavedBrochureById(renameBrochure.localId);
         if (savedBrochure) {
-          // Update in database and queue for sync (don't skip sync queue)
           await LocalDatabaseService.updateSavedBrochure(renameBrochure.localId, {
             custom_title: newTitle.trim(),
             sync_status: 'pending',
           });
+
+          await LocalDatabaseService.createActivityLog({
+            user_id: userId,
+            mr_id: userId,
+            activity_type: 'brochure_renamed',
+            description: `Renamed brochure to "${newTitle.trim()}"`,
+            metadata: JSON.stringify({
+              saved_brochure_id: renameBrochure.localId,
+              brochure_id: brochureId,
+              previous_title: renameBrochure.customTitle,
+              new_title: newTitle.trim(),
+            }),
+            is_deleted: false,
+          });
         }
       } catch (dbError) {
         console.warn('Failed to update saved brochure in database:', dbError);
-        // Continue with AsyncStorage update
-      }
-
-      // Update server if online (only if brochureId is valid)
-      if (brochureId) {
-        // TODO: Queue saved brochure title update for sync
-        // const serverResult = await savedBrochuresSyncService.updateSavedBrochureTitle(
-        //   userId,
-        //   brochureId,
-        //   newTitle.trim()
-        // )
-        const serverResult = { success: true } // Placeholder - changes are queued
-        // If server update succeeds, mark as synced
-        if (serverResult.success) {
-          try {
-            const { LocalDatabaseService } = await import('../../services/localDatabaseService');
-            await LocalDatabaseService.updateSavedBrochure(renameBrochure.localId, {
-              sync_status: 'synced',
-              skipSyncQueue: true,
-            });
-          } catch (dbError) {
-            console.warn('Failed to mark brochure as synced:', dbError);
-          }
-        }
       }
 
       // Update the brochure title locally (for UI)
@@ -1704,7 +1704,9 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
                     {(() => {
                       // Check for ZIP brochure thumbnail first (for downloaded/processed brochures)
                       // For saved brochures, use the actual brochure_id (which might include timestamp)
-                      const thumbnailKey = isSaved ? brochureId : brochureId
+                      const thumbnailKey = isSaved
+                        ? ((brochure as SavedBrochure).storageId || (brochure as SavedBrochure).localId)
+                        : brochureId
                       const zipThumbnail = brochureThumbnails[thumbnailKey || 'default']
                       
                       if (zipThumbnail) {

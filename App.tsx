@@ -245,15 +245,11 @@ export default function App() {
             return;
           }
           
-          // Simple check: perform sync if local DB appears empty
-          // TODO: Implement more sophisticated sync decision logic if needed
-          const doctors = await LocalDatabaseService.getDoctors(autoLoginResult.user.id);
-          const shouldSync = doctors.length === 0;
+          const syncResult = await SyncService.syncDownInitial(autoLoginResult.user.id);
+          const shouldSync = syncResult.message !== 'Skipped initial sync down — local data already exists';
           
           if (shouldSync) {
-            console.log(`🔄 AUTO-LOGIN DEBUG: Starting comprehensive sync - Reason: Local DB appears empty...`);
-            
-            const syncResult = await SyncService.syncDown(autoLoginResult.user.id);
+            console.log(`🔄 AUTO-LOGIN DEBUG: Starting initial sync down — local DB is empty`);
             
             if (syncResult.success) {
               console.log('✅ AUTO-LOGIN DEBUG: Comprehensive sync completed successfully');
@@ -270,7 +266,7 @@ export default function App() {
               console.warn('⚠️ AUTO-LOGIN DEBUG: Comprehensive sync failed:', syncResult.error);
             }
           } else {
-            console.log(`⏭️ AUTO-LOGIN DEBUG: Skipping sync - Local DB has ${doctors.length} doctors (offline-first mode)`);
+            console.log('⏭️ AUTO-LOGIN DEBUG: Skipping sync down — local data exists (offline-first mode)');
             // Work with local data only
             
             // Even if sync is skipped, clean up any duplicates that may exist

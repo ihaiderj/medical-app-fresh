@@ -6,6 +6,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as SecureStore from 'expo-secure-store'
 import { LocalDatabaseService } from './localDatabaseService'
 import { SessionManagementService } from './sessionManagementService'
+import { ExtendedAuthService } from './extendedAuthService'
 
 interface PersistentSession {
   userId: string
@@ -120,6 +121,10 @@ export class PersistentAuthService {
       // Get saved session
       const { session, isValid } = await this.getSession()
       if (!isValid || !session) {
+        const extendedRestore = await this.tryRestoreFromExtendedSession()
+        if (extendedRestore.success) {
+          return extendedRestore
+        }
         console.log('No valid session found')
         return { success: false, error: 'No valid session' }
       }
@@ -127,6 +132,10 @@ export class PersistentAuthService {
       // Try to get saved credentials
       const credentialsData = await SecureStore.getItemAsync(this.CREDENTIALS_KEY)
       if (!credentialsData) {
+        const extendedRestore = await this.tryRestoreFromExtendedSession()
+        if (extendedRestore.success) {
+          return extendedRestore
+        }
         console.log('No saved credentials found')
         return { success: false, error: 'No saved credentials' }
       }
@@ -134,14 +143,28 @@ export class PersistentAuthService {
       const credentials = JSON.parse(credentialsData)
       
       if (credentials.isHashed) {
-        const localResult = await LocalDatabaseService.getUserCredentialsByEmail(credentials.email)
+        let localResult = await LocalDatabaseService.getUserCredentialsByEmail(credentials.email)
+        if (!localResult) {
+          await LocalDatabaseService.ensureReady()
+          localResult = await LocalDatabaseService.getUserCredentialsByEmail(credentials.email)
+        }
+
         if (!localResult || localResult.password_hash !== credentials.password) {
+          console.warn('PersistentAuth: Stored credentials mismatch or lookup failed')
+          const extendedRestore = await this.tryRestoreFromExtendedSession()
+          if (extendedRestore.success) {
+            return extendedRestore
+          }
           await this.clearSession()
           return { success: false, error: 'Stored credentials mismatch' }
         }
 
         const localUser = await LocalDatabaseService.getUserById(localResult.user_id)
         if (!localUser) {
+          const extendedRestore = await this.tryRestoreFromExtendedSession()
+          if (extendedRestore.success) {
+            return extendedRestore
+          }
           await this.clearSession()
           return { success: false, error: 'Offline profile not found' }
         }
@@ -184,8 +207,48 @@ export class PersistentAuthService {
       }
     } catch (error) {
       console.error('Error in auto-login:', error)
-      await this.clearSession() // Clear potentially corrupted data
+      const extendedRestore = await this.tryRestoreFromExtendedSession()
+      if (extendedRestore.success) {
+        return extendedRestore
+      }
       return { success: false, error: 'Auto-login error' }
+    }
+  }
+
+  private static async tryRestoreFromExtendedSession(): Promise<{ success: boolean; user?: any; error?: string }> {
+    try {
+      const extended = await ExtendedAuthService.getExtendedSession()
+      if (!extended || Date.now() >= extended.expiresAt) {
+        return { success: false, error: 'No extended session' }
+      }
+
+      await LocalDatabaseService.ensureReady()
+      const localUser = await LocalDatabaseService.getUserById(extended.userId)
+      if (!localUser) {
+        return { success: false, error: 'Extended session user not in local DB' }
+      }
+
+      const userProfile = {
+        id: localUser.id,
+        email: localUser.email,
+        role: localUser.role,
+        first_name: localUser.first_name,
+        last_name: localUser.last_name,
+        phone: localUser.phone,
+        profile_image_url: localUser.profile_image_url,
+        is_active: localUser.is_active,
+      }
+
+      await SessionManagementService.recordLocalSession(userProfile.id)
+      const { AuthService } = require('./AuthService')
+      AuthService.setCurrentUser(userProfile)
+      await this.saveSession(extended.userId, extended.email, extended.role, undefined, true)
+
+      console.log('Auto-login succeeded using extended offline session')
+      return { success: true, user: userProfile }
+    } catch (error) {
+      console.warn('PersistentAuth: Extended session restore failed:', error)
+      return { success: false, error: 'Extended session restore failed' }
     }
   }
 

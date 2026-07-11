@@ -154,6 +154,21 @@ export class MRService {
     }
   }
 
+  /** Server activity log ids for reconciliation (local is source of truth on sync-up). */
+  static async listActivityLogIds(
+    _mrId: string,
+    limit: number = 500,
+  ): Promise<{ success: boolean; data?: string[]; error?: string }> {
+    const result = await this.getRecentActivities(_mrId, limit)
+    if (!result.success) {
+      return { success: false, error: result.error }
+    }
+    const ids = (result.data || [])
+      .map((row) => String(row.id || '').trim())
+      .filter(Boolean)
+    return { success: true, data: ids }
+  }
+
   static async getAssignedBrochures(_mrId: string): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
     try {
       const data = await apiClient.get<MRAssignedBrochure[]>('/api/mr/brochures/')
@@ -685,15 +700,26 @@ export class MRService {
     try {
       const data = await apiClient.get<unknown[]>('/api/mr/saved-brochures/')
       const transformedData =
-        data?.map((item: Record<string, unknown>, index: number) => ({
-          id: item.id || `saved_${item.brochure_id}_${index}`,
-          brochure_id: item.brochure_id,
-          brochure_title: item.brochure_title,
-          custom_title: item.custom_title,
-          original_brochure_data: item.original_brochure_data,
-          saved_at: item.saved_at || item.created_at,
-          last_accessed: item.last_accessed,
-        })) || []
+        data
+          ?.map((item: Record<string, unknown>) => {
+            if (!item.id) {
+              console.warn(
+                '⚠️ Saved brochure from server missing id — skipped (reconcile by server id only)',
+                item.brochure_id,
+              )
+              return null
+            }
+            return {
+              id: String(item.id),
+              brochure_id: item.brochure_id,
+              brochure_title: item.brochure_title,
+              custom_title: item.custom_title,
+              original_brochure_data: item.original_brochure_data,
+              saved_at: item.saved_at || item.created_at,
+              last_accessed: item.last_accessed,
+            }
+          })
+          .filter((row): row is NonNullable<typeof row> => row !== null) || []
       return { success: true, data: transformedData }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to fetch saved brochures') }
@@ -704,12 +730,19 @@ export class MRService {
     _mrId: string,
     brochureOrSavedId: string,
     customTitle: string,
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; error?: string; notFound?: boolean }> {
     try {
       await apiClient.patch(`/api/mr/saved-brochures/${brochureOrSavedId}/`, { custom_title: customTitle })
       return { success: true }
     } catch (error) {
-      return { success: false, error: serviceError(error, 'Failed to update saved brochure title') }
+      const notFound =
+        error instanceof ApiError &&
+        (error.status === 404 || error.message.toLowerCase().includes('not found'))
+      return {
+        success: false,
+        error: serviceError(error, 'Failed to update saved brochure title'),
+        notFound,
+      }
     }
   }
 
