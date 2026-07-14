@@ -187,9 +187,7 @@ export class OfflineFirstService {
       });
 
       const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueDoctorSync(payload.mr_id).catch(console.warn);
-      }
+      // Sync queue + syncUpFull handles backup; do not pull server doctors on write.
 
       return { success: true, data: { id }, isOffline: !isOnline };
     } catch (error) {
@@ -202,9 +200,7 @@ export class OfflineFirstService {
       await LocalDatabaseService.updateDoctor(id, updates as Partial<LocalDoctor>);
 
       const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueDoctorSyncById(id).catch(console.warn);
-      }
+      // Sync queue + syncUpFull handles backup.
 
       return { success: true, isOffline: !isOnline };
     } catch (error) {
@@ -212,9 +208,13 @@ export class OfflineFirstService {
     }
   }
 
-  static async deleteDoctor(id: string, deleteRelatedMeetings: boolean = false): Promise<ServiceResponse<{ hasMeetings: boolean; meetingCount: number }>> {
+  static async deleteDoctor(
+    id: string,
+    deleteRelatedMeetings: boolean = false,
+    checkOnly: boolean = false,
+  ): Promise<ServiceResponse<{ hasMeetings: boolean; meetingCount: number }>> {
     try {
-      const result = await LocalDatabaseService.deleteDoctor(id, deleteRelatedMeetings);
+      const result = await LocalDatabaseService.deleteDoctor(id, deleteRelatedMeetings, checkOnly);
       
       if (!result.success) {
         return { 
@@ -225,9 +225,8 @@ export class OfflineFirstService {
       }
       
       const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueDoctorSyncById(id).catch(console.warn);
-      }
+      // Sync queue + syncUpFull handles backup.
+
       return { 
         success: true, 
         isOffline: !isOnline,
@@ -367,9 +366,7 @@ export class OfflineFirstService {
       });
 
       const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueMeetingSync(payload.mr_id).catch(console.warn);
-      }
+      // Sync queue + syncUpFull handles backup; do not pull server meetings on write.
 
       return { success: true, data: { id }, isOffline: !isOnline };
     } catch (error) {
@@ -382,9 +379,7 @@ export class OfflineFirstService {
       await LocalDatabaseService.updateMeeting(id, updates as Partial<LocalMeeting>);
 
       const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueMeetingSyncById(id).catch(console.warn);
-      }
+      // Sync queue + syncUpFull handles backup.
 
       return { success: true, isOffline: !isOnline };
     } catch (error) {
@@ -396,9 +391,8 @@ export class OfflineFirstService {
     try {
       await LocalDatabaseService.deleteMeeting(id);
       const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueMeetingSyncById(id).catch(console.warn);
-      }
+      // Sync queue + syncUpFull handles backup.
+
       return { success: true, isOffline: !isOnline };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to delete meeting' };
@@ -409,11 +403,7 @@ export class OfflineFirstService {
     try {
       await LocalDatabaseService.ensureReady();
       const meetings = await LocalDatabaseService.getMeetings(mrId);
-      const isOnline = await NetworkService.isOnline();
-      if (isOnline) {
-        this.enqueueMeetingSync(mrId).catch(console.warn);
-      }
-      return { success: true, data: meetings, isOffline: !isOnline };
+      return { success: true, data: meetings, isOffline: true };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to load meetings' };
     }

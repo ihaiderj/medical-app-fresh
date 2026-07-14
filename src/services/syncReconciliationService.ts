@@ -228,22 +228,147 @@ export class SyncReconciliationService {
     clearedStaleServerIds: number
     errors: string[]
   }> {
-    return this.reconcileServerBackedRecords({
-      entity: 'doctors',
-      mrId,
-      fetchServerIds: async () => {
-        const result = await MRService.getDoctors(mrId)
-        if (!result.success || !result.data) {
-          throw new Error(result.error || 'Failed to fetch doctors from server')
+    let queued = 0
+    let clearedStaleServerIds = 0
+    const errors: string[] = []
+
+    let serverDoctors: MRAssignedDoctor[] = []
+    try {
+      const listResult = await MRService.getDoctors(mrId)
+      if (!listResult.success || !listResult.data) {
+        throw new Error(listResult.error || 'Failed to fetch doctors from server')
+      }
+      serverDoctors = listResult.data
+    } catch (error) {
+      errors.push(`doctors: ${error instanceof Error ? error.message : 'Server fetch failed'}`)
+      return { queued, clearedStaleServerIds, errors }
+    }
+
+    const serverById = new Map(
+      serverDoctors.map((doctor) => [String(doctor.doctor_id || ''), doctor]),
+    )
+    const serverIds = new Set(serverById.keys())
+    const locals = await LocalDatabaseService.getDoctors(mrId)
+
+    console.log(
+      `🔄 RECONCILE doctors: local=${locals.filter((doctor) => !doctor.is_deleted).length} server=${serverIds.size}`,
+    )
+
+    for (const local of locals) {
+      if (local.is_deleted) continue
+
+      try {
+        let operation: 'create' | 'update' | undefined
+        let clearServerId = false
+
+        if (local.sync_status === 'pending' || local.sync_status === 'error') {
+          operation = local.server_id ? 'update' : 'create'
+        } else if (!local.server_id) {
+          operation = 'create'
+        } else if (!serverIds.has(String(local.server_id))) {
+          operation = 'create'
+          clearServerId = true
+        } else {
+          const serverDoctor = serverById.get(String(local.server_id))
+          if (serverDoctor && this.localDoctorDiffersFromServer(local, serverDoctor)) {
+            operation = 'update'
+          }
         }
-        return new Set(
-          (result.data as MRAssignedDoctor[])
-            .map((d) => String(d.doctor_id || ''))
-            .filter(Boolean),
+
+        const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation('doctors', local.id)
+        if (alreadyQueued && !operation) {
+          operation = local.server_id ? 'update' : 'create'
+        }
+
+        if (!operation) continue
+
+        if (clearServerId) {
+          await LocalDatabaseService.resetDoctorServerSync(local.id)
+          clearedStaleServerIds++
+        }
+
+        if (!alreadyQueued) {
+          await LocalDatabaseService.addToSyncQueue(operation, 'doctors', local.id, {
+            ...local,
+            notes: local.notes ?? '',
+          })
+          queued++
+          console.log(`🔄 RECONCILE: Queued doctors ${operation} for ${local.id}`)
+        }
+
+        await LocalDatabaseService.updateDoctor(local.id, {
+          sync_status: 'pending',
+          skipSyncQueue: true,
+        })
+      } catch (error) {
+        errors.push(
+          `doctors ${local.id}: ${error instanceof Error ? error.message : 'Unknown'}`,
         )
-      },
-      loadLocal: () => LocalDatabaseService.getDoctors(mrId),
-    })
+      }
+    }
+
+    console.log(`🔄 RECONCILE doctors: queued=${queued} cleared=${clearedStaleServerIds}`)
+
+    const deletedLocals = await LocalDatabaseService.getDeletedDoctorsWithServerId(mrId)
+    for (const local of deletedLocals) {
+      if (!local.server_id || !LocalDatabaseService.doctorDeleteNeedsServerTombstone(local)) {
+        continue
+      }
+
+      try {
+        const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation('doctors', local.id)
+        if (!alreadyQueued) {
+          await LocalDatabaseService.addToSyncQueue('delete', 'doctors', local.id, {
+            ...local,
+            notes: local.notes ?? '',
+          })
+          queued++
+          console.log(
+            `🔄 RECONCILE: Queued doctors delete for ${local.id} (server_id=${local.server_id})`,
+          )
+        }
+
+        if (local.sync_status === 'synced' || local.sync_status === 'error') {
+          await LocalDatabaseService.updateDoctor(local.id, {
+            sync_status: 'pending',
+            skipSyncQueue: true,
+          })
+        }
+      } catch (error) {
+        errors.push(
+          `doctors delete ${local.id}: ${error instanceof Error ? error.message : 'Unknown'}`,
+        )
+      }
+    }
+
+    return { queued, clearedStaleServerIds, errors }
+  }
+
+  private static localDoctorDiffersFromServer(
+    local: {
+      first_name?: string
+      last_name?: string
+      specialty?: string
+      hospital?: string
+      phone?: string | null
+      email?: string | null
+      location?: string | null
+      notes?: string | null
+    },
+    server: MRAssignedDoctor,
+  ): boolean {
+    const norm = (value: unknown) => String(value ?? '').trim()
+
+    return (
+      norm(local.first_name) !== norm(server.first_name) ||
+      norm(local.last_name) !== norm(server.last_name) ||
+      norm(local.specialty) !== norm(server.specialty) ||
+      norm(local.hospital) !== norm(server.hospital) ||
+      norm(local.phone) !== norm(server.phone) ||
+      norm(local.email) !== norm(server.email) ||
+      norm(local.location) !== norm(server.location) ||
+      norm(local.notes) !== norm(server.notes)
+    )
   }
 
   private static async reconcileMeetings(mrId: string): Promise<{
@@ -251,22 +376,24 @@ export class SyncReconciliationService {
     clearedStaleServerIds: number
     errors: string[]
   }> {
-    return this.reconcileServerBackedRecords({
+    const result = await this.reconcileServerBackedRecords({
       entity: 'meetings',
       mrId,
       fetchServerIds: async () => {
-        const result = await MRService.getMeetings(mrId)
-        if (!result.success || !result.data) {
-          throw new Error(result.error || 'Failed to fetch meetings from server')
+        const listResult = await MRService.getMeetings(mrId)
+        if (!listResult.success || !listResult.data) {
+          throw new Error(listResult.error || 'Failed to fetch meetings from server')
         }
         return new Set(
-          (result.data as Array<{ id?: string; meeting_id?: string }>)
+          (listResult.data as Array<{ id?: string; meeting_id?: string }>)
             .map((m) => String(m.id || m.meeting_id || ''))
             .filter(Boolean),
         )
       },
       loadLocal: () => LocalDatabaseService.getMeetings(mrId),
     })
+    console.log(`🔄 RECONCILE meetings: queued=${result.queued} cleared=${result.clearedStaleServerIds}`)
+    return result
   }
 
   private static async reconcileMeetingFollowUps(mrId: string): Promise<{
@@ -275,28 +402,59 @@ export class SyncReconciliationService {
     errors: string[]
   }> {
     let queued = 0
+    let clearedStaleServerIds = 0
     const errors: string[] = []
+
+    const serverList = await MRService.listServerFollowUpIds(mrId)
+    if (!serverList.success) {
+      errors.push(`meeting_followups: ${serverList.error || 'Failed to fetch server list'}`)
+      return { queued, clearedStaleServerIds, errors }
+    }
+
+    const serverIds = new Set(serverList.data || [])
     const meetings = await LocalDatabaseService.getMeetings(mrId)
+    const localFollowUps = (
+      await Promise.all(meetings.map((m) => LocalDatabaseService.getMeetingFollowUps(m.id)))
+    ).flat()
+
+    console.log(
+      `🔄 RECONCILE meeting_followups: local=${localFollowUps.filter((f) => !f.is_deleted).length} server=${serverIds.size}`,
+    )
 
     for (const meeting of meetings) {
       const followUps = await LocalDatabaseService.getMeetingFollowUps(meeting.id)
       for (const followUp of followUps) {
         if (followUp.is_deleted) continue
-        const op = await this.localRecordNeedsQueue(followUp.sync_status, followUp.server_id)
-        if (!op) continue
-
-        if (op === 'create' && !meeting.server_id) {
-          continue
-        }
 
         try {
-          await LocalDatabaseService.addToSyncQueue(op, 'meeting_followups', followUp.id, followUp)
+          let operation: 'create' | 'update' | undefined
+          let clearServerId = false
+
+          if (followUp.sync_status === 'pending' || followUp.sync_status === 'error') {
+            operation = followUp.server_id ? 'update' : 'create'
+          } else if (!followUp.server_id) {
+            operation = 'create'
+          } else if (!serverIds.has(String(followUp.server_id))) {
+            operation = 'create'
+            clearServerId = true
+          }
+
+          if (!operation) continue
+          if (operation === 'create' && !meeting.server_id) continue
+
+          if (clearServerId) {
+            await LocalDatabaseService.resetMeetingFollowUpServerSync(followUp.id)
+            clearedStaleServerIds++
+          }
+
+          await LocalDatabaseService.addToSyncQueue(operation, 'meeting_followups', followUp.id, followUp)
           await LocalDatabaseService.updateMeetingFollowUp(
             followUp.id,
             { sync_status: 'pending' },
             true,
           )
           queued++
+          console.log(`🔄 RECONCILE: Queued meeting_followups ${operation} for ${followUp.id}`)
         } catch (error) {
           errors.push(
             `meeting_followup ${followUp.id}: ${error instanceof Error ? error.message : 'Unknown'}`,
@@ -305,7 +463,7 @@ export class SyncReconciliationService {
       }
     }
 
-    return { queued, clearedStaleServerIds: 0, errors }
+    return { queued, clearedStaleServerIds, errors }
   }
 
   private static async reconcileMeetingNotes(mrId: string): Promise<{
@@ -314,32 +472,56 @@ export class SyncReconciliationService {
     errors: string[]
   }> {
     let queued = 0
+    let clearedStaleServerIds = 0
     const errors: string[] = []
-    const meetings = await LocalDatabaseService.getMeetings(mrId)
 
-    for (const meeting of meetings) {
-      const notes = await LocalDatabaseService.getMeetingNotes(meeting.id)
-      for (const note of notes) {
-        if (note.is_deleted) continue
-        const op = await this.localRecordNeedsQueue(note.sync_status, note.server_id)
-        if (!op) continue
-        if (op === 'create' && !meeting.server_id) continue
+    const serverList = await MRService.listServerMeetingNoteIds(mrId)
+    if (!serverList.success) {
+      errors.push(`meeting_notes: ${serverList.error || 'Failed to fetch server list'}`)
+      return { queued, clearedStaleServerIds, errors }
+    }
 
-        try {
-          await LocalDatabaseService.addToSyncQueue(op, 'meeting_notes', note.id, note)
-          await LocalDatabaseService.updateMeetingSlideNote(
-            note.id,
-            { sync_status: 'pending' },
-            true,
-          )
-          queued++
-        } catch (error) {
-          errors.push(`meeting_note ${note.id}: ${error instanceof Error ? error.message : 'Unknown'}`)
+    const serverIds = new Set(serverList.data || [])
+    const notes = await LocalDatabaseService.getMeetingNotesForMr(mrId)
+
+    console.log(`🔄 RECONCILE meeting_notes: local=${notes.length} server=${serverIds.size}`)
+
+    for (const note of notes) {
+      if (note.is_deleted) continue
+
+      try {
+        let operation: 'create' | 'update' | undefined
+        let clearServerId = false
+
+        if (note.sync_status === 'pending' || note.sync_status === 'error') {
+          operation = note.server_id ? 'update' : 'create'
+        } else if (!note.server_id) {
+          operation = 'create'
+        } else if (!serverIds.has(String(note.server_id))) {
+          operation = 'create'
+          clearServerId = true
         }
+
+        if (!operation) continue
+
+        const meeting = await LocalDatabaseService.getMeetingById(note.meeting_id)
+        if (operation === 'create' && (!meeting || !meeting.server_id)) continue
+
+        if (clearServerId) {
+          await LocalDatabaseService.resetMeetingNoteServerSync(note.id)
+          clearedStaleServerIds++
+        }
+
+        await LocalDatabaseService.addToSyncQueue(operation, 'meeting_notes', note.id, note)
+        await LocalDatabaseService.updateMeetingNote(note.id, { sync_status: 'pending' }, true)
+        queued++
+        console.log(`🔄 RECONCILE: Queued meeting_notes ${operation} for ${note.id}`)
+      } catch (error) {
+        errors.push(`meeting_note ${note.id}: ${error instanceof Error ? error.message : 'Unknown'}`)
       }
     }
 
-    return { queued, clearedStaleServerIds: 0, errors }
+    return { queued, clearedStaleServerIds, errors }
   }
 
   private static async reconcileBrochureSyncs(mrId: string): Promise<{
@@ -421,16 +603,19 @@ export class SyncReconciliationService {
           clearedStaleServerIds++
         }
 
-        await LocalDatabaseService.addToSyncQueue('create', 'activity_logs', log.id, {
-          ...log,
-          activity_type: activityType,
-          description,
-          action: activityType,
-          details: description,
-          server_id: null,
-        })
-        queued++
-        console.log(`🔄 RECONCILE: Queued activity_logs create for ${log.id}`)
+        const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation('activity_logs', log.id)
+        if (!alreadyQueued) {
+          await LocalDatabaseService.addToSyncQueue('create', 'activity_logs', log.id, {
+            ...log,
+            activity_type: activityType,
+            description,
+            action: activityType,
+            details: description,
+            server_id: null,
+          })
+          queued++
+          console.log(`🔄 RECONCILE: Queued activity_logs create for ${log.id}`)
+        }
       } catch (error) {
         errors.push(`activity_log ${log.id}: ${error instanceof Error ? error.message : 'Unknown'}`)
       }
@@ -487,6 +672,10 @@ export class SyncReconciliationService {
     }
 
     const locals = await options.loadLocal()
+    console.log(
+      `🔄 RECONCILE ${options.entity}: local=${locals.filter((l) => !l.is_deleted).length} server=${serverIds.size}`,
+    )
+
     for (const local of locals) {
       if (local.is_deleted) continue
 
@@ -507,9 +696,9 @@ export class SyncReconciliationService {
 
         if (clearServerId) {
           if (options.entity === 'doctors') {
-            await LocalDatabaseService.updateDoctor(local.id, { server_id: null }, true)
+            await LocalDatabaseService.resetDoctorServerSync(local.id)
           } else {
-            await LocalDatabaseService.updateMeeting(local.id, { server_id: null }, true)
+            await LocalDatabaseService.resetMeetingServerSync(local.id)
           }
           clearedStaleServerIds++
         }
@@ -517,13 +706,19 @@ export class SyncReconciliationService {
         const tableName = options.entity
         const updateFn =
           options.entity === 'doctors'
-            ? (id: string) => LocalDatabaseService.updateDoctor(id, { sync_status: 'pending' }, true)
-            : (id: string) => LocalDatabaseService.updateMeeting(id, { sync_status: 'pending' }, true)
+            ? (id: string) => LocalDatabaseService.updateDoctor(id, { sync_status: 'pending', skipSyncQueue: true })
+            : (id: string) => LocalDatabaseService.updateMeeting(id, { sync_status: 'pending', skipSyncQueue: true })
 
-        await LocalDatabaseService.addToSyncQueue(operation, tableName, local.id, local)
+        const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation(tableName, local.id)
+        if (!alreadyQueued) {
+          await LocalDatabaseService.addToSyncQueue(operation, tableName, local.id, {
+            ...local,
+            notes: local.notes ?? '',
+          })
+          queued++
+          console.log(`🔄 RECONCILE: Queued ${tableName} ${operation} for ${local.id}`)
+        }
         await updateFn(local.id)
-        queued++
-        console.log(`🔄 RECONCILE: Queued ${tableName} ${operation} for ${local.id}`)
       } catch (error) {
         errors.push(
           `${options.entity} ${local.id}: ${error instanceof Error ? error.message : 'Unknown'}`,

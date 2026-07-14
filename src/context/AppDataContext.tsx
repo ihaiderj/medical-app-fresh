@@ -173,10 +173,9 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
    */
   const notifyDoctorChange = useCallback(() => {
     console.log('AppDataContext: Notifying doctor change');
-    
-    // Refresh doctors first
-    refreshDoctors().then(() => {
-      // Then notify all subscribers using the current state
+
+    // Defer to next tick — avoids "Cannot update component while rendering" warnings
+    setTimeout(() => {
       setDoctorSubscribers(current => {
         console.log('AppDataContext: Notifying', current.size, 'doctor subscribers');
         current.forEach(callback => {
@@ -186,9 +185,13 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
             console.error('AppDataContext: Error in doctor change subscriber:', error);
           }
         });
-        return current; // Return same set to avoid triggering state update
+        return current;
       });
-    });
+
+      refreshDoctors().catch(error => {
+        console.error('AppDataContext: Error refreshing doctors:', error);
+      });
+    }, 0);
   }, [refreshDoctors]);
 
   /**
@@ -335,10 +338,9 @@ export const AppDataProvider: React.FC<AppDataProviderProps> = ({ children }) =>
               void (async () => {
                 try {
                   await LocalDatabaseService.ensureReady();
-                  await LocalDatabaseService.markServerDoctorsSynced(session.userId);
-                  await LocalDatabaseService.cleanupStaleSyncQueueEntries(session.userId);
+                  await LocalDatabaseService.repairDoctorSyncQueueState(session.userId);
                 } catch (error) {
-                  console.warn('AppDataContext: Failed to fix server doctors sync status:', error);
+                  console.warn('AppDataContext: Failed to repair doctor sync queue state:', error);
                 }
               })();
             }, 2000);

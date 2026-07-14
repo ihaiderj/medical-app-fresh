@@ -24,7 +24,11 @@ export class DoctorPhotoServiceV2 {
     localFilePath: string,
     fileName: string,
     userId: string,
-    onProgress?: (progress: PhotoUploadProgress) => void
+    onProgress?: (progress: PhotoUploadProgress) => void,
+    options?: {
+      doctorLocalId?: string
+      doctorServerId?: string
+    },
   ): Promise<PhotoUploadResult> {
     try {
       console.log('Starting doctor photo upload (offline-first):', fileName)
@@ -80,6 +84,14 @@ export class DoctorPhotoServiceV2 {
       const { LocalDatabaseService } = await import('./localDatabaseService')
       const { generateUUID } = await import('../utils/uuid')
       
+      const localChanges =
+        options?.doctorLocalId || options?.doctorServerId
+          ? JSON.stringify({
+              doctor_local_id: options?.doctorLocalId || null,
+              doctor_server_id: options?.doctorServerId || null,
+            })
+          : null
+
       await LocalDatabaseService.upsertDoctorPhoto({
         id: generateUUID(),
         user_id: userId,
@@ -88,7 +100,8 @@ export class DoctorPhotoServiceV2 {
         mime_type: mimeType,
         created_at: new Date().toISOString(),
         sync_status: 'pending',
-        local_changes: null
+        local_changes: localChanges,
+        needs_sync: true,
       })
 
       if (onProgress) {

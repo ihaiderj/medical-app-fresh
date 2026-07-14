@@ -240,7 +240,11 @@ export default function DoctorFormModal({
         resolvedUserId,
         (progress) => {
           setPhotoProgress(progress.percentage);
-        }
+        },
+        {
+          doctorLocalId: existingDoctor?.id,
+          doctorServerId: existingDoctor?.server_id,
+        },
       );
 
       if (!uploadResult.success || !uploadResult.photoUrl) {

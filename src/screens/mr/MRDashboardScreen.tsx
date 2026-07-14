@@ -278,9 +278,10 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     const unsubscribe = onActivityChange(() => {
       console.log('MRDashboard: Received activity change notification, refreshing dashboard...');
       loadDashboardData();
+      refreshSyncStats();
     });
     return unsubscribe;
-  }, [onActivityChange, loadDashboardData])
+  }, [onActivityChange, loadDashboardData, refreshSyncStats])
 
   const debugReloadData = async () => {
     console.log('🔍 DASHBOARD DEBUG: Manual reload triggered');
@@ -504,6 +505,9 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       case 'brochure_saved': return 'bookmark'
       case 'brochure_renamed': return 'create-outline'
       case 'brochure_viewed': return 'eye'
+      case 'doctor_added':
+      case 'doctor_updated': return 'person'
+      case 'doctor_deleted': return 'trash'
       default: return 'information-circle'
     }
   }

@@ -174,7 +174,7 @@ export default function DoctorsScreen({ navigation, route }: DoctorsScreenProps)
   const handleDeleteDoctor = async (doctor: any) => {
     try {
       // First check if doctor has meetings
-      const checkResult = await UnifiedDataService.deleteDoctor(doctor.id, false);
+      const checkResult = await UnifiedDataService.deleteDoctor(doctor.id, false, true);
       
       if (!checkResult.success && checkResult.hasMeetings && checkResult.meetingCount) {
         // Doctor has meetings - show warning with options

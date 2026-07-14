@@ -116,15 +116,18 @@ export class SyncService {
         : 'All metadata backed up to server',
     ].join('. ')
 
+    const reconcileWarnings = reconcileResult.errors.filter(Boolean)
+    const uploadErrors = (uploadResult.errors || []).filter(Boolean)
+
     return {
-      success: uploadResult.success && reconcileResult.errors.length === 0,
+      success: uploadResult.success,
       synced: uploadResult.synced,
       failed: uploadResult.failed,
       message: combinedMessage,
       errors: [
-        ...(reconcileResult.errors.length > 0 ? reconcileResult.errors : []),
-        ...(uploadResult.errors || []),
-      ].filter(Boolean),
+        ...uploadErrors,
+        ...reconcileWarnings.map((warning) => `Warning: ${warning}`),
+      ],
       reconciled: reconcileResult.queued,
       backupGapsRemaining: gapStats.total,
     }
@@ -204,20 +207,43 @@ export class SyncService {
 
       // Get pending operations
       await LocalDatabaseService.ensureReady()
+      await LocalDatabaseService.repairDoctorSyncQueueState(userId)
+      const requeuedDoctorDeletes = await LocalDatabaseService.reconcileDeletedDoctorSync(userId)
+      if (requeuedDoctorDeletes > 0) {
+        console.log(`🔄 SYNC UP: Re-queued ${requeuedDoctorDeletes} doctor delete(s)`)
+      }
       await LocalDatabaseService.cleanupStaleSyncOperations()
+      await LocalDatabaseService.sanitizePendingDoctorSyncOperations()
       const requeuedDeletes = await LocalDatabaseService.reconcileSavedBrochureDeleteSync(userId)
       if (requeuedDeletes > 0) {
         console.log(`🔄 SYNC UP: Re-queued ${requeuedDeletes} saved brochure delete(s)`)
       }
       const pendingOps = await LocalDatabaseService.getPendingSyncOperations()
-      
+      const photoResult = await this.syncPendingDoctorPhotos(userId)
+
       if (pendingOps.length === 0) {
+        if (photoResult.synced > 0 || photoResult.failed > 0) {
+          console.log(
+            `🔄 SYNC UP: Doctor photos synced=${photoResult.synced} failed=${photoResult.failed}`,
+          )
+          return {
+            success: photoResult.failed === 0,
+            synced: photoResult.synced,
+            failed: photoResult.failed,
+            message:
+              photoResult.failed === 0
+                ? `Synced ${photoResult.synced} doctor photo(s)`
+                : `Synced ${photoResult.synced}, failed ${photoResult.failed} doctor photo(s)`,
+            errors: photoResult.errors.length > 0 ? photoResult.errors : undefined,
+          }
+        }
+
         console.log('✅ SYNC UP: No pending operations to sync')
         return {
           success: true,
           synced: 0,
           failed: 0,
-          message: 'No pending operations to sync'
+          message: 'No pending operations to sync',
         }
       }
 
@@ -227,7 +253,7 @@ export class SyncService {
       const bulkResult = await this.syncUpViaPush(sortedOps, userId)
       if (bulkResult) {
         await LocalDatabaseService.cleanupStaleSyncOperations()
-        return bulkResult
+        return this.mergePhotoSyncResult(bulkResult, photoResult)
       }
 
       // Fallback: process operations individually
@@ -315,13 +341,16 @@ export class SyncService {
 
       this.reportProgress('Complete', message, 100, sortedOps.length, sortedOps.length)
 
-      return {
-        success: failed === 0,
-        synced,
-        failed,
-        message,
-        errors: errors.length > 0 ? errors : undefined
-      }
+      return this.mergePhotoSyncResult(
+        {
+          success: failed === 0,
+          synced,
+          failed,
+          message,
+          errors: errors.length > 0 ? errors : undefined,
+        },
+        photoResult,
+      )
     } catch (error) {
       console.error('❌ SYNC UP: Fatal error:', error)
       return {
@@ -338,14 +367,243 @@ export class SyncService {
    * Sort operations by dependency order
    */
   private static sortOperationsByDependency(ops: any[]): any[] {
-    const order = ['doctors', 'meetings', 'meeting_notes', 'meeting_slide_notes', 'meeting_followups', 'saved_brochures', 'brochure_sync', 'activity_logs']
+    const tableOrder = ['doctors', 'meetings', 'meeting_notes', 'meeting_slide_notes', 'meeting_followups', 'saved_brochures', 'brochure_sync', 'activity_logs']
+    const actionOrder: Record<string, number> = { create: 0, update: 1, delete: 2 }
     return ops.sort((a, b) => {
-      const aIndex = order.indexOf(a.table_name)
-      const bIndex = order.indexOf(b.table_name)
-      if (aIndex === -1 && bIndex === -1) return 0
-      if (aIndex === -1) return 1
-      if (bIndex === -1) return -1
-      return aIndex - bIndex
+      const aIndex = tableOrder.indexOf(a.table_name)
+      const bIndex = tableOrder.indexOf(b.table_name)
+      if (aIndex !== bIndex) {
+        if (aIndex === -1 && bIndex === -1) return 0
+        if (aIndex === -1) return 1
+        if (bIndex === -1) return -1
+        return aIndex - bIndex
+      }
+
+      const aAction = actionOrder[a.operation_type] ?? 1
+      const bAction = actionOrder[b.operation_type] ?? 1
+      if (aAction !== bAction) {
+        return aAction - bAction
+      }
+
+      return String(a.timestamp || '').localeCompare(String(b.timestamp || ''))
+    })
+  }
+
+  private static mergePhotoSyncResult(
+    result: SyncResult,
+    photoResult: { synced: number; failed: number; errors: string[] },
+  ): SyncResult {
+    const synced = result.synced + photoResult.synced
+    const failed = result.failed + photoResult.failed
+    const errors = [...(result.errors || []), ...photoResult.errors]
+    const photoMessage =
+      photoResult.synced > 0 || photoResult.failed > 0
+        ? `; photos: ${photoResult.synced} synced${photoResult.failed > 0 ? `, ${photoResult.failed} failed` : ''}`
+        : ''
+
+    return {
+      ...result,
+      success: failed === 0,
+      synced,
+      failed,
+      message: `${result.message}${photoMessage}`,
+      errors: errors.length > 0 ? errors : undefined,
+    }
+  }
+
+  private static parseDoctorPhotoLinks(
+    localChanges?: string | null,
+  ): { doctorLocalId?: string; doctorServerId?: string } {
+    if (!localChanges) {
+      return {}
+    }
+
+    try {
+      const parsed =
+        typeof localChanges === 'string' ? JSON.parse(localChanges) : localChanges
+      return {
+        doctorLocalId: parsed?.doctor_local_id || undefined,
+        doctorServerId: parsed?.doctor_server_id || undefined,
+      }
+    } catch {
+      return {}
+    }
+  }
+
+  private static async syncPendingDoctorPhotos(
+    userId: string,
+  ): Promise<{ synced: number; failed: number; errors: string[] }> {
+    let synced = 0
+    let failed = 0
+    const errors: string[] = []
+
+    try {
+      const pendingPhotos = await LocalDatabaseService.getPendingDoctorPhotos(userId)
+      if (pendingPhotos.length === 0) {
+        return { synced, failed, errors }
+      }
+
+      console.log(`🔄 SYNC PHOTO: Uploading ${pendingPhotos.length} pending doctor photo(s)`)
+
+      for (const photo of pendingPhotos) {
+        if (!photo.file_path?.trim()) {
+          failed++
+          errors.push(`doctor_photo ${photo.id}: missing file path`)
+          continue
+        }
+
+        const fileInfo = await FileSystem.getInfoAsync(photo.file_path)
+        if (!fileInfo.exists) {
+          failed++
+          errors.push(`doctor_photo ${photo.id}: local file missing`)
+          continue
+        }
+
+        const links = this.parseDoctorPhotoLinks(photo.local_changes)
+        let doctor =
+          links.doctorLocalId
+            ? await LocalDatabaseService.getDoctorRecordById(links.doctorLocalId)
+            : null
+
+        if (!doctor && photo.file_path) {
+          doctor = await LocalDatabaseService.findDoctorByProfileImagePath(
+            userId,
+            photo.file_path,
+          )
+        }
+
+        const doctorServerId = doctor?.server_id?.trim() || links.doctorServerId?.trim()
+
+        try {
+          const uploadResult = await apiClient.uploadFile(
+            '/api/files/doctor-photos/upload/',
+            photo.file_path,
+            photo.file_name || `doctor_${photo.id}.jpg`,
+            doctorServerId ? { doctor_id: doctorServerId } : undefined,
+          )
+
+          const fileUrl = uploadResult.file_url
+          if (!fileUrl) {
+            failed++
+            errors.push(`doctor_photo ${photo.id}: upload returned no file_url`)
+            continue
+          }
+
+          if (doctor && !doctor.is_deleted) {
+            await LocalDatabaseService.updateDoctor(doctor.id, {
+              profile_image_url: fileUrl,
+              sync_status: doctorServerId ? 'synced' : doctor.sync_status,
+              skipSyncQueue: Boolean(doctorServerId),
+            })
+          } else if (doctorServerId) {
+            const patchResult = await MRService.updateDoctor(doctorServerId, {
+              profile_image_url: fileUrl,
+            })
+            if (!patchResult.success) {
+              console.warn(
+                `⚠️ SYNC PHOTO: PATCH profile_image_url failed for ${doctorServerId}:`,
+                patchResult.error,
+              )
+            }
+          }
+
+          await LocalDatabaseService.markDoctorPhotoSynced(photo.id)
+          synced++
+          console.log(
+            `✅ SYNC PHOTO: Uploaded ${photo.id}${doctorServerId ? ` for doctor ${doctorServerId}` : ''}`,
+          )
+        } catch (error) {
+          failed++
+          const message = error instanceof Error ? error.message : 'Unknown error'
+          errors.push(`doctor_photo ${photo.id}: ${message}`)
+          console.error(`❌ SYNC PHOTO: Failed to upload ${photo.id}:`, error)
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      errors.push(`doctor_photos: ${message}`)
+      console.error('❌ SYNC PHOTO: Failed to process pending doctor photos:', error)
+    }
+
+    return { synced, failed, errors }
+  }
+
+  private static normalizeDoctorProfileImageUrl(value: unknown): string {
+    if (value === null || value === undefined) {
+      return ''
+    }
+    return String(value)
+  }
+
+  private static isDoctorAlreadyGoneOnServer(error?: string): boolean {
+    if (!error) {
+      return false
+    }
+    const normalized = error.toLowerCase()
+    return (
+      normalized.includes('does not exist') ||
+      normalized.includes('not found') ||
+      normalized.includes('no doctor')
+    )
+  }
+
+  /**
+   * Soft-delete the Doctor row on the server (Django admin tombstone).
+   * REST DELETE only removes the MR assignment; sync push sets is_deleted on Doctor.
+   */
+  private static async pushDoctorSoftDelete(
+    serverId: string,
+    localId: string,
+    mrId: string,
+  ): Promise<{ success: boolean; alreadyGone?: boolean; error?: string }> {
+    try {
+      const response = await apiClient.post<{
+        results?: Array<{ success: boolean; error?: string }>
+      }>('/api/sync/push/', {
+        operations: [
+          {
+            local_id: `tombstone_${localId}`,
+            entity: 'doctors',
+            action: 'delete',
+            data: {
+              server_id: serverId,
+              mr_id: mrId,
+              is_deleted: true,
+            },
+          },
+        ],
+      })
+
+      const result = response?.results?.[0]
+      if (result?.success) {
+        console.log(`✅ SYNC DOCTOR: Tombstone pushed for ${serverId}`)
+        return { success: true }
+      }
+
+      const error = result?.error || 'unknown error'
+      if (this.isDoctorAlreadyGoneOnServer(error)) {
+        console.log(`✅ SYNC DOCTOR: Doctor already absent on server ${serverId}`)
+        return { success: false, alreadyGone: true, error }
+      }
+
+      console.warn(`⚠️ SYNC DOCTOR: Sync push tombstone failed for ${serverId}:`, error)
+      return { success: false, error }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (this.isDoctorAlreadyGoneOnServer(message)) {
+        console.log(`✅ SYNC DOCTOR: Doctor already absent on server ${serverId}`)
+        return { success: false, alreadyGone: true, error: message }
+      }
+      console.error(`❌ SYNC DOCTOR: Sync push tombstone error for ${serverId}:`, error)
+      return { success: false, error: message }
+    }
+  }
+
+  private static async markDoctorDeleteSynced(localId: string): Promise<void> {
+    await LocalDatabaseService.updateDoctor(localId, {
+      sync_status: 'synced',
+      skipSyncQueue: true,
+      local_changes: JSON.stringify({ delete_tombstone_pushed: true }),
     })
   }
 
@@ -355,9 +613,15 @@ export class SyncService {
   private static async syncDoctor(op: any, userId: string): Promise<boolean> {
     try {
       const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
+      const localDoctor = await LocalDatabaseService.getDoctorRecordById(op.record_id)
       console.log(`🔄 SYNC DOCTOR: ${op.operation_type}`, data)
 
       if (op.operation_type === 'create') {
+        if (localDoctor?.is_deleted) {
+          console.log('✅ SYNC DOCTOR: Skipping create — doctor was deleted locally')
+          return true
+        }
+
         const result = await MRService.addDoctor(userId, {
           first_name: data.first_name,
           last_name: data.last_name,
@@ -366,26 +630,29 @@ export class SyncService {
           phone: data.phone,
           email: data.email,
           location: data.location,
-          notes: data.notes,
-          profile_image_url: data.profile_image_url
+          notes: data.notes ?? '',
+          profile_image_url: this.normalizeDoctorProfileImageUrl(
+            data.profile_image_url ?? localDoctor?.profile_image_url,
+          ),
         })
 
         if (result.success && result.data) {
           // Update local record with server_id
           await LocalDatabaseService.updateDoctor(op.record_id, {
             server_id: result.data.doctor_id || result.data.id,
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'update') {
-        if (!data.server_id) {
-          console.warn('⚠️ SYNC DOCTOR: Cannot update doctor without server_id')
-          return false
+        const serverId = localDoctor?.server_id || data.server_id
+        if (!serverId) {
+          return this.syncDoctor({ ...op, operation_type: 'create' }, userId)
         }
 
-        const result = await MRService.updateDoctor(data.server_id, {
+        const result = await MRService.updateDoctor(serverId, {
           first_name: data.first_name,
           last_name: data.last_name,
           specialty: data.specialty,
@@ -393,38 +660,75 @@ export class SyncService {
           phone: data.phone,
           email: data.email,
           location: data.location,
-          notes: data.notes,
-          profile_image_url: data.profile_image_url
+          notes: data.notes ?? '',
+          profile_image_url: this.normalizeDoctorProfileImageUrl(
+            data.profile_image_url ?? localDoctor?.profile_image_url,
+          ),
         })
 
         if (result.success) {
           await LocalDatabaseService.updateDoctor(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'delete') {
-        if (!data.server_id) {
-          console.warn('⚠️ SYNC DOCTOR: Cannot delete doctor without server_id')
+        const serverId = localDoctor?.server_id || data.server_id
+        if (!serverId) {
+          console.log('✅ SYNC DOCTOR: Skipping server delete — doctor was never synced')
+          await LocalDatabaseService.updateDoctor(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+          return true
+        }
+
+        const mrId = String(localDoctor?.mr_id || data.mr_id || userId)
+        console.log(`🔄 SYNC DOCTOR: delete server_id=${serverId}`, data)
+
+        const restResult = await MRService.deleteDoctor(serverId)
+        if (!restResult.success) {
+          console.error(`❌ SYNC DOCTOR: REST delete failed for ${serverId}:`, restResult.error)
           return false
         }
 
-        const result = await MRService.deleteDoctor(data.server_id)
-        if (result.success) {
-          // Local record already marked as deleted, just update sync status
-          await LocalDatabaseService.updateDoctor(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
-          return true
+        const tombstone = await this.pushDoctorSoftDelete(serverId, op.record_id, mrId)
+        const deleteConfirmed = tombstone.success || tombstone.alreadyGone
+
+        if (!deleteConfirmed) {
+          console.error(
+            `❌ SYNC DOCTOR: Delete not confirmed for ${serverId}:`,
+            tombstone.error || 'unknown error',
+          )
+          return false
         }
-        return false
+
+        await this.markDoctorDeleteSynced(op.record_id)
+        console.log(`✅ SYNC DOCTOR: Delete complete for ${serverId}`)
+        return true
       }
 
       return false
     } catch (error) {
       console.error('❌ SYNC DOCTOR: Error:', error)
       return false
+    }
+  }
+
+  private static async retryBulkOpIndividually(op: any, userId: string): Promise<boolean> {
+    switch (op.table_name) {
+      case 'doctors':
+        return this.syncDoctor(op, userId)
+      case 'meetings':
+        return this.syncMeeting(op, userId)
+      case 'meeting_notes':
+      case 'meeting_slide_notes':
+        return this.syncMeetingNote(op, userId)
+      case 'meeting_followups':
+        return this.syncMeetingFollowUp(op, userId)
+      case 'activity_logs':
+        return this.syncActivityLog(op, userId)
+      default:
+        return false
     }
   }
 
@@ -452,22 +756,24 @@ export class SyncService {
           title: data.title,
           purpose: data.purpose || '',
           scheduled_date: data.scheduled_date,
-          duration_minutes: data.duration_minutes || 30
+          duration_minutes: data.duration_minutes || 30,
+          location: data.location,
+          notes: data.notes,
         })
 
         if (result.success && result.data) {
-          // Update local record with server_id
           await LocalDatabaseService.updateMeeting(op.record_id, {
             server_id: result.data.meeting_id,
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            doctor_server_id: doctor.server_id,
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'update') {
         if (!data.server_id) {
-          console.warn('⚠️ SYNC MEETING: Cannot update meeting without server_id')
-          return false
+          return this.syncMeeting({ ...op, operation_type: 'create' }, userId)
         }
 
         const result = await MRService.updateMeeting(data.server_id, {
@@ -482,22 +788,25 @@ export class SyncService {
 
         if (result.success) {
           await LocalDatabaseService.updateMeeting(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'delete') {
         if (!data.server_id) {
-          console.warn('⚠️ SYNC MEETING: Cannot delete meeting without server_id')
-          return false
+          console.log('✅ SYNC MEETING: Skipping server delete — meeting was never synced')
+          await LocalDatabaseService.updateMeeting(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+          return true
         }
 
         const result = await MRService.deleteMeeting(data.server_id)
         if (result.success) {
           await LocalDatabaseService.updateMeeting(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
@@ -518,32 +827,41 @@ export class SyncService {
       const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
       console.log(`🔄 SYNC NOTE: ${op.operation_type}`, data)
 
-      // Get meeting server_id
       const meeting = await LocalDatabaseService.getMeetingById(data.meeting_id)
       if (!meeting || !meeting.server_id) {
         console.error('❌ SYNC NOTE: Meeting not found or missing server_id')
         return false
       }
 
+      let followUpServerId: string | undefined
+      if (data.follow_up_id) {
+        const followUp = await LocalDatabaseService.getMeetingFollowUpById(data.follow_up_id)
+        followUpServerId = followUp?.server_id || undefined
+      }
+
       if (op.operation_type === 'create') {
         const result = await MRService.addSlideNote({
           meeting_id: meeting.server_id,
           slide_id: data.slide_id,
-          note_text: data.note_text || ''
+          slide_title: data.slide_title,
+          slide_order: data.slide_order ?? 0,
+          brochure_id: data.brochure_id || '',
+          note_text: data.note_text || '',
+          follow_up_id: followUpServerId,
         })
 
         if (result.success && result.data) {
-          await LocalDatabaseService.updateMeetingSlideNote(op.record_id, {
-            server_id: result.data.note_id || result.data.id,
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+          await LocalDatabaseService.updateMeetingNote(op.record_id, {
+            server_id: result.data.note_id || (result.data as { id?: string }).id,
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'update') {
         if (!data.server_id) {
-          console.warn('⚠️ SYNC NOTE: Cannot update note without server_id')
-          return false
+          return this.syncMeetingNote({ ...op, operation_type: 'create' }, userId)
         }
 
         const result = await MRService.updateSlideNote(
@@ -552,23 +870,26 @@ export class SyncService {
           meeting.server_id,
         )
         if (result.success) {
-          await LocalDatabaseService.updateMeetingSlideNote(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+          await LocalDatabaseService.updateMeetingNote(op.record_id, {
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'delete') {
         if (!data.server_id) {
-          console.warn('⚠️ SYNC NOTE: Cannot delete note without server_id')
-          return false
+          console.log('✅ SYNC NOTE: Skipping server delete — note was never synced')
+          await LocalDatabaseService.updateMeetingNote(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+          return true
         }
 
         const result = await MRService.deleteSlideNote(data.server_id, meeting.server_id)
         if (result.success) {
-          await LocalDatabaseService.updateMeetingSlideNote(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+          await LocalDatabaseService.updateMeetingNote(op.record_id, {
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
@@ -601,48 +922,53 @@ export class SyncService {
           meeting_id: meeting.server_id,
           follow_up_date: data.follow_up_date,
           follow_up_time: data.follow_up_time,
-          follow_up_notes: data.follow_up_notes || ''
+          follow_up_notes: data.follow_up_notes || '',
+          status: data.status || 'scheduled',
         })
 
         if (result.success && result.data) {
           const followUpId = result.data.followup_id || result.data.id
           await LocalDatabaseService.updateMeetingFollowUp(op.record_id, {
             server_id: followUpId,
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'update') {
         if (!data.server_id) {
-          console.warn('⚠️ SYNC FOLLOW-UP: Cannot update follow-up without server_id')
-          return false
+          return this.syncMeetingFollowUp({ ...op, operation_type: 'create' }, userId)
         }
 
-        const result = await MRService.updateMeetingFollowUp(data.server_id, {
+        const result = await MRService.updateMeetingFollowUpById(data.server_id, {
           follow_up_date: data.follow_up_date,
           follow_up_time: data.follow_up_time,
-          follow_up_notes: data.follow_up_notes || ''
+          follow_up_notes: data.follow_up_notes || '',
+          status: data.status,
         })
 
         if (result.success) {
           await LocalDatabaseService.updateMeetingFollowUp(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
       } else if (op.operation_type === 'delete') {
         if (!data.server_id) {
-          console.warn('⚠️ SYNC FOLLOW-UP: Cannot delete follow-up without server_id')
-          return false
+          console.log('✅ SYNC FOLLOW-UP: Skipping server delete — follow-up was never synced')
+          await LocalDatabaseService.updateMeetingFollowUp(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+          return true
         }
 
         const result = await MRService.deleteMeetingFollowUp(data.server_id)
         if (result.success) {
           await LocalDatabaseService.updateMeetingFollowUp(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         return false
@@ -1084,7 +1410,7 @@ export class SyncService {
                 phone: doctor.phone,
                 email: doctor.email,
                 location: doctor.location,
-                notes: doctor.notes,
+                notes: doctor.notes ?? '',
                 profile_image_url: null,
                 created_at: doctor.created_at,
                 updated_at: doctor.created_at,
@@ -1178,6 +1504,8 @@ export class SyncService {
                       follow_up_date: followUp.follow_up_date,
                       follow_up_time: followUp.follow_up_time,
                       follow_up_notes: followUp.follow_up_notes || null,
+                      status: followUp.status || 'scheduled',
+                      sequence_number: followUp.sequence_number || 1,
                       created_at: followUp.created_at,
                       updated_at: followUp.updated_at || followUp.created_at,
                       sync_status: 'synced',
@@ -1197,6 +1525,49 @@ export class SyncService {
         }
       } catch (error) {
         console.error('❌ SYNC DOWN: Failed to download follow-ups:', error)
+      }
+
+      // Download meeting notes (metadata)
+      this.reportProgress('Downloading', 'Downloading meeting notes...', 65)
+      console.log('⬇️ SYNC DOWN: Downloading meeting notes...')
+      try {
+        const meetingsForNotes = await LocalDatabaseService.getMeetings(userId)
+        for (const meeting of meetingsForNotes) {
+          if (!meeting.server_id) continue
+          try {
+            const detailsResult = await MRService.getMeetingDetails(meeting.server_id)
+            if (!detailsResult.success || !detailsResult.data?.slide_notes) continue
+
+            for (const note of detailsResult.data.slide_notes) {
+              try {
+                await LocalDatabaseService.upsertMeetingNote({
+                  id: `note_${note.note_id}`,
+                  server_id: note.note_id,
+                  meeting_id: meeting.id,
+                  meeting_server_id: meeting.server_id,
+                  slide_id: note.slide_id,
+                  slide_title: note.slide_title,
+                  slide_order: note.slide_order ?? 0,
+                  brochure_id: meeting.brochure_id || '',
+                  note_text: note.note_text,
+                  created_at: note.created_at,
+                  updated_at: note.updated_at || note.created_at,
+                  version: 1,
+                  sync_status: 'synced',
+                  is_deleted: false,
+                })
+                synced++
+              } catch (error) {
+                failed++
+                errors.push(`Note ${note.note_id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+              }
+            }
+          } catch (error) {
+            console.warn(`⚠️ SYNC DOWN: Failed to download notes for meeting ${meeting.server_id}:`, error)
+          }
+        }
+      } catch (error) {
+        console.error('❌ SYNC DOWN: Failed to download meeting notes:', error)
       }
 
       // Download available brochures and sync local cache
@@ -1353,6 +1724,84 @@ export class SyncService {
     return mapping[tableName] || null
   }
 
+  private static async enrichPushData(op: any, data: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (op.table_name === 'saved_brochures') {
+      return this.enrichSavedBrochurePushData(op, data)
+    }
+
+    if (op.table_name === 'doctors') {
+      const local = await LocalDatabaseService.getDoctorRecordById(op.record_id)
+      const merged = { ...(local || {}), ...data } as Record<string, unknown>
+
+      if (op.operation_type === 'create' && local?.is_deleted) {
+        return { skip: true }
+      }
+
+      const payload: Record<string, unknown> = {
+        mr_id: merged.mr_id,
+        first_name: merged.first_name,
+        last_name: merged.last_name,
+        specialty: merged.specialty,
+        hospital: merged.hospital,
+        phone: merged.phone ?? null,
+        email: merged.email ?? null,
+        location: merged.location ?? null,
+        notes: merged.notes ?? '',
+        profile_image_url: this.normalizeDoctorProfileImageUrl(merged.profile_image_url),
+      }
+
+      const serverId = local?.server_id || merged.server_id
+      if (op.operation_type === 'update' || op.operation_type === 'delete') {
+        payload.server_id = serverId
+      }
+      if (op.operation_type === 'delete') {
+        payload.is_deleted = true
+      }
+      return payload
+    }
+
+    if (op.table_name === 'meetings') {
+      const local = await LocalDatabaseService.getMeetingById(op.record_id)
+      const merged = { ...(local || {}), ...data } as Record<string, unknown>
+      const doctorLocalId = String(merged.doctor_id || '')
+      const doctor = doctorLocalId
+        ? await LocalDatabaseService.getDoctorById(doctorLocalId)
+        : null
+      const doctorServerId = String(
+        merged.doctor_server_id || doctor?.server_id || '',
+      ).trim()
+
+      if (op.operation_type === 'delete') {
+        return {
+          server_id: merged.server_id,
+          is_deleted: true,
+        }
+      }
+
+      const payload: Record<string, unknown> = {
+        mr_id: merged.mr_id,
+        doctor_id: doctorServerId,
+        brochure_id: merged.brochure_id || '',
+        brochure_title: merged.brochure_title || '',
+        title: merged.title,
+        purpose: merged.purpose || '',
+        scheduled_date: merged.scheduled_date,
+        duration_minutes: merged.duration_minutes ?? 30,
+        location: merged.location ?? null,
+        notes: merged.notes ?? '',
+        status: merged.status || 'scheduled',
+      }
+
+      if (op.operation_type === 'update') {
+        payload.server_id = merged.server_id
+      }
+
+      return payload
+    }
+
+    return data
+  }
+
   private static async enrichSavedBrochurePushData(op: any, data: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (op.table_name !== 'saved_brochures') {
       return data
@@ -1398,10 +1847,58 @@ export class SyncService {
     }
   }
 
+  /**
+   * Doctor/meeting deletes use direct REST first; doctors also need a sync-push
+   * tombstone so the Doctor row is soft-deleted in Django admin.
+   */
+  private static shouldSyncDirectly(op: any): boolean {
+    if (op.operation_type !== 'delete') {
+      return false
+    }
+    return op.table_name === 'doctors' || op.table_name === 'meetings'
+  }
+
+  private static async processDirectSyncOps(
+    ops: any[],
+    userId: string,
+  ): Promise<{ synced: number; failed: number; errors: string[] }> {
+    let synced = 0
+    let failed = 0
+    const errors: string[] = []
+
+    for (const op of ops) {
+      let success = false
+      switch (op.table_name) {
+        case 'doctors':
+          success = await this.syncDoctor(op, userId)
+          break
+        case 'meetings':
+          success = await this.syncMeeting(op, userId)
+          break
+        default:
+          break
+      }
+
+      if (success) {
+        await LocalDatabaseService.markOperationCompleted(op.id)
+        synced++
+      } else {
+        const errorMsg = `Failed to sync ${op.table_name} ${op.operation_type}`
+        await LocalDatabaseService.markOperationFailed(op.id, errorMsg)
+        failed++
+        errors.push(errorMsg)
+      }
+    }
+
+    return { synced, failed, errors }
+  }
+
   private static async syncUpViaPush(ops: any[], userId: string): Promise<SyncResult | null> {
     const brochureSyncOps = ops.filter((op) => op.table_name === 'brochure_sync')
     const savedBrochureOps = ops.filter((op) => op.table_name === 'saved_brochures')
     const bulkOps = ops.filter((op) => op.table_name !== 'brochure_sync' && op.table_name !== 'saved_brochures')
+    const directOps = bulkOps.filter((op) => this.shouldSyncDirectly(op))
+    const pushBulkOps = bulkOps.filter((op) => !this.shouldSyncDirectly(op))
 
     if (bulkOps.length === 0 && brochureSyncOps.length === 0 && savedBrochureOps.length === 0) {
       return null
@@ -1410,6 +1907,14 @@ export class SyncService {
     let synced = 0
     let failed = 0
     const errors: string[] = []
+
+    if (directOps.length > 0) {
+      console.log(`🔄 SYNC UP: Processing ${directOps.length} delete(s) via direct API`)
+      const directResult = await this.processDirectSyncOps(directOps, userId)
+      synced += directResult.synced
+      failed += directResult.failed
+      errors.push(...directResult.errors)
+    }
 
     for (const op of savedBrochureOps) {
       const success = await this.syncSavedBrochure(op, userId)
@@ -1423,15 +1928,20 @@ export class SyncService {
       }
     }
 
-    if (bulkOps.length > 0) {
+    if (pushBulkOps.length > 0) {
       try {
         const operations = []
-        for (const op of bulkOps) {
+        for (const op of pushBulkOps) {
           const entity = this.mapTableToEntity(op.table_name)
           if (!entity) continue
 
           const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
-          const pushData = await this.enrichSavedBrochurePushData(op, data)
+          const pushData = await this.enrichPushData(op, data)
+          if ((pushData as { skip?: boolean }).skip) {
+            await LocalDatabaseService.markOperationCompleted(op.id)
+            synced++
+            continue
+          }
           operations.push({
             local_id: String(op.id),
             entity,
@@ -1447,13 +1957,20 @@ export class SyncService {
           )
 
           for (const result of response.results || []) {
-            const op = bulkOps.find((item) => String(item.id) === result.id)
+            const op = pushBulkOps.find((item) => String(item.id) === result.id)
             if (!op) continue
 
             if (result.success) {
-              await this.applyPushSuccess(op, result.server_id, userId)
-              await LocalDatabaseService.markOperationCompleted(op.id)
-              synced++
+              try {
+                await this.applyPushSuccess(op, result.server_id, userId)
+                await LocalDatabaseService.markOperationCompleted(op.id)
+                synced++
+              } catch (error) {
+                const errorMsg = error instanceof Error ? error.message : 'Failed to apply sync result'
+                await LocalDatabaseService.markOperationFailed(op.id, errorMsg)
+                failed++
+                errors.push(errorMsg)
+              }
             } else if (
               op.table_name === 'saved_brochures' &&
               op.operation_type === 'delete' &&
@@ -1462,9 +1979,15 @@ export class SyncService {
               await LocalDatabaseService.markOperationCompleted(op.id)
               synced++
             } else {
-              await LocalDatabaseService.markOperationFailed(op.id, result.error || 'Sync failed')
-              failed++
-              errors.push(result.error || `Failed ${op.table_name}`)
+              const individualSuccess = await this.retryBulkOpIndividually(op, userId)
+              if (individualSuccess) {
+                await LocalDatabaseService.markOperationCompleted(op.id)
+                synced++
+              } else {
+                await LocalDatabaseService.markOperationFailed(op.id, result.error || 'Sync failed')
+                failed++
+                errors.push(result.error || `Failed ${op.table_name}`)
+              }
             }
           }
         }
@@ -1506,7 +2029,7 @@ export class SyncService {
       }
     }
 
-    if (bulkOps.length > 0) {
+    if (pushBulkOps.length > 0 || directOps.length > 0) {
       return {
         success: failed === 0,
         synced,
@@ -1534,24 +2057,30 @@ export class SyncService {
 
     switch (op.table_name) {
       case 'doctors':
-        if (serverId) {
-          await LocalDatabaseService.updateDoctor(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+        if (op.operation_type === 'delete') {
+          await LocalDatabaseService.updateDoctor(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+        } else if (serverId) {
+          await LocalDatabaseService.updateDoctor(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
         }
         break
       case 'meetings':
         if (serverId) {
-          await LocalDatabaseService.updateMeeting(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+          await LocalDatabaseService.updateMeeting(op.record_id, {
+            server_id: serverId,
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
         }
         break
       case 'meeting_notes':
       case 'meeting_slide_notes':
         if (serverId) {
-          await LocalDatabaseService.updateMeetingSlideNote(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+          await LocalDatabaseService.updateMeetingNote(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
         }
         break
       case 'meeting_followups':
         if (serverId) {
-          await LocalDatabaseService.updateMeetingFollowUp(op.record_id, { server_id: serverId, sync_status: 'synced' }, true)
+          await LocalDatabaseService.updateMeetingFollowUp(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
         }
         break
       case 'saved_brochures':
@@ -1569,7 +2098,7 @@ export class SyncService {
     }
 
     if (op.table_name === 'doctors' && op.operation_type === 'update') {
-      await LocalDatabaseService.updateDoctor(op.record_id, { sync_status: 'synced' }, true)
+      await LocalDatabaseService.updateDoctor(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
     }
   }
 
@@ -1607,7 +2136,7 @@ export class SyncService {
             phone: doctor.phone,
             email: doctor.email,
             location: doctor.location,
-            notes: doctor.notes,
+            notes: doctor.notes ?? '',
             profile_image_url: doctor.profile_image_url,
             created_at: doctor.created_at,
             updated_at: doctor.updated_at || doctor.created_at,
@@ -1673,10 +2202,15 @@ export class SyncService {
           }
 
           const serverSavedId = String(savedBrochure.id || '')
+          if (!serverSavedId) {
+            console.warn('⚠️ SYNC PULL: Saved brochure missing server id — skipped')
+            continue
+          }
+
           await LocalDatabaseService.upsertSavedBrochure({
-            id: serverSavedId || `saved_${userId}_${canonicalBrochureId}`,
-            server_id: serverSavedId || null,
-            storage_id: savedBrochure.storage_id || serverSavedId || undefined,
+            id: serverSavedId,
+            server_id: serverSavedId,
+            storage_id: savedBrochure.storage_id || serverSavedId,
             mr_id: userId,
             brochure_id: canonicalBrochureId,
             brochure_title: savedBrochure.brochure_title,
@@ -1712,6 +2246,8 @@ export class SyncService {
             follow_up_date: followUp.follow_up_date,
             follow_up_time: followUp.follow_up_time,
             follow_up_notes: followUp.follow_up_notes || null,
+            status: followUp.status || 'scheduled',
+            sequence_number: followUp.sequence_number || 1,
             created_at: followUp.created_at,
             updated_at: followUp.updated_at || followUp.created_at,
             sync_status: 'synced',
@@ -1721,6 +2257,39 @@ export class SyncService {
         } catch (error) {
           failed++
           errors.push(`Follow-up ${followUp.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      for (const note of data.meeting_slide_notes || []) {
+        if (note.is_deleted) continue
+        try {
+          const meeting = await LocalDatabaseService.getMeetingByServerId(note.meeting_id)
+          if (!meeting) {
+            failed++
+            continue
+          }
+          await LocalDatabaseService.upsertMeetingNote({
+            id: `note_${note.id}`,
+            server_id: note.id,
+            meeting_id: meeting.id,
+            meeting_server_id: note.meeting_id,
+            slide_id: note.slide_id,
+            slide_title: note.slide_title,
+            slide_order: note.slide_order ?? 0,
+            brochure_id: note.brochure_id || meeting.brochure_id || '',
+            note_text: note.note_text,
+            slide_image_uri: note.slide_image_uri,
+            follow_up_id: note.follow_up_id,
+            created_at: note.created_at,
+            updated_at: note.updated_at || note.created_at,
+            version: 1,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Note ${note.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
         }
       }
 

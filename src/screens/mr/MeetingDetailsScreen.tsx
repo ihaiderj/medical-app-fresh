@@ -202,23 +202,7 @@ const MeetingDetailsScreen = () => {
           style: 'destructive',
           onPress: async () => {
             try {
-              console.log('MeetingDetailsScreen: Attempting to delete note from local DB first')
-              console.log('MeetingDetailsScreen: Note ID:', slideNote.note_id)
-
-              // Try to delete as local note first
-              try {
-                await LocalDatabaseService.deleteMeetingNote(slideNote.note_id)
-                console.log('MeetingDetailsScreen: Note deleted successfully from local DB')
-                Alert.alert('Success', 'Note deleted successfully')
-                loadMeetingDetails()
-                return
-              } catch (localError) {
-                console.log('MeetingDetailsScreen: Note not found in local DB, falling back to server')
-              }
-              
-              // Fallback to server note deletion
-              const result = await MRService.deleteSlideNote(slideNote.note_id)
-              
+              const result = await OfflineFirstService.deleteMeetingNote(slideNote.note_id)
               if (result.success) {
                 Alert.alert('Success', 'Note deleted successfully')
                 loadMeetingDetails()
@@ -242,27 +226,9 @@ const MeetingDetailsScreen = () => {
         return
       }
 
-      console.log('MeetingDetailsScreen: Attempting to update note in local DB first')
-      console.log('MeetingDetailsScreen: Note ID:', editingNote.note_id)
-
-      // Try to update as local note first
-      try {
-        await LocalDatabaseService.updateMeetingNote(editingNote.note_id, {
-          note_text: newNoteText.trim()
-        })
-        console.log('MeetingDetailsScreen: Note updated successfully in local DB')
-        Alert.alert('Success', 'Note updated successfully')
-        setShowEditNoteModal(false)
-        setNewNoteText('')
-        setEditingNote(null)
-        loadMeetingDetails()
-        return
-      } catch (localError) {
-        console.log('MeetingDetailsScreen: Note not found in local DB, falling back to server')
-      }
-
-      // Fallback to server note update
-      const result = await MRService.updateSlideNote(editingNote.note_id, newNoteText.trim())
+      const result = await OfflineFirstService.updateMeetingNote(editingNote.note_id, {
+        note_text: newNoteText.trim()
+      })
       
       if (result.success) {
         Alert.alert('Success', 'Note updated successfully')
@@ -370,6 +336,26 @@ const MeetingDetailsScreen = () => {
         return
       }
 
+      // Follow-up must be today or later
+      const fuDate = new Date(followUpForm.follow_up_date)
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      fuDate.setHours(0, 0, 0, 0)
+      if (fuDate < today) {
+        Alert.alert('Invalid Date', 'Follow-up date cannot be in the past.')
+        return
+      }
+
+      // Follow-up must be on or after the meeting date
+      if (meetingDetails?.scheduled_date) {
+        const meetDate = new Date(meetingDetails.scheduled_date)
+        meetDate.setHours(0, 0, 0, 0)
+        if (fuDate < meetDate) {
+          Alert.alert('Invalid Date', 'Follow-up date must be on or after the meeting date.')
+          return
+        }
+      }
+
       const result = await OfflineFirstService.createMeetingFollowUp({
         meeting_id: meetingId,
         follow_up_date: followUpForm.follow_up_date,
@@ -413,6 +399,26 @@ const MeetingDetailsScreen = () => {
     if (!selectedFollowUp) return
 
     try {
+      // Follow-up must be today or later
+      if (followUpForm.follow_up_date) {
+        const fuDate = new Date(followUpForm.follow_up_date)
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        fuDate.setHours(0, 0, 0, 0)
+        if (fuDate < today) {
+          Alert.alert('Invalid Date', 'Follow-up date cannot be in the past.')
+          return
+        }
+        if (meetingDetails?.scheduled_date) {
+          const meetDate = new Date(meetingDetails.scheduled_date)
+          meetDate.setHours(0, 0, 0, 0)
+          if (fuDate < meetDate) {
+            Alert.alert('Invalid Date', 'Follow-up date must be on or after the meeting date.')
+            return
+          }
+        }
+      }
+
       const result = await OfflineFirstService.updateMeetingFollowUp(selectedFollowUp.id, {
         follow_up_date: followUpForm.follow_up_date,
         follow_up_time: followUpForm.follow_up_time,
@@ -1018,7 +1024,10 @@ const MeetingDetailsScreen = () => {
                     const initialDate = followUpForm.follow_up_date 
                       ? new Date(followUpForm.follow_up_date)
                       : new Date()
-                    datePicker.showDate(initialDate, { mode: 'date' }, (result: DatePickerResult) => {
+                    const minDate = meetingDetails?.scheduled_date
+                      ? new Date(Math.max(new Date(meetingDetails.scheduled_date).getTime(), new Date().setHours(0,0,0,0)))
+                      : new Date()
+                    datePicker.showDate(initialDate, { mode: 'date', minimumDate: minDate }, (result: DatePickerResult) => {
                       if (!result.cancelled && result.date) {
                         setFollowUpForm({ ...followUpForm, follow_up_date: result.date.toISOString().split('T')[0] })
                       }
@@ -1140,7 +1149,10 @@ const MeetingDetailsScreen = () => {
                     const initialDate = followUpForm.follow_up_date 
                       ? new Date(followUpForm.follow_up_date)
                       : new Date()
-                    datePicker.showDate(initialDate, { mode: 'date' }, (result: DatePickerResult) => {
+                    const minDate = meetingDetails?.scheduled_date
+                      ? new Date(Math.max(new Date(meetingDetails.scheduled_date).getTime(), new Date().setHours(0,0,0,0)))
+                      : new Date()
+                    datePicker.showDate(initialDate, { mode: 'date', minimumDate: minDate }, (result: DatePickerResult) => {
                       if (!result.cancelled && result.date) {
                         setFollowUpForm({ ...followUpForm, follow_up_date: result.date.toISOString().split('T')[0] })
                       }

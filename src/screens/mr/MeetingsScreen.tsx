@@ -18,7 +18,6 @@ import { Ionicons } from "@expo/vector-icons"
 import { UnifiedDataService } from "../../services/UnifiedDataService"
 import { useGlobalForms } from "../../context/GlobalFormContext"
 import { OfflineFirstService } from "../../services/offlineFirstService"
-import { MRService } from "../../services/MRService"
 import { AuthService } from "../../services/AuthService"
 import { useModalQueue } from "../../hooks/useModalQueue"
 import { useAppData, useDoctorSync } from "../../context/AppDataContext"
@@ -89,7 +88,15 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     if (!doctorId) {
       return undefined
     }
-    return availableDoctors.find((doctor) => getDoctorIdentifier(doctor) === doctorId)
+    return availableDoctors.find((doctor) => {
+      const identifiers = [
+        getDoctorIdentifier(doctor),
+        doctor.id,
+        doctor.server_id,
+        doctor.doctor_id,
+      ].filter(Boolean)
+      return identifiers.includes(doctorId)
+    })
   }
 
   // Doctor form state for inline creation
@@ -423,57 +430,6 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     }
   }
 
-  // Old loadMeetings (kept for reference but not used)
-  const _oldLoadMeetings = async () => {
-    setIsLoading(true)
-    try {
-      const userResult = await AuthService.getCurrentUser()
-      if (userResult.success && userResult.user) {
-        const [localMeetingsResult, serverMeetingsResult] = await Promise.all([
-          OfflineFirstService.getMeetings(userResult.user.id),
-          MRService.getMeetings(userResult.user.id)
-        ])
-        
-        console.log('Local meetings result:', localMeetingsResult)
-        console.log('Server meetings result:', serverMeetingsResult)
-        
-        let allMeetings: any[] = []
-        
-        // Collect local meetings
-        if (localMeetingsResult.success && localMeetingsResult.data) {
-          allMeetings = Array.isArray(localMeetingsResult.data) ? localMeetingsResult.data : []
-        }
-        
-        // Collect server meetings
-        if (serverMeetingsResult.success && serverMeetingsResult.data) {
-          const serverMeetings = Array.isArray(serverMeetingsResult.data) ? serverMeetingsResult.data : []
-          
-          // Merge server meetings with local, avoiding duplicates
-          // A meeting is duplicate if it has the same server_id or meeting_id
-          serverMeetings.forEach(serverMeeting => {
-            const isDuplicate = allMeetings.some(localMeeting => 
-              (localMeeting.server_id && localMeeting.server_id === serverMeeting.meeting_id) ||
-              (localMeeting.meeting_id && localMeeting.meeting_id === serverMeeting.meeting_id)
-            )
-            
-            if (!isDuplicate) {
-              allMeetings.push(serverMeeting)
-            }
-          })
-        }
-        
-        console.log('Combined meetings count:', allMeetings.length)
-        console.log('Setting meetings data:', allMeetings.slice(0, 3)) // Log first 3 for debugging
-        setMeetings(allMeetings)
-      }
-    } catch (error) {
-      console.error('Error loading meetings:', error)
-      Alert.alert("Error", "Failed to load meetings")
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
   // Reload meetings when filter changes
   useEffect(() => {
     if (!isLoading) {
@@ -500,40 +456,44 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
 
   const filteredMeetings = React.useMemo(() => {
     if (!meetings || !Array.isArray(meetings)) {
-      console.log('Meetings data is not an array:', meetings)
       return []
     }
 
     return meetings.map((meeting) => {
-      // Auto-complete meetings if date has passed
       const now = new Date()
-      now.setHours(0, 0, 0, 0) // Reset to start of day for comparison
       
-      // Check if meeting should be auto-completed
-      let autoCompletedStatus = meeting.status
-      if (meeting.status !== 'completed' && meeting.status !== 'cancelled') {
-        // Priority 1: Check if follow-up date/time has passed
-        if (meeting.follow_up_date && meeting.follow_up_time) {
-          const followUpDateTime = new Date(meeting.follow_up_date)
-          const [hours, minutes] = meeting.follow_up_time.split(':')
-          followUpDateTime.setHours(parseInt(hours), parseInt(minutes))
-          
-          if (followUpDateTime < new Date()) {
-            autoCompletedStatus = 'completed'
+      let derivedStatus = meeting.status
+
+      if (derivedStatus !== 'cancelled') {
+        // If there is a pending (future) follow-up, the meeting is "scheduled"
+        const latestFU = meeting.latest_follow_up
+        if (latestFU && latestFU.status !== 'completed' && latestFU.status !== 'cancelled') {
+          const fuDate = new Date(latestFU.follow_up_date)
+          if (latestFU.follow_up_time) {
+            const [h, m] = latestFU.follow_up_time.split(':')
+            fuDate.setHours(parseInt(h), parseInt(m))
+          } else {
+            fuDate.setHours(23, 59, 59)
           }
-        }
-        // Priority 2: If no follow-up, check scheduled date/time
-        else if (meeting.scheduled_date) {
-          const meetingDateTime = new Date(meeting.scheduled_date)
-          if (meetingDateTime < new Date()) {
-            autoCompletedStatus = 'completed'
+          if (fuDate >= now) {
+            derivedStatus = 'follow-up-scheduled'
+          } else {
+            derivedStatus = 'completed'
+          }
+        } else if (derivedStatus !== 'completed') {
+          // No active follow-up: auto-complete if meeting date passed
+          if (meeting.scheduled_date) {
+            const meetingDate = new Date(meeting.scheduled_date)
+            if (meetingDate < now) {
+              derivedStatus = 'completed'
+            }
           }
         }
       }
       
       return {
         ...meeting,
-        status: autoCompletedStatus
+        status: derivedStatus
       }
     }).filter((meeting) => {
       if (!meeting) return false
@@ -572,7 +532,9 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
       case "completed":
         return "#10b981"
       case "follow-up-scheduled":
-        return "#d97706"
+        return "#8b5cf6"
+      case "scheduled":
+        return "#3b82f6"
       case "cancelled":
         return "#ef4444"
       default:
@@ -619,48 +581,40 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
 
   const handleSaveEdit = async () => {
     try {
-      console.log('=== EDIT MEETING DEBUG ===')
-      console.log('selectedMeeting:', selectedMeeting)
-      console.log('meetingForm:', meetingForm)
-      
-      if (!selectedMeeting) {
-        console.log('ERROR: No selected meeting')
-        return
-      }
+      if (!selectedMeeting) return
 
-      // Use the correct meeting ID field (local meetings use 'id', server meetings use 'meeting_id')
       const meetingId = selectedMeeting.id || selectedMeeting.meeting_id
       
-      console.log('Calling MRService.updateMeeting with params:')
-      console.log('- meeting_id:', meetingId)
-      console.log('- scheduled_date:', meetingForm.scheduled_date)
-      console.log('- duration_minutes:', meetingForm.duration_minutes)
-      console.log('- notes:', meetingForm.notes)
+      // Validate: scheduled_date must not be in the past
+      if (meetingForm.scheduled_date) {
+        const selected = new Date(meetingForm.scheduled_date)
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        selected.setHours(0, 0, 0, 0)
+        if (selected < today) {
+          Alert.alert("Invalid Date", "Meeting date cannot be in the past.")
+          return
+        }
+      }
 
-      const result = await MRService.updateMeeting(
-        meetingId,
-        meetingForm.scheduled_date,
-        meetingForm.duration_minutes,
-        undefined, // presentationId
-        meetingForm.notes,
-        'scheduled', // status
-        meetingForm.purpose, // title
-        meetingForm.doctor_id || undefined // doctorId
-      )
-      
-      console.log('Update meeting result:', result)
+      const updateData = {
+        title: meetingForm.purpose,
+        purpose: meetingForm.purpose,
+        scheduled_date: meetingForm.scheduled_date,
+        duration_minutes: meetingForm.duration_minutes,
+        notes: meetingForm.notes,
+        doctor_id: meetingForm.doctor_id || undefined,
+        status: 'scheduled',
+      }
+
+      const result = await OfflineFirstService.updateMeeting(meetingId, updateData)
       
       if (result.success) {
-        console.log('SUCCESS: Meeting updated successfully')
-        
-        // Notify global state about meeting change
         notifyMeetingChange()
-        
         Alert.alert("Success", "Meeting updated successfully!")
         setShowEditModal(false)
-        loadMeetings() // Refresh the meetings list
+        loadMeetings()
       } else {
-        console.log('ERROR: Update failed:', result.error)
         Alert.alert("Error", result.error || "Failed to update meeting")
       }
     } catch (error) {
@@ -694,6 +648,26 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
       if (!followUpDate || !followUpTime) {
         Alert.alert("Error", "Please select both date and time");
         return;
+      }
+
+      // Follow-up must be today or later
+      const fuDate = new Date(followUpDate);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      fuDate.setHours(0, 0, 0, 0);
+      if (fuDate < today) {
+        Alert.alert("Invalid Date", "Follow-up date cannot be in the past.");
+        return;
+      }
+
+      // Follow-up must be on or after the meeting date
+      const meetingDate = selectedMeeting.scheduled_date ? new Date(selectedMeeting.scheduled_date) : null;
+      if (meetingDate) {
+        meetingDate.setHours(0, 0, 0, 0);
+        if (fuDate < meetingDate) {
+          Alert.alert("Invalid Date", "Follow-up date must be on or after the meeting date.");
+          return;
+        }
       }
 
       console.log('Calling OfflineFirstService.createMeetingFollowUp with meetingId:', meetingId);
@@ -789,6 +763,18 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         return
       }
 
+      // Validate: scheduled_date must not be in the past
+      if (meetingForm.scheduled_date) {
+        const selected = new Date(meetingForm.scheduled_date)
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        selected.setHours(0, 0, 0, 0)
+        if (selected < today) {
+          Alert.alert("Invalid Date", "Meeting date cannot be in the past.")
+          return
+        }
+      }
+
       // Get current user
       const userResult = await AuthService.getCurrentUser()
       if (userResult.success && userResult.user) {
@@ -834,46 +820,10 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     }
   }
 
-  const handleUpdateMeeting = async () => {
-    if (!selectedMeeting) return
-    
-    try {
-      // Update meeting
-      const result = await MRService.updateMeeting(
-        selectedMeeting.id,
-        meetingForm.scheduled_date,
-        meetingForm.duration_minutes,
-        undefined, // presentation_id
-        meetingForm.notes,
-        selectedMeeting.status
-      )
-      
-      if (result.success) {
-        Alert.alert("Success", "Meeting updated successfully!")
-        setShowEditModal(false)
-        resetMeetingForm()
-        loadMeetings()
-      } else {
-        Alert.alert("Error", result.error || "Failed to update meeting")
-      }
-    } catch (error) {
-      console.error('Error updating meeting:', error)
-      Alert.alert("Error", "Failed to update meeting")
-    }
-  }
-
   const handleDeleteMeeting = (meeting: any) => {
-    console.log('=== DELETE MEETING DEBUG ===')
-    console.log('Meeting to delete:', meeting)
-    console.log('Meeting ID (meeting.meeting_id):', meeting.meeting_id)
-    console.log('Meeting ID (meeting.id):', meeting.id)
-    console.log('Has server_id:', meeting.server_id)
-    console.log('Meeting title:', meeting.title)
-    console.log('Meeting purpose:', meeting.purpose)
-    
     Alert.alert(
       "Delete Meeting",
-      `Are you sure you want to delete the meeting "${meeting.title || meeting.purpose}"?\\n\\nThis action cannot be undone and will remove all associated slide notes.`,
+      `Are you sure you want to delete the meeting "${meeting.title || meeting.purpose}"?\n\nThis will also remove all associated follow-ups and notes.`,
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -881,60 +831,16 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
           style: "destructive",
           onPress: async () => {
             try {
-              // Determine if this is a local-only meeting or server meeting
-              const isLocalMeeting = meeting.id && !meeting.meeting_id && !meeting.server_id
-              const meetingId = meeting.meeting_id || meeting.id
-              const serverId = meeting.server_id
+              const meetingId = meeting.id || meeting.meeting_id
               
-              console.log('Is local meeting:', isLocalMeeting)
-              console.log('Attempting to delete meeting with ID:', meetingId)
-              console.log('Server ID:', serverId)
-              
-              // Delete by both id and server_id if available to handle duplicates
-              let result
-              if (isLocalMeeting) {
-                // Use OfflineFirstService for local meetings
-                console.log('Calling OfflineFirstService.deleteMeeting...')
-                result = await OfflineFirstService.deleteMeeting(meetingId)
-                
-                // Also try to delete by server_id if it exists (for duplicates)
-                if (serverId && result.success) {
-                  try {
-                    await OfflineFirstService.deleteMeeting(serverId)
-                    console.log('Also deleted duplicate by server_id:', serverId)
-                  } catch (e) {
-                    console.log('Note: Could not delete by server_id (may not exist):', e)
-                  }
-                }
-              } else {
-                // Use MRService for server meetings
-                console.log('Calling MRService.deleteMeeting...')
-                result = await MRService.deleteMeeting(meetingId)
-                
-                // Also try to delete by server_id if different from meetingId
-                if (serverId && serverId !== meetingId && result.success) {
-                  try {
-                    await MRService.deleteMeeting(serverId)
-                    console.log('Also deleted duplicate by server_id:', serverId)
-                  } catch (e) {
-                    console.log('Note: Could not delete by server_id (may not exist):', e)
-                  }
-                }
-              }
-              
-              console.log('=== DELETE RESULT ===')
-              console.log('Success:', result.success)
-              console.log('Error:', result.error)
-              console.log('Data:', result.data)
+              // Always use OfflineFirstService — handles local soft-delete + sync queue
+              const result = await OfflineFirstService.deleteMeeting(meetingId)
               
               if (result.success) {
-                console.log('SUCCESS: Meeting deleted successfully')
                 Alert.alert("Success", "Meeting deleted successfully!")
-                // Notify meeting change to refresh all screens
                 notifyMeetingChange()
-                loadMeetings() // Refresh the meetings list
+                loadMeetings()
               } else {
-                console.log('ERROR: Delete failed:', result.error)
                 Alert.alert("Error", result.error || "Failed to delete meeting")
               }
             } catch (error) {
@@ -1104,17 +1010,19 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
 
               {(meeting.latest_follow_up || (meeting.follow_up_required && meeting.follow_up_date)) ? (
               <View style={styles.followUpInfo}>
-                <Ionicons name="calendar" size={14} color="#d97706" />
+                <Ionicons name="calendar" size={14} color={meeting.status === 'follow-up-scheduled' ? '#8b5cf6' : '#d97706'} />
                 <View style={styles.followUpContent}>
-                  <Text style={styles.followUpText}>
+                  <Text style={[styles.followUpText, meeting.status === 'follow-up-scheduled' && { color: '#8b5cf6' }]}>
                     {meeting.latest_follow_up 
-                      ? `Follow-up #${meeting.latest_follow_up.sequence_number}: ${formatDate(meeting.latest_follow_up.follow_up_date)}${meeting.latest_follow_up.follow_up_time ? ` at ${meeting.latest_follow_up.follow_up_time}` : ''}`
+                      ? `Next: ${formatDate(meeting.latest_follow_up.follow_up_date)}${meeting.latest_follow_up.follow_up_time ? ` at ${meeting.latest_follow_up.follow_up_time}` : ''}`
                       : `Follow-up: ${formatDate(meeting.follow_up_date)}${meeting.follow_up_time ? ` at ${meeting.follow_up_time}` : ''}`
                     }
                   </Text>
-                  {meeting.follow_up_count > 1 && (
-                    <View style={styles.followUpCountBadge}>
-                      <Text style={styles.followUpCountText}>{meeting.follow_up_count} total</Text>
+                  {meeting.follow_up_count > 0 && (
+                    <View style={[styles.followUpCountBadge, meeting.status === 'follow-up-scheduled' && { backgroundColor: '#8b5cf6' }]}>
+                      <Text style={styles.followUpCountText}>
+                        {meeting.follow_up_count} {meeting.follow_up_count === 1 ? 'follow-up' : 'follow-ups'}
+                      </Text>
                     </View>
                   )}
                 </View>
@@ -1219,7 +1127,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
                     setSelectedDate(initialDate)
                     datePicker.showDate(initialDate, {
                       mode: 'date',
-                      title: 'Select Meeting Date'
+                      title: 'Select Meeting Date',
+                      minimumDate: new Date(),
                     }, (result) => {
                       if (!result.cancelled && result.date) {
                         setMeetingForm(prev => ({ ...prev, scheduled_date: result.date?.toISOString().split('T')[0] || '' }))
@@ -1325,10 +1234,13 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
                   style={styles.dateTimeButton}
                   onPress={() => {
                     setDatePickerMode('followup')
+                    const minDate = selectedMeeting?.scheduled_date
+                      ? new Date(Math.max(new Date(selectedMeeting.scheduled_date).getTime(), new Date().setHours(0,0,0,0)))
+                      : new Date()
                     setSelectedDate(new Date(followUpDate || Date.now()))
                     datePicker.showDate(
                       new Date(followUpDate || Date.now()), 
-                      { mode: 'date', title: 'Select Follow-up Date' },
+                      { mode: 'date', title: 'Select Follow-up Date', minimumDate: minDate },
                       (result) => {
                         if (!result.cancelled && result.date instanceof Date) {
                           setFollowUpDate(result.date.toISOString().split('T')[0])

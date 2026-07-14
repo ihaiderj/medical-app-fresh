@@ -185,6 +185,14 @@ export default function MeetingFormModal({
     }
     if (!formData.scheduled_date) {
       newErrors.scheduled_date = 'Meeting date is required';
+    } else {
+      const selected = new Date(formData.scheduled_date);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      selected.setHours(0, 0, 0, 0);
+      if (selected < today) {
+        newErrors.scheduled_date = 'Meeting date cannot be in the past';
+      }
     }
     if (!formData.time) {
       newErrors.time = 'Meeting time is required';
@@ -506,6 +514,7 @@ export default function MeetingFormModal({
           visible={showDatePicker}
           value={selectedDate}
           mode="date"
+          minimumDate={new Date()}
           onConfirm={(result) => {
             if (!result.cancelled && result.date) {
               handleDateSelect(result.date)

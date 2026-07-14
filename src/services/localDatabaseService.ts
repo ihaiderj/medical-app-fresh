@@ -868,7 +868,7 @@ export class LocalDatabaseService {
             `, [
               doctor.id, doctor.server_id || null, doctor.mr_id, doctor.first_name, doctor.last_name,
               doctor.email || null, doctor.phone || null, doctor.specialty || null, doctor.hospital || null,
-              location, doctor.profile_image_url || null, doctor.notes || null,
+              location, doctor.profile_image_url || null, doctor.notes ?? '',
               doctor.relationship_status || 'active', doctor.meetings_count || 0,
               doctor.last_meeting_date || null, doctor.next_appointment || null,
               doctor.created_by || null, doctor.created_at, doctor.updated_at, doctor.last_modified || null,
@@ -1559,6 +1559,15 @@ export class LocalDatabaseService {
           console.error('LocalDB: Migration 007 failed, but continuing:', migrationError);
         }
       }
+
+      // Migration 8: Normalize doctors.notes to empty string (avoids NOT NULL failures on legacy DBs)
+      if (currentVersion < 8) {
+        try {
+          await this.runMigration_008();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 008 failed, but continuing:', migrationError);
+        }
+      }
       
     } catch (error) {
       console.error('LocalDB: Migration error:', error);
@@ -2071,6 +2080,44 @@ export class LocalDatabaseService {
     console.log('LocalDB: Migration 007 completed');
   }
 
+  /**
+   * Migration 008: Backfill null doctor notes to empty string.
+   */
+  private static async runMigration_008(): Promise<void> {
+    console.log('LocalDB: Running migration 008 - Normalize doctors.notes...');
+
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+
+    try {
+      await this.db.execAsync(`UPDATE doctors SET notes = '' WHERE notes IS NULL`);
+      console.log('LocalDB: Backfilled null doctors.notes to empty string');
+    } catch (error) {
+      console.warn('LocalDB: Could not backfill doctors.notes:', error);
+    }
+
+    try {
+      const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 8');
+      const versionResult = await versionCheck.executeAsync();
+      const versionRow = await versionResult.getFirstAsync();
+      await versionCheck.finalizeAsync();
+
+      if (!versionRow) {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (8)');
+        console.log('LocalDB: Schema version updated to 8');
+      }
+    } catch {
+      try {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (8)');
+      } catch {
+        console.log('LocalDB: Schema version 8 already exists');
+      }
+    }
+
+    console.log('LocalDB: Migration 008 completed');
+  }
+
   // ==================== DOCTORS CRUD ====================
 
   /**
@@ -2088,6 +2135,7 @@ export class LocalDatabaseService {
     const doctor: LocalDoctor = {
       id,
       ...doctorData,
+      notes: doctorData.notes ?? '',
       created_at: (doctorData as any).created_at || now,
       updated_at: (doctorData as any).updated_at || now,
       last_modified: doctorData.last_modified || now,
@@ -2129,7 +2177,7 @@ export class LocalDatabaseService {
       `, [
         doctor.id, doctor.server_id || null, doctor.mr_id, doctor.first_name, 
           doctor.last_name, doctor.email || null, doctor.phone || null, doctor.specialty, doctor.hospital, doctor.location || null,
-          doctor.profile_image_url || null, doctor.notes || null, doctor.relationship_status, doctor.meetings_count,
+          doctor.profile_image_url || null, doctor.notes ?? '', doctor.relationship_status, doctor.meetings_count,
           doctor.last_meeting_date || null, doctor.next_appointment || null,
           doctor.created_by || null, doctor.created_at, doctor.updated_at,
           doctor.last_modified || doctor.updated_at, doctor.version, doctor.sync_status,
@@ -2229,6 +2277,59 @@ export class LocalDatabaseService {
     }
   }
 
+  /** True when a locally deleted doctor still needs server tombstone (REST + sync push). */
+  static doctorDeleteNeedsServerTombstone(record: LocalDoctor): boolean {
+    if (!record.is_deleted || !record.server_id?.trim()) {
+      return false;
+    }
+    if (record.sync_status !== 'synced') {
+      return true;
+    }
+    try {
+      const changes = record.local_changes
+        ? (typeof record.local_changes === 'string'
+          ? JSON.parse(record.local_changes)
+          : record.local_changes)
+        : {};
+      return !changes?.delete_tombstone_pushed;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Soft-deleted doctors that still have a server id (may need server delete). */
+  static async getDeletedDoctorsWithServerId(mrId: string): Promise<LocalDoctor[]> {
+    await this.initialize();
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const doctorsData = await AsyncStorage.getItem('doctors');
+        const doctors: LocalDoctor[] = doctorsData ? JSON.parse(doctorsData) : [];
+        return doctors.filter(
+          (doctor) =>
+            doctor.mr_id === mrId &&
+            doctor.is_deleted &&
+            Boolean(doctor.server_id?.trim()),
+        );
+      }
+
+      const rows = await this.queryAllSql(
+        `SELECT * FROM doctors
+         WHERE mr_id = ? AND is_deleted = 1
+           AND server_id IS NOT NULL AND server_id <> ''`,
+        [mrId],
+      );
+
+      return rows.map((row: any) => ({
+        ...row,
+        is_deleted: Boolean(row.is_deleted),
+      })) as LocalDoctor[];
+    } catch (error) {
+      console.error('LocalDB: Failed to get deleted doctors with server_id:', error);
+      return [];
+    }
+  }
+
   /**
    * Get doctor by ID
    */
@@ -2236,26 +2337,95 @@ export class LocalDatabaseService {
     await this.initialize();
     
     try {
-      if (this.isUsingAsyncStorage()) {
-        const data = await AsyncStorage.getItem('doctors');
-        const doctors: LocalDoctor[] = data ? JSON.parse(data) : [];
-        return doctors.find(d => d.id === id && !d.is_deleted) || null;
+      const record = await this.getDoctorRecordById(id);
+      if (!record || record.is_deleted) {
+        return null;
       }
-
-      const result = await this.db.getFirstAsync(`
-        SELECT * FROM doctors WHERE id = ? AND is_deleted = 0
-      `, [id]);
-
-      if (!result) return null;
-
-      return {
-        ...result,
-        is_deleted: Boolean(result.is_deleted)
-      } as LocalDoctor;
+      return record;
     } catch (error) {
       console.error('LocalDB: Failed to get doctor by ID:', error);
       throw error;
     }
+  }
+
+  /** Get doctor row by local id, including soft-deleted records. */
+  static async getDoctorRecordById(id: string): Promise<LocalDoctor | null> {
+    await this.initialize();
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('doctors');
+        const doctors: LocalDoctor[] = data ? JSON.parse(data) : [];
+        const doctor = doctors.find((d) => d.id === id);
+        return doctor ? { ...doctor, is_deleted: Boolean(doctor.is_deleted) } : null;
+      }
+
+      const result = await this.db.getFirstAsync(`
+        SELECT * FROM doctors WHERE id = ?
+      `, [id]);
+
+      if (!result) return null;
+
+      return this.mapRowToDoctor(result);
+    } catch (error) {
+      console.error('LocalDB: Failed to get doctor record by ID:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Drop doctor queue items that contradict current local state.
+   */
+  static async sanitizePendingDoctorSyncOperations(): Promise<number> {
+    await this.ensureReady();
+    if (this.useAsyncStorage) {
+      return 0;
+    }
+
+    let cleaned = 0;
+
+    try {
+      const doctorOps = await this.queryAllSql<SyncOperation>(`
+        SELECT * FROM sync_operations
+        WHERE table_name = 'doctors' AND status IN ('pending', 'failed')
+      `);
+
+      const byDoctor = new Map<string, SyncOperation[]>();
+      for (const op of doctorOps) {
+        const list = byDoctor.get(op.record_id) || [];
+        list.push(op);
+        byDoctor.set(op.record_id, list);
+      }
+
+      for (const [doctorId, ops] of byDoctor.entries()) {
+        const doctor = await this.getDoctorRecordById(doctorId);
+        if (!doctor) {
+          for (const op of ops) {
+            await this.markOperationCompleted(op.id);
+            cleaned++;
+          }
+          continue;
+        }
+
+        if (doctor.is_deleted) {
+          const serverId = doctor.server_id?.trim() || '';
+          for (const op of ops) {
+            if (!serverId || op.operation_type === 'create' || op.operation_type === 'update') {
+              await this.markOperationCompleted(op.id);
+              cleaned++;
+            }
+          }
+        }
+      }
+
+      if (cleaned > 0) {
+        console.log(`LocalDB: Sanitized ${cleaned} contradictory doctor sync operation(s)`);
+      }
+    } catch (error) {
+      console.error('LocalDB: Failed to sanitize doctor sync operations:', error);
+    }
+
+    return cleaned;
   }
 
   /**
@@ -2306,9 +2476,10 @@ export class LocalDatabaseService {
 
       // Build dynamic update query
       Object.entries(updates).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue') {
+        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue' && value !== undefined) {
+          const normalizedValue = key === 'notes' && (value === null || value === undefined) ? '' : value;
           updateFields.push(`${key} = ?`);
-          values.push(value);
+          values.push(normalizedValue);
         }
       });
 
@@ -2366,6 +2537,7 @@ export class LocalDatabaseService {
         // Update existing doctor (skip sync queue for server sync)
         await this.updateDoctor(existing.id, {
           ...doctor,
+          notes: doctor.notes ?? '',
           skipSyncQueue: true,
           sync_status: 'synced'
         });
@@ -2373,6 +2545,7 @@ export class LocalDatabaseService {
         // Create new doctor (skip sync queue for server sync)
         await this.createDoctor({
           ...doctor,
+          notes: doctor.notes ?? '',
           skipSyncQueue: true
         });
       }
@@ -2388,20 +2561,36 @@ export class LocalDatabaseService {
    * @param deleteRelatedMeetings - Whether to delete related meetings
    * @returns Object with success status, hasMeetings flag, and meetingCount
    */
-  static async deleteDoctor(id: string, deleteRelatedMeetings: boolean = false): Promise<{ 
-    success: boolean; 
-    hasMeetings: boolean; 
-    meetingCount: number; 
-    error?: string 
+  static async deleteDoctor(
+    id: string,
+    deleteRelatedMeetings: boolean = false,
+    checkOnly: boolean = false,
+  ): Promise<{
+    success: boolean;
+    hasMeetings: boolean;
+    meetingCount: number;
+    error?: string;
   }> {
     await this.initialize();
     
     try {
       const doctorToDelete = await this.getDoctorById(id);
       if (!doctorToDelete) {
+        const alreadyDeleted = await this.db.getFirstAsync(
+          `SELECT id FROM doctors WHERE id = ? AND is_deleted = 1`,
+          [id],
+        );
+        if (alreadyDeleted) {
+          console.log(`LocalDB: Doctor already deleted: ${id}`);
+          return { success: true, hasMeetings: false, meetingCount: 0 };
+        }
+
         console.warn(`LocalDB: Attempted to delete non-existent doctor with id: ${id}`);
-        // If it doesn't exist locally, ensure it's not in the sync queue either
-        await this.executeQuery(`DELETE FROM sync_queue WHERE record_id = ? AND table_name = 'doctors'`, [id]);
+        await this.runSql(`
+          UPDATE sync_operations
+          SET status = 'completed', error_message = 'cancelled_record_missing'
+          WHERE table_name = 'doctors' AND record_id = ? AND status IN ('pending', 'failed')
+        `, [id]);
         return { success: false, hasMeetings: false, meetingCount: 0, error: 'Doctor not found' };
       }
 
@@ -2418,6 +2607,10 @@ export class LocalDatabaseService {
         return { success: false, hasMeetings: true, meetingCount, error: 'Doctor has related meetings' };
       }
 
+      if (checkOnly) {
+        return { success: false, hasMeetings, meetingCount };
+      }
+
       // Delete related meetings if requested
       if (hasMeetings && deleteRelatedMeetings) {
         for (const meeting of relatedMeetings) {
@@ -2426,15 +2619,48 @@ export class LocalDatabaseService {
       }
 
       const now = new Date().toISOString();
+      const neverSynced = !doctorToDelete.server_id;
       
       await this.executeQuery(`
         UPDATE doctors 
         SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ? 
         WHERE id = ?
-      `, [now, 'pending', id]);
+      `, [now, neverSynced ? 'synced' : 'pending', id]);
 
-      // Add to sync queue with the full record to ensure server_id is present
-      await this.addToSyncQueue('delete', 'doctors', id, doctorToDelete);
+      if (neverSynced) {
+        await this.cancelPendingDoctorCreateArtifacts(id, doctorToDelete.mr_id);
+      } else {
+        await this.addToSyncQueue('delete', 'doctors', id, doctorToDelete);
+      }
+
+      try {
+        const activityId = await this.createActivityLog({
+          user_id: doctorToDelete.mr_id,
+          mr_id: doctorToDelete.mr_id,
+          activity_type: 'doctor_deleted',
+          description: `Deleted doctor: ${doctorToDelete.first_name} ${doctorToDelete.last_name}`,
+          metadata: JSON.stringify({
+            doctor_id: id,
+            specialty: doctorToDelete.specialty,
+            hospital: doctorToDelete.hospital,
+            server_id: doctorToDelete.server_id ?? null,
+          }),
+          is_deleted: false,
+        });
+        if (neverSynced) {
+          await this.markActivityLogSynced(activityId);
+          const pendingLogOp = await this.queryFirstSql<{ id: string }>(`
+            SELECT id FROM sync_operations
+            WHERE table_name = 'activity_logs' AND record_id = ? AND status = 'pending'
+            ORDER BY timestamp DESC LIMIT 1
+          `, [activityId]);
+          if (pendingLogOp?.id) {
+            await this.markOperationCompleted(pendingLogOp.id);
+          }
+        }
+      } catch (error) {
+        console.warn('LocalDB: Failed to create activity log for doctor delete:', error);
+      }
       
       console.log('LocalDB: Doctor soft deleted:', id);
       return { success: true, hasMeetings, meetingCount };
@@ -2447,6 +2673,29 @@ export class LocalDatabaseService {
         error: error instanceof Error ? error.message : 'Failed to delete doctor' 
       };
     }
+  }
+
+  private static async cancelPendingDoctorCreateArtifacts(doctorId: string, mrId: string): Promise<void> {
+    const doctorIdPattern = `%"doctor_id":"${doctorId}"%`;
+
+    await this.runSql(`
+      UPDATE sync_operations
+      SET status = 'completed', error_message = 'superseded_by_delete'
+      WHERE status IN ('pending', 'failed')
+        AND (
+          (table_name = 'doctors' AND record_id = ? AND operation_type IN ('create', 'update', 'delete'))
+          OR (table_name = 'activity_logs' AND operation_type = 'create' AND data LIKE ?)
+        )
+    `, [doctorId, doctorIdPattern]);
+
+    await this.runSql(`
+      UPDATE activity_logs
+      SET sync_status = 'synced', version = version + 1
+      WHERE mr_id = ? AND is_deleted = 0
+        AND action = 'doctor_added'
+        AND metadata LIKE ?
+        AND sync_status != 'synced'
+    `, [mrId, doctorIdPattern]);
   }
 
   private static normalizeString(value?: string | null): string {
@@ -2671,7 +2920,8 @@ export class LocalDatabaseService {
   }
 
   /**
-   * Mark all doctors with server_id as synced (fix for old records)
+   * Mark doctors with server_id as synced only when they have no pending queue work.
+   * Legacy helper — prefer repairDoctorSyncQueueState on startup.
    */
   static async markServerDoctorsSynced(mrId: string): Promise<void> {
     await this.initialize();
@@ -2697,13 +2947,58 @@ export class LocalDatabaseService {
         await this.runSql(
           `UPDATE doctors
            SET updated_at = ?, last_modified = ?, sync_status = 'synced', local_changes = NULL
-           WHERE mr_id = ? AND server_id IS NOT NULL AND server_id <> '' AND sync_status = 'pending'`,
+           WHERE mr_id = ? AND server_id IS NOT NULL AND server_id <> '' AND sync_status = 'pending'
+             AND id NOT IN (
+               SELECT record_id FROM sync_operations
+               WHERE table_name = 'doctors' AND status IN ('pending', 'failed')
+             )`,
           [now, now, mrId],
         );
       }
       console.log('LocalDB: Marked server doctors as synced for MR:', mrId);
     } catch (error) {
       console.error('LocalDB: Failed to mark server doctors as synced:', error);
+    }
+  }
+
+  /**
+   * Repair doctor sync state after app restart:
+   * - restore pending status when queue still has work
+   * - drop only erroneous create queue rows for already-synced doctors
+   */
+  static async repairDoctorSyncQueueState(mrId: string): Promise<void> {
+    await this.initialize();
+
+    try {
+      await this.cleanupStaleSyncQueueEntries(mrId);
+
+      if (this.isUsingAsyncStorage()) {
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const pendingDoctorOps = await this.queryAllSql<{ record_id: string }>(`
+        SELECT DISTINCT record_id
+        FROM sync_operations
+        WHERE table_name = 'doctors' AND status IN ('pending', 'failed')
+      `);
+
+      for (const row of pendingDoctorOps) {
+        await this.runSql(
+          `UPDATE doctors
+           SET sync_status = 'pending', updated_at = ?, last_modified = ?
+           WHERE id = ? AND mr_id = ?`,
+          [now, now, row.record_id, mrId],
+        );
+      }
+
+      if (pendingDoctorOps.length > 0) {
+        console.log(
+          `LocalDB: Restored pending sync status for ${pendingDoctorOps.length} doctor(s) with queue work`,
+        );
+      }
+    } catch (error) {
+      console.error('LocalDB: Failed to repair doctor sync queue state:', error);
     }
   }
 
@@ -2714,9 +3009,13 @@ export class LocalDatabaseService {
       const serverDoctorId = server?.id || server?.doctor_id || server?.server_id || null;
       
       // Check if this doctor is pending deletion locally. If so, skip.
+      const localDoctor = serverDoctorId ? await this.getDoctorByServerId(serverDoctorId) : null;
       const pendingDelete = serverDoctorId ? await this.db.getFirstAsync(
-        `SELECT 1 FROM sync_queue WHERE table_name = 'doctors' AND operation_type = 'delete' AND data LIKE ?`,
-        [`%${serverDoctorId}%`]
+        `SELECT 1 FROM sync_operations
+         WHERE table_name = 'doctors' AND operation_type = 'delete'
+           AND status IN ('pending', 'failed')
+           AND (record_id = ? OR data LIKE ?)`,
+        [localDoctor?.id ?? '', `%${serverDoctorId}%`],
       ) : null;
 
       if (pendingDelete) {
@@ -3005,9 +3304,10 @@ export class LocalDatabaseService {
 
       // Build dynamic update query
       Object.entries(updates).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue') {
+        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue' && value !== undefined) {
+          const normalizedValue = key === 'notes' && (value === null || value === undefined) ? '' : value;
           updateFields.push(`${key} = ?`);
-          values.push(value);
+          values.push(normalizedValue);
         }
       });
 
@@ -3023,16 +3323,8 @@ export class LocalDatabaseService {
       if (!skipSyncQueue) {
         const updatedMeeting = await this.getMeetingById(id);
         if (updatedMeeting) {
-          // Only queue for sync if meeting has server_id (was previously synced)
-          // Local-only meetings can't be updated on server
-          if (updatedMeeting.server_id) {
-            await this.addToSyncQueue('update', 'meetings', id, updatedMeeting);
-          } else {
-            console.log(`LocalDB: Skipping sync queue for update - meeting ${id} has no server_id (local-only)`);
-            // Mark as synced since there's nothing to sync
-            await this.db.runAsync(`UPDATE meetings SET sync_status = 'synced' WHERE id = ?`, [id]);
-          }
-          
+          await this.addToSyncQueue('update', 'meetings', id, updatedMeeting);
+
           // Create activity log for meeting update (only for user changes, not server syncs)
           try {
             await this.createActivityLog({
@@ -3069,32 +3361,67 @@ export class LocalDatabaseService {
     try {
       const now = new Date().toISOString();
       
-      // Check if meeting has server_id before queuing for sync
       const meeting = await this.getMeetingById(id);
-      const hasServerId = meeting?.server_id;
       
       await this.db.runAsync(`
         UPDATE meetings 
         SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ? 
         WHERE id = ?
-      `, [now, hasServerId ? 'pending' : 'synced', id]);
+      `, [now, 'pending', id]);
 
-      // Add to sync queue only if meeting has server_id (was previously synced)
-      // Local-only meetings can't be deleted on server
-      if (hasServerId) {
-        await this.addToSyncQueue('delete', 'meetings', id, { 
-          id, 
+      if (meeting) {
+        await this.addToSyncQueue('delete', 'meetings', id, {
+          ...meeting,
+          id,
           server_id: meeting.server_id,
-          is_deleted: true 
+          is_deleted: true,
         });
-      } else {
-        console.log(`LocalDB: Skipping sync queue for delete - meeting ${id} has no server_id (local-only)`);
       }
+
+      // Cascade soft-delete follow-ups and notes for this meeting
+      await this.cascadeSoftDeleteMeetingChildren(id);
       
-      console.log('LocalDB: Meeting deleted:', id);
+      console.log('LocalDB: Meeting deleted (with cascade):', id);
     } catch (error) {
       console.error('LocalDB: Failed to delete meeting:', error);
       throw error;
+    }
+  }
+
+  private static async cascadeSoftDeleteMeetingChildren(meetingId: string): Promise<void> {
+    const now = new Date().toISOString();
+    try {
+      // Soft-delete all non-deleted follow-ups for this meeting
+      const followUps = await this.db.getAllAsync<any>(
+        `SELECT * FROM meeting_followups WHERE meeting_id = ? AND is_deleted = 0`, [meetingId]
+      );
+      for (const fu of followUps) {
+        await this.db.runAsync(
+          `UPDATE meeting_followups SET is_deleted = 1, updated_at = ?, sync_status = 'pending' WHERE id = ?`,
+          [now, fu.id]
+        );
+        await this.addToSyncQueue('delete', 'meeting_followups', fu.id, {
+          ...fu, is_deleted: true,
+        });
+      }
+
+      // Soft-delete all non-deleted notes for this meeting
+      const notes = await this.db.getAllAsync<any>(
+        `SELECT * FROM meeting_notes WHERE meeting_id = ? AND is_deleted = 0`, [meetingId]
+      );
+      for (const note of notes) {
+        await this.db.runAsync(
+          `UPDATE meeting_notes SET is_deleted = 1, updated_at = ?, sync_status = 'pending' WHERE id = ?`,
+          [now, note.id]
+        );
+        await this.addToSyncQueue('delete', 'meeting_notes', note.id, {
+          ...note, is_deleted: true,
+        });
+      }
+
+      console.log(`LocalDB: Cascade-deleted ${followUps.length} follow-ups and ${notes.length} notes for meeting ${meetingId}`);
+    } catch (error) {
+      console.warn('LocalDB: Cascade soft-delete partial failure (meeting children):', error);
     }
   }
 
@@ -3358,49 +3685,49 @@ export class LocalDatabaseService {
   /**
    * Create a new meeting note locally
    */
-  static async createMeetingNote(noteData: Omit<LocalMeetingNote, 'id' | 'created_at' | 'updated_at' | 'version' | 'sync_status' | 'is_deleted'>): Promise<string> {
+  static async createMeetingNote(
+    noteData: Omit<LocalMeetingNote, 'id' | 'created_at' | 'updated_at' | 'version' | 'sync_status' | 'is_deleted'> & {
+      skipSyncQueue?: boolean
+    },
+  ): Promise<string> {
     await this.initialize();
     
-    const id = generateUUID();
+    const skipSyncQueue = noteData.skipSyncQueue || false;
+    const id = (noteData as { id?: string }).id || generateUUID();
     const now = new Date().toISOString();
     
     const note: LocalMeetingNote = {
       id,
       ...noteData,
-      created_at: now,
-      updated_at: now,
-      version: 1,
-      sync_status: 'pending',
+      created_at: (noteData as { created_at?: string }).created_at || now,
+      updated_at: (noteData as { updated_at?: string }).updated_at || now,
+      version: (noteData as { version?: number }).version || 1,
+      sync_status: (noteData as { sync_status?: LocalMeetingNote['sync_status'] }).sync_status || (skipSyncQueue ? 'synced' : 'pending'),
       is_deleted: false
     };
 
     try {
-      // Debug: Log the note object and count values
       const valuesArray = [
         note.id, note.server_id || null, note.meeting_id, note.meeting_server_id || null,
         note.slide_id, note.slide_title, note.slide_order, note.brochure_id,
-        note.note_text, note.slide_image_uri || null, note.created_at, note.updated_at, 
-        note.last_modified || null, note.version, note.sync_status, 
+        note.note_text, note.slide_image_uri || null, note.follow_up_id || null,
+        note.created_at, note.updated_at,
+        note.last_modified || null, note.version, note.sync_status,
         note.is_deleted ? 1 : 0, note.local_changes || null
       ];
-      console.log('LocalDB: Creating meeting note with', valuesArray.length, 'values');
-      console.log('LocalDB: Note data:', {
-        id: note.id,
-        meeting_id: note.meeting_id,
-        slide_id: note.slide_id,
-        brochure_id: note.brochure_id
-      });
       
       await this.db.runAsync(`
         INSERT INTO meeting_notes (
           id, server_id, meeting_id, meeting_server_id, slide_id, slide_title, 
-          slide_order, brochure_id, note_text, slide_image_uri, created_at, updated_at, 
+          slide_order, brochure_id, note_text, slide_image_uri, follow_up_id,
+          created_at, updated_at, 
           last_modified, version, sync_status, is_deleted, local_changes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, valuesArray);
 
-      // Add to sync queue
-      await this.addToSyncQueue('create', 'meeting_notes', id, note);
+      if (!skipSyncQueue) {
+        await this.addToSyncQueue('create', 'meeting_notes', id, note);
+      }
       
       console.log('LocalDB: Meeting note created locally:', id);
       return id;
@@ -3470,6 +3797,14 @@ export class LocalDatabaseService {
     }
   }
 
+  /** @deprecated Use updateMeetingNote — kept for legacy sync call sites */
+  static async updateMeetingSlideNote(
+    id: string,
+    updates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean },
+  ): Promise<void> {
+    return this.updateMeetingNote(id, updates);
+  }
+
   /**
    * Update meeting note
    */
@@ -3505,13 +3840,7 @@ export class LocalDatabaseService {
       if (!skipSyncQueue) {
       const updatedNote = await this.getMeetingNoteById(id);
       if (updatedNote) {
-        if (updatedNote.server_id) {
-          await this.addToSyncQueue('update', 'meeting_notes', id, updatedNote);
-        } else {
-          console.log(`LocalDB: Skipping sync queue for note update - note ${id} has no server_id (local-only)`);
-          // Mark as synced since there's nothing to sync
-          await this.db.runAsync(`UPDATE meeting_notes SET sync_status = 'synced' WHERE id = ?`, [id]);
-          }
+        await this.addToSyncQueue('update', 'meeting_notes', id, updatedNote);
         }
       }
 
@@ -3531,29 +3860,24 @@ export class LocalDatabaseService {
     try {
       const now = new Date().toISOString();
       
-      // Fetch the note before deleting to check if it has server_id
       const note = await this.getMeetingNoteById(id);
-      const hasServerId = note?.server_id;
       
       await this.db.runAsync(`
         UPDATE meeting_notes 
         SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ? 
         WHERE id = ?
-      `, [now, hasServerId ? 'pending' : 'synced', id]);
+      `, [now, 'pending', id]);
 
-      // Add to sync queue only if note has server_id (was previously synced)
-      // Local-only notes can't be deleted on server
-      if (hasServerId && note) {
+      if (note) {
         await this.addToSyncQueue('delete', 'meeting_notes', id, {
+          ...note,
           id: note.id,
           server_id: note.server_id,
           meeting_id: note.meeting_id,
           meeting_server_id: note.meeting_server_id,
           slide_id: note.slide_id,
-          is_deleted: true
+          is_deleted: true,
         });
-      } else {
-        console.log(`LocalDB: Skipping sync queue for note delete - note ${id} has no server_id (local-only)`);
       }
       
       console.log('LocalDB: Meeting note deleted:', id);
@@ -3814,15 +4138,14 @@ export class LocalDatabaseService {
         `, [now, 'pending', id]);
       }
 
-      // Add to sync queue only if follow-up has server_id (was previously synced)
-      if (followUp.server_id) {
-        await this.addToSyncQueue('delete', 'meeting_followups', id, {
-          id: followUp.id,
-          server_id: followUp.server_id,
-          meeting_id: followUp.meeting_id,
-          is_deleted: true
-        });
-      }
+      // Always queue delete; sync layer skips server call when never uploaded
+      await this.addToSyncQueue('delete', 'meeting_followups', id, {
+        ...followUp,
+        id: followUp.id,
+        server_id: followUp.server_id,
+        meeting_id: followUp.meeting_id,
+        is_deleted: true,
+      });
       
       // Also delete associated notes
       const notes = await this.getMeetingNotes(followUp.meeting_id);
@@ -3835,6 +4158,49 @@ export class LocalDatabaseService {
       console.log('LocalDB: Meeting follow-up deleted:', id);
     } catch (error) {
       console.error('LocalDB: Failed to delete meeting follow-up:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Upsert meeting note (for server sync-down)
+   */
+  static async upsertMeetingNote(note: LocalMeetingNote): Promise<void> {
+    await this.initialize();
+
+    try {
+      const existing = await this.getMeetingNoteById(note.id);
+
+      if (existing) {
+        await this.updateMeetingNote(note.id, {
+          ...note,
+          skipSyncQueue: true,
+        });
+        return;
+      }
+
+      if (note.server_id) {
+        const byServerId = await this.db.getFirstAsync(
+          `SELECT * FROM meeting_notes WHERE server_id = ? AND is_deleted = 0`,
+          [note.server_id],
+        );
+
+        if (byServerId) {
+          await this.updateMeetingNote((byServerId as { id: string }).id, {
+            ...note,
+            id: (byServerId as { id: string }).id,
+            skipSyncQueue: true,
+          });
+          return;
+        }
+      }
+
+      await this.createMeetingNote({
+        ...note,
+        skipSyncQueue: true,
+      });
+    } catch (error) {
+      console.error('LocalDB: Failed to upsert meeting note:', error);
       throw error;
     }
   }
@@ -4828,6 +5194,57 @@ export class LocalDatabaseService {
     }
   }
 
+  static async resetDoctorServerSync(id: string): Promise<void> {
+    await this.runSql(
+      `UPDATE doctors SET server_id = NULL, sync_status = 'pending' WHERE id = ?`,
+      [id],
+    );
+  }
+
+  static async resetMeetingServerSync(id: string): Promise<void> {
+    await this.runSql(
+      `UPDATE meetings SET server_id = NULL, sync_status = 'pending' WHERE id = ?`,
+      [id],
+    );
+  }
+
+  static async resetMeetingFollowUpServerSync(id: string): Promise<void> {
+    await this.runSql(
+      `UPDATE meeting_followups SET server_id = NULL, sync_status = 'pending' WHERE id = ?`,
+      [id],
+    );
+  }
+
+  static async resetMeetingNoteServerSync(id: string): Promise<void> {
+    await this.runSql(
+      `UPDATE meeting_notes SET server_id = NULL, sync_status = 'pending' WHERE id = ?`,
+      [id],
+    );
+  }
+
+  static async getMeetingNotesForMr(mrId: string): Promise<LocalMeetingNote[]> {
+    await this.initialize();
+
+    try {
+      const result = await this.db.getAllAsync(
+        `SELECT mn.*
+         FROM meeting_notes mn
+         INNER JOIN meetings m ON mn.meeting_id = m.id
+         WHERE m.mr_id = ? AND mn.is_deleted = 0
+         ORDER BY mn.created_at`,
+        [mrId],
+      );
+
+      return (result || []).map((row: any) => ({
+        ...row,
+        is_deleted: Boolean(row.is_deleted),
+      })) as LocalMeetingNote[];
+    } catch (error) {
+      console.error('LocalDB: Failed to get meeting notes for MR:', error);
+      return [];
+    }
+  }
+
   /**
    * Mark an activity log as successfully backed up to the server.
    */
@@ -4957,7 +5374,7 @@ export class LocalDatabaseService {
 
   /**
    * Collapse create/update for the same record into one pending op.
-   * Prevents download+rename from producing two server creates.
+   * Edits on never-synced rows become creates; edits on synced rows become updates.
    */
   private static resolveQueueOperation(
     operation: 'create' | 'update' | 'delete',
@@ -4971,6 +5388,32 @@ export class LocalDatabaseService {
       return 'update';
     }
     return 'create';
+  }
+
+  /**
+   * Check if a record already has a pending/failed sync operation.
+   */
+  static async hasPendingSyncOperation(tableName: string, recordId: string): Promise<boolean> {
+    await this.ensureReady();
+
+    if (this.isUsingAsyncStorage()) {
+      const syncData = await AsyncStorage.getItem('sync_operations');
+      const syncOps: SyncOperation[] = syncData ? JSON.parse(syncData) : [];
+      return syncOps.some(
+        (op) =>
+          op.table_name === tableName &&
+          op.record_id === recordId &&
+          (op.status === 'pending' || op.status === 'failed'),
+      );
+    }
+
+    const rows = await this.queryAllSql<{ found: number }>(
+      `SELECT 1 as found FROM sync_operations
+       WHERE table_name = ? AND record_id = ? AND status IN ('pending', 'failed')
+       LIMIT 1`,
+      [tableName, recordId],
+    );
+    return rows.length > 0;
   }
 
   /**
@@ -5001,7 +5444,8 @@ export class LocalDatabaseService {
           await this.runSql(`
             UPDATE sync_operations
             SET status = 'completed', error_message = 'superseded'
-            WHERE table_name = ? AND record_id = ? AND operation_type = 'delete'
+            WHERE table_name = ? AND record_id = ?
+              AND operation_type IN ('create', 'update', 'delete')
               AND status IN ('pending', 'failed')
           `, [tableName, recordId]);
         } else {
@@ -5025,7 +5469,7 @@ export class LocalDatabaseService {
             sameRecord &&
             isPending &&
             (resolvedOperation === 'delete'
-              ? op.operation_type === 'delete'
+              ? op.operation_type === 'create' || op.operation_type === 'update' || op.operation_type === 'delete'
               : op.operation_type === 'create' || op.operation_type === 'update');
           return shouldSupersede
             ? { ...op, status: 'completed' as const, error_message: 'superseded' }
@@ -5145,6 +5589,57 @@ export class LocalDatabaseService {
     }
   }
 
+  static async reconcileDeletedDoctorSync(mrId: string): Promise<number> {
+    await this.ensureReady();
+
+    if (this.useAsyncStorage) {
+      return 0;
+    }
+
+    try {
+      const deletedRecords = await this.getDeletedDoctorsWithServerId(mrId);
+      let requeued = 0;
+
+      for (const record of deletedRecords) {
+        if (!record.server_id?.trim() || !this.doctorDeleteNeedsServerTombstone(record)) {
+          continue;
+        }
+
+        const existingOp = await this.queryFirstSql<{ id: string }>(`
+          SELECT id FROM sync_operations
+          WHERE table_name = 'doctors'
+            AND record_id = ?
+            AND operation_type = 'delete'
+            AND status IN ('pending', 'failed')
+        `, [record.id]);
+
+        if (!existingOp) {
+          await this.addToSyncQueue('delete', 'doctors', record.id, {
+            ...record,
+            notes: record.notes ?? '',
+          });
+          requeued++;
+        }
+
+        if (record.sync_status === 'synced' || record.sync_status === 'error') {
+          await this.updateDoctor(record.id, {
+            sync_status: 'pending',
+            skipSyncQueue: true,
+          });
+        }
+      }
+
+      if (requeued > 0) {
+        console.log(`LocalDB: Re-queued ${requeued} doctor delete sync operation(s)`);
+      }
+
+      return requeued;
+    } catch (error) {
+      console.error('LocalDB: Failed to reconcile deleted doctor sync:', error);
+      return 0;
+    }
+  }
+
   /**
    * Mark sync operation as completed
    */
@@ -5243,6 +5738,7 @@ export class LocalDatabaseService {
 
     try {
       cleaned += await this.dedupePendingSyncOperations();
+      cleaned += await this.sanitizePendingDoctorSyncOperations();
 
       const ops = await this.queryAllSql<SyncOperation>(`
         SELECT * FROM sync_operations
@@ -5260,6 +5756,37 @@ export class LocalDatabaseService {
             stale = true;
           } else if (op.operation_type === 'delete' && record.is_deleted && record.sync_status === 'synced') {
             stale = true;
+          }
+        } else if (op.table_name === 'doctors') {
+          const doctor = await this.queryFirstSql<{ is_deleted: number; server_id: string | null; sync_status: string }>(
+            `SELECT is_deleted, server_id, sync_status FROM doctors WHERE id = ?`,
+            [op.record_id],
+          );
+          if (!doctor) {
+            stale = true;
+          } else if (doctor.is_deleted && !doctor.server_id) {
+            stale = true;
+          } else if (
+            op.operation_type === 'create' &&
+            doctor.sync_status === 'synced' &&
+            !!doctor.server_id
+          ) {
+            stale = true;
+          }
+        } else if (op.table_name === 'activity_logs' && op.operation_type === 'create') {
+          const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data;
+          const doctorId = data?.metadata
+            ? (typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata)?.doctor_id
+            : undefined;
+          const activityType = data?.activity_type || data?.action;
+          if (doctorId && activityType === 'doctor_added') {
+            const doctor = await this.queryFirstSql<{ is_deleted: number; server_id: string | null }>(
+              `SELECT is_deleted, server_id FROM doctors WHERE id = ?`,
+              [doctorId],
+            );
+            if (!doctor || (doctor.is_deleted && !doctor.server_id)) {
+              stale = true;
+            }
           }
         }
 
@@ -5358,44 +5885,85 @@ export class LocalDatabaseService {
         return empty;
       }
 
-      const needsBackup = `sync_status != 'synced' OR server_id IS NULL OR server_id = ''`;
-
-      const count = async (sql: string, params: unknown[] = []) => {
-        const row = await this.queryFirstSql<{ count: number }>(sql, params);
-        return row?.count || 0;
+      const countEntity = async (entity: string, sql: string, params: unknown[] = []) => {
+        try {
+          const row = await this.queryFirstSql<{ count: number }>(sql, params);
+          return row?.count || 0;
+        } catch (error) {
+          console.error(`LocalDB: getBackupGapCounts failed for ${entity}:`, error);
+          return 0;
+        }
       };
 
+      const saved_brochures = await countEntity(
+        'saved_brochures',
+        `SELECT COUNT(*) as count FROM saved_brochures
+         WHERE mr_id = ? AND is_deleted = 0
+           AND (sync_status != 'synced' OR server_id IS NULL OR server_id = '')`,
+        [mrId],
+      );
+      const doctors = await countEntity(
+        'doctors',
+        `SELECT COUNT(*) as count FROM doctors
+         WHERE mr_id = ? AND is_deleted = 0
+           AND (sync_status != 'synced' OR server_id IS NULL OR server_id = '')`,
+        [mrId],
+      );
+      const meetings = await countEntity(
+        'meetings',
+        `SELECT COUNT(*) as count FROM meetings
+         WHERE mr_id = ? AND is_deleted = 0
+           AND (sync_status != 'synced' OR server_id IS NULL OR server_id = '')`,
+        [mrId],
+      );
+      const meeting_followups = await countEntity(
+        'meeting_followups',
+        `SELECT COUNT(*) as count
+         FROM meeting_followups mf
+         INNER JOIN meetings m ON mf.meeting_id = m.id
+         WHERE m.mr_id = ? AND mf.is_deleted = 0
+           AND (mf.sync_status != 'synced' OR mf.server_id IS NULL OR mf.server_id = '')`,
+        [mrId],
+      );
+      const meeting_notes = await countEntity(
+        'meeting_notes',
+        `SELECT COUNT(*) as count
+         FROM meeting_notes mn
+         INNER JOIN meetings m ON mn.meeting_id = m.id
+         WHERE m.mr_id = ? AND mn.is_deleted = 0
+           AND (mn.sync_status != 'synced' OR mn.server_id IS NULL OR mn.server_id = '')`,
+        [mrId],
+      );
+      const brochure_sync = await countEntity(
+        'brochure_sync',
+        `SELECT COUNT(*) as count FROM brochure_sync
+         WHERE mr_id = ? AND is_deleted = 0
+           AND (sync_status != 'synced' OR server_id IS NULL OR server_id = '')`,
+        [mrId],
+      );
+      const activity_logs = await countEntity(
+        'activity_logs',
+        `SELECT COUNT(*) as count FROM activity_logs
+         WHERE mr_id = ? AND is_deleted = 0
+           AND (sync_status != 'synced' OR server_id IS NULL OR server_id = '')`,
+        [mrId],
+      );
+      const doctor_photos = await countEntity(
+        'doctor_photos',
+        `SELECT COUNT(*) as count FROM doctor_photos
+         WHERE user_id = ? AND sync_status != 'synced'`,
+        [mrId],
+      );
+
       return {
-        saved_brochures: await count(
-          `SELECT COUNT(*) as count FROM saved_brochures WHERE mr_id = ? AND is_deleted = 0 AND (${needsBackup})`,
-          [mrId],
-        ),
-        doctors: await count(
-          `SELECT COUNT(*) as count FROM doctors WHERE mr_id = ? AND is_deleted = 0 AND (${needsBackup})`,
-          [mrId],
-        ),
-        meetings: await count(
-          `SELECT COUNT(*) as count FROM meetings WHERE mr_id = ? AND is_deleted = 0 AND (${needsBackup})`,
-          [mrId],
-        ),
-        meeting_followups: await count(
-          `SELECT COUNT(*) as count FROM meeting_followups WHERE is_deleted = 0 AND (${needsBackup})`,
-        ),
-        meeting_notes: await count(
-          `SELECT COUNT(*) as count FROM meeting_slide_notes WHERE sync_status != 'synced' OR COALESCE(needs_sync, 1) = 1`,
-        ),
-        brochure_sync: await count(
-          `SELECT COUNT(*) as count FROM brochure_sync WHERE mr_id = ? AND is_deleted = 0 AND (${needsBackup})`,
-          [mrId],
-        ),
-        activity_logs: await count(
-          `SELECT COUNT(*) as count FROM activity_logs WHERE mr_id = ? AND is_deleted = 0 AND (${needsBackup})`,
-          [mrId],
-        ),
-        doctor_photos: await count(
-          `SELECT COUNT(*) as count FROM doctor_photos WHERE user_id = ? AND sync_status != 'synced'`,
-          [mrId],
-        ),
+        saved_brochures,
+        doctors,
+        meetings,
+        meeting_followups,
+        meeting_notes,
+        brochure_sync,
+        activity_logs,
+        doctor_photos,
       };
     } catch (error) {
       console.error('LocalDB: Failed to get backup gap counts:', error);
@@ -5680,8 +6248,8 @@ export class LocalDatabaseService {
   }
 
   /**
-   * Clean up stale sync queue entries for records that came from server
-   * These shouldn't be in the queue since they weren't created/updated by the user
+   * Remove erroneous create queue rows for doctors that already exist on the server.
+   * Never removes legitimate update/delete operations.
    */
   static async cleanupStaleSyncQueueEntries(mrId: string): Promise<void> {
     await this.initialize();
@@ -5695,24 +6263,22 @@ export class LocalDatabaseService {
         const doctorsData = await AsyncStorage.getItem('doctors');
         const doctors: LocalDoctor[] = doctorsData ? JSON.parse(doctorsData) : [];
         
-        // Create a map of doctor IDs to their sync_status and server_id
-        const doctorMap = new Map<string, { sync_status: string; server_id?: string }>();
+        const doctorMap = new Map<string, { server_id?: string }>();
         doctors.forEach((doctor: LocalDoctor) => {
           if (doctor.mr_id === mrId) {
-            doctorMap.set(doctor.id, {
-              sync_status: doctor.sync_status,
-              server_id: doctor.server_id
-            });
+            doctorMap.set(doctor.id, { server_id: doctor.server_id });
           }
         });
         
-        // Filter out stale entries
         const validOps = syncOps.filter((op: any) => {
-          if (op.table_name === 'doctors' && op.status === 'pending') {
+          if (
+            op.table_name === 'doctors' &&
+            op.status === 'pending' &&
+            op.operation_type === 'create'
+          ) {
             const doctor = doctorMap.get(op.record_id);
-            // Remove if doctor has server_id (came from server) OR is already synced
-            if (doctor && (doctor.server_id || doctor.sync_status === 'synced')) {
-              console.log('LocalDB: Removing stale sync queue entry for doctor:', op.record_id);
+            if (doctor?.server_id) {
+              console.log('LocalDB: Removing stale doctor create queue entry:', op.record_id);
               return false;
             }
           }
@@ -5724,22 +6290,22 @@ export class LocalDatabaseService {
           console.log(`LocalDB: Cleaned up ${syncOps.length - validOps.length} stale sync queue entries`);
         }
       } else {
-        // Use SQLite - remove pending sync operations for doctors that have server_id or are synced
         const result = await this.withDb(async (db) => {
           return db.runAsync(`
           DELETE FROM sync_operations
           WHERE table_name = 'doctors'
           AND status = 'pending'
+          AND operation_type = 'create'
           AND record_id IN (
-            SELECT id FROM doctors 
-            WHERE mr_id = ? 
-            AND (server_id IS NOT NULL AND server_id <> '' OR sync_status = 'synced')
+            SELECT id FROM doctors
+            WHERE mr_id = ?
+            AND server_id IS NOT NULL AND server_id <> ''
           )
         `, [mrId]);
         });
         
         if (result.changes > 0) {
-          console.log(`LocalDB: Cleaned up ${result.changes} stale sync queue entries for doctors`);
+          console.log(`LocalDB: Cleaned up ${result.changes} stale doctor create queue entries`);
         }
       }
     } catch (error) {
@@ -6068,6 +6634,76 @@ export class LocalDatabaseService {
   /**
    * Get doctor photos by user_id
    */
+  static async getPendingDoctorPhotos(userId: string): Promise<LocalDoctorPhoto[]> {
+    const photos = await this.getDoctorPhotos(userId);
+    return photos.filter(
+      (photo) => photo.sync_status === 'pending' || photo.sync_status === 'error',
+    );
+  }
+
+  static async markDoctorPhotoSynced(photoId: string): Promise<void> {
+    await this.initialize();
+
+    const now = new Date().toISOString();
+    if (this.isUsingAsyncStorage()) {
+      const photosData = await AsyncStorage.getItem('doctor_photos');
+      const photos: LocalDoctorPhoto[] = photosData ? JSON.parse(photosData) : [];
+      const index = photos.findIndex((photo) => photo.id === photoId);
+      if (index >= 0) {
+        photos[index] = {
+          ...photos[index],
+          sync_status: 'synced',
+          last_synced_at: now,
+          needs_sync: false,
+        };
+        await AsyncStorage.setItem('doctor_photos', JSON.stringify(photos));
+      }
+      return;
+    }
+
+    await this.runSql(
+      `UPDATE doctor_photos
+       SET sync_status = 'synced', last_synced_at = ?, needs_sync = 0
+       WHERE id = ?`,
+      [now, photoId],
+    );
+  }
+
+  static async findDoctorByProfileImagePath(
+    mrId: string,
+    imagePath: string,
+  ): Promise<LocalDoctor | null> {
+    await this.initialize();
+
+    if (!imagePath?.trim()) {
+      return null;
+    }
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const doctorsData = await AsyncStorage.getItem('doctors');
+        const doctors: LocalDoctor[] = doctorsData ? JSON.parse(doctorsData) : [];
+        const doctor = doctors.find(
+          (row) =>
+            row.mr_id === mrId &&
+            !row.is_deleted &&
+            row.profile_image_url === imagePath,
+        );
+        return doctor ? { ...doctor, is_deleted: Boolean(doctor.is_deleted) } : null;
+      }
+
+      const row = await this.queryFirstSql(
+        `SELECT * FROM doctors
+         WHERE mr_id = ? AND is_deleted = 0 AND profile_image_url = ?`,
+        [mrId, imagePath],
+      );
+      return row ? this.mapRowToDoctor(row) : null;
+    } catch (error) {
+      console.error('LocalDB: Failed to find doctor by profile image path:', error);
+      return null;
+    }
+  }
+
   static async getDoctorPhotos(userId: string): Promise<LocalDoctorPhoto[]> {
     await this.initialize();
     

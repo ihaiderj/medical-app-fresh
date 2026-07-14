@@ -169,6 +169,58 @@ export class MRService {
     return { success: true, data: ids }
   }
 
+  /** Server follow-up ids for reconciliation across all MR meetings. */
+  static async listServerFollowUpIds(
+    mrId: string,
+  ): Promise<{ success: boolean; data?: string[]; error?: string }> {
+    const meetingsResult = await this.getMeetings(mrId)
+    if (!meetingsResult.success) {
+      return { success: false, error: meetingsResult.error || 'Failed to fetch meetings' }
+    }
+
+    const ids: string[] = []
+    for (const meeting of meetingsResult.data || []) {
+      const meetingId = String(meeting.meeting_id || meeting.id || '')
+      if (!meetingId) continue
+
+      const followUpsResult = await this.getMeetingFollowUps(meetingId)
+      if (!followUpsResult.success || !followUpsResult.data) continue
+
+      for (const row of followUpsResult.data as Array<{ followup_id?: string; id?: string }>) {
+        const followUpId = String(row.followup_id || row.id || '').trim()
+        if (followUpId) ids.push(followUpId)
+      }
+    }
+
+    return { success: true, data: ids }
+  }
+
+  /** Server meeting note ids for reconciliation across all MR meetings. */
+  static async listServerMeetingNoteIds(
+    mrId: string,
+  ): Promise<{ success: boolean; data?: string[]; error?: string }> {
+    const meetingsResult = await this.getMeetings(mrId)
+    if (!meetingsResult.success) {
+      return { success: false, error: meetingsResult.error || 'Failed to fetch meetings' }
+    }
+
+    const ids: string[] = []
+    for (const meeting of meetingsResult.data || []) {
+      const meetingId = String(meeting.meeting_id || meeting.id || '')
+      if (!meetingId) continue
+
+      const detailsResult = await this.getMeetingDetails(meetingId)
+      if (!detailsResult.success || !detailsResult.data?.slide_notes) continue
+
+      for (const note of detailsResult.data.slide_notes) {
+        const noteId = String(note.note_id || '').trim()
+        if (noteId) ids.push(noteId)
+      }
+    }
+
+    return { success: true, data: ids }
+  }
+
   static async getAssignedBrochures(_mrId: string): Promise<{ success: boolean; data?: MRAssignedBrochure[]; error?: string }> {
     try {
       const data = await apiClient.get<MRAssignedBrochure[]>('/api/mr/brochures/')
@@ -413,6 +465,7 @@ export class MRService {
     brochure_id?: string
     note_text: string
     slide_image_uri?: string
+    follow_up_id?: string
     timestamp?: string
   }): Promise<{ success: boolean; data?: { note_id: string }; error?: string }> {
     try {
@@ -422,6 +475,7 @@ export class MRService {
         slide_order: noteData.slide_order ?? 0,
         brochure_id: noteData.brochure_id,
         note_text: noteData.note_text,
+        follow_up_id: noteData.follow_up_id,
       })
       return { success: true, data }
     } catch (error) {
@@ -613,11 +667,20 @@ export class MRService {
     }
   }
 
-  static async deleteDoctor(doctorId: string): Promise<{ success: boolean; error?: string }> {
+  static async deleteDoctor(
+    doctorId: string,
+  ): Promise<{ success: boolean; notFound?: boolean; error?: string }> {
     try {
       await apiClient.delete(`/api/mr/doctor-assignments/${doctorId}/`)
+      console.log(`MRService: DELETE doctor-assignment ${doctorId} succeeded`)
       return { success: true }
     } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        console.log(
+          `MRService: DELETE doctor-assignment ${doctorId} returned 404 (assignment may already be removed)`,
+        )
+        return { success: true, notFound: true }
+      }
       return { success: false, error: serviceError(error, 'Failed to delete doctor') }
     }
   }
