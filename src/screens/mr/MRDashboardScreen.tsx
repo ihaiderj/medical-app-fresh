@@ -20,6 +20,8 @@ import { SyncService } from '../../services/SyncService';
 import { NetworkService } from '../../services/networkService';
 import { NetworkAlerts } from '../../utils/networkAlerts';
 import { TokenStorage } from '../../services/tokenStorage';
+import { NotificationService } from '../../services/NotificationService';
+import MeetingRemindersModal from '../../components/MeetingRemindersModal';
 // import SyncTestPanel from '../../components/SyncTestPanel'; // DELETED
 
 interface MRDashboardScreenProps {
@@ -38,6 +40,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [syncProgress, setSyncProgress] = useState<{ step: string; message: string; progress: number } | null>(null)
   const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0, unbackedUp: 0 })
   const [showTestPanel, setShowTestPanel] = useState(false)
+  const [reminderRefresh, setReminderRefresh] = useState(0)
   const loadInFlightRef = useRef(false)
   const loadRequestIdRef = useRef(0)
   const hasLoadedOnceRef = useRef(false)
@@ -84,6 +87,12 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       setUserProfile(user);
     }
   }, [user]);
+
+  // Initialize local notifications (permissions + channel) once.
+  useEffect(() => {
+    NotificationService.configure();
+    NotificationService.ensurePermissions();
+  }, []);
 
   // Reset dashboard load state when user logs out
   useEffect(() => {
@@ -238,6 +247,8 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       const timer = setTimeout(() => {
         loadDashboardData({ silent: hasLoadedOnceRef.current });
       }, hasLoadedOnceRef.current ? 0 : 1500);
+      // Re-check meeting reminders (upcoming today + expired) on each focus.
+      setReminderRefresh((prev) => prev + 1);
       return () => clearTimeout(timer);
     }, [user?.id, loadDashboardData]),
   )
@@ -800,6 +811,14 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         )}
         </ScrollView>
       </SafeAreaView>
+
+      {/* Meeting reminders: upcoming-today prompts + expired status resolution */}
+      <MeetingRemindersModal
+        userId={user?.id}
+        refreshKey={reminderRefresh}
+        navigation={navigation}
+        onChanged={() => loadDashboardData({ silent: true })}
+      />
 
       {/* Sync Test Panel Modal */}
       {/* TODO: Implement sync test panel if needed */}

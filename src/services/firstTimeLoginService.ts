@@ -106,12 +106,15 @@ export class FirstTimeLoginService {
         
         const hasDoctors = doctorsData && JSON.parse(doctorsData).length > 0;
         const hasMeetings = meetingsData && JSON.parse(meetingsData).length > 0;
-        const hasUsers = usersData && JSON.parse(usersData).id;
         const hasSavedBrochures = savedBrochuresData && JSON.parse(savedBrochuresData).length > 0;
         const hasActivityLogs = activityLogsData && JSON.parse(activityLogsData).length > 0;
-        
-        const isEmpty = !hasDoctors && !hasMeetings && !hasUsers && !hasSavedBrochures && !hasActivityLogs;
-        console.log('🔍 FIRST LOGIN DEBUG: AsyncStorage check - hasDoctors:', hasDoctors, 'hasMeetings:', hasMeetings, 'hasUsers:', hasUsers, 'hasSavedBrochures:', hasSavedBrochures, 'hasActivityLogs:', hasActivityLogs, 'isEmpty:', isEmpty);
+        // NOTE: intentionally do NOT count the `users`/`user_profile` entry — the
+        // current user's own profile is written during login before this check,
+        // so it must not be treated as "synced data already exists".
+        void usersData;
+
+        const isEmpty = !hasDoctors && !hasMeetings && !hasSavedBrochures && !hasActivityLogs;
+        console.log('🔍 FIRST LOGIN DEBUG: AsyncStorage check - hasDoctors:', hasDoctors, 'hasMeetings:', hasMeetings, 'hasSavedBrochures:', hasSavedBrochures, 'hasActivityLogs:', hasActivityLogs, 'isEmpty:', isEmpty);
         return isEmpty;
       }
       
@@ -126,11 +129,6 @@ export class FirstTimeLoginService {
         []
       );
       
-      const usersCount = await LocalDatabaseService.executeSelectFirst(
-        'SELECT COUNT(*) as count FROM users',
-        []
-      );
-      
       const savedBrochuresCount = await LocalDatabaseService.executeSelectFirst(
         'SELECT COUNT(*) as count FROM saved_brochures WHERE is_deleted = 0',
         []
@@ -141,13 +139,16 @@ export class FirstTimeLoginService {
         []
       );
       
+      // NOTE: intentionally do NOT count the `users` table — the current user's
+      // own profile is upserted during login before this check runs, so counting
+      // it would always make the DB look "non-empty" and skip the initial
+      // sync-down. Emptiness is based on actual synced content only.
       const isEmpty = (doctorsCount?.count || 0) === 0 && 
                      (meetingsCount?.count || 0) === 0 && 
-                     (usersCount?.count || 0) === 0 &&
                      (savedBrochuresCount?.count || 0) === 0 &&
                      (activityLogsCount?.count || 0) === 0;
       
-      console.log('🔍 FIRST LOGIN DEBUG: SQLite check - doctors:', doctorsCount?.count, 'meetings:', meetingsCount?.count, 'users:', usersCount?.count, 'savedBrochures:', savedBrochuresCount?.count, 'activityLogs:', activityLogsCount?.count, 'isEmpty:', isEmpty);
+      console.log('🔍 FIRST LOGIN DEBUG: SQLite check - doctors:', doctorsCount?.count, 'meetings:', meetingsCount?.count, 'savedBrochures:', savedBrochuresCount?.count, 'activityLogs:', activityLogsCount?.count, 'isEmpty:', isEmpty);
       return isEmpty;
       
     } catch (error) {

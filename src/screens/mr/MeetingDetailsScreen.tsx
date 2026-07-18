@@ -16,10 +16,13 @@ import { Ionicons } from '@expo/vector-icons'
 import { useNavigation, useRoute } from '@react-navigation/native'
 import { MRService } from '../../services/MRService'
 import { OfflineFirstService } from '../../services/offlineFirstService'
-import { LocalDatabaseService, LocalMeetingFollowUp, LocalMeetingNote } from '../../services/localDatabaseService'
+import { LocalDatabaseService, LocalMeetingFollowUp, LocalMeetingNote, LocalMeetingGeneralNote } from '../../services/localDatabaseService'
 import { getModalWidth, getModalMaxHeight, getModalPadding, getModalBorderRadius, isTablet } from '../../utils/responsive'
+import { BrochureManagementService } from '../../services/brochureManagementService'
+import { FilePathUtils } from '../../utils/filePathUtils'
 import BottomSheetDatePicker from '../../components/BottomSheetDatePicker'
 import { useBottomSheetDatePicker, DatePickerResult } from '../../hooks/useBottomSheetDatePicker'
+import { useAppData } from '../../context/AppDataContext'
 
 interface MeetingDetails {
   meeting_id: string
@@ -46,6 +49,7 @@ interface SlideNote {
   slide_order: number
   note_text: string
   slide_image_uri?: string
+  brochure_title?: string
   created_at: string
   updated_at: string
   follow_up_id?: string
@@ -77,11 +81,58 @@ const MeetingDetailsScreen = () => {
     follow_up_notes: '',
     status: 'scheduled' as 'scheduled' | 'completed' | 'cancelled'
   })
+  const [generalNotes, setGeneralNotes] = useState<LocalMeetingGeneralNote[]>([])
+  const [showGeneralNoteModal, setShowGeneralNoteModal] = useState(false)
+  const [editingGeneralNote, setEditingGeneralNote] = useState<LocalMeetingGeneralNote | null>(null)
+  const [generalNoteTitle, setGeneralNoteTitle] = useState('')
+  const [generalNoteText, setGeneralNoteText] = useState('')
   const datePicker = useBottomSheetDatePicker()
+  const { notifyMeetingChange } = useAppData()
 
   useEffect(() => {
     loadMeetingDetails()
   }, [meetingId])
+
+  // Slide images are NOT stored on the backend — they only live inside the
+  // downloaded brochure copy. When a note comes down from sync it has no usable
+  // slide_image_uri, so reconstruct it from the local brochure content by
+  // matching the note's slide_id.
+  const resolveNoteSlideImage = async (note: {
+    slide_image_uri?: string
+    brochure_id?: string
+    slide_id?: string
+    slide_order?: number
+  }): Promise<string | undefined> => {
+    if (note.slide_image_uri && note.slide_image_uri.startsWith('file://')) {
+      return note.slide_image_uri
+    }
+    if (!note.brochure_id || !note.slide_id) {
+      return note.slide_image_uri
+    }
+    try {
+      const result = await BrochureManagementService.getBrochureData(note.brochure_id)
+      if (!result.success || !result.data) {
+        return note.slide_image_uri
+      }
+      const slide = result.data.slides.find((s: any) => s.id === note.slide_id)
+      if (!slide) {
+        return note.slide_image_uri
+      }
+      let fileName = slide.fileName
+      if (!fileName && slide.imageUri) {
+        fileName = slide.imageUri.includes('/')
+          ? slide.imageUri.split('/').pop()
+          : slide.imageUri
+      }
+      if (!fileName) {
+        fileName = `slide_${slide.order ?? note.slide_order ?? 0}.jpg`
+      }
+      return FilePathUtils.getSlideImagePath(note.brochure_id, fileName)
+    } catch (error) {
+      console.warn('MeetingDetailsScreen: Failed to resolve slide image for note:', error)
+      return note.slide_image_uri
+    }
+  }
 
   const loadMeetingDetails = async () => {
     try {
@@ -100,11 +151,15 @@ const MeetingDetailsScreen = () => {
           const doctor = await LocalDatabaseService.getDoctorById(localMeeting.doctor_id)
           
           // Load meeting notes and follow-ups
-          const [notes, followUpsData] = await Promise.all([
+          const [notes, followUpsData, generalNotesData] = await Promise.all([
             LocalDatabaseService.getMeetingNotes(meetingId),
             LocalDatabaseService.getMeetingFollowUps(meetingId).catch((error) => {
               console.warn('MeetingDetailsScreen: Failed to load follow-ups:', error);
               return []; // Return empty array on error
+            }),
+            LocalDatabaseService.getMeetingGeneralNotes(meetingId).catch((error) => {
+              console.warn('MeetingDetailsScreen: Failed to load general notes:', error);
+              return [];
             })
           ])
           
@@ -127,17 +182,18 @@ const MeetingDetailsScreen = () => {
             updated_at: localMeeting.updated_at,
           }
           
-          const formattedNotes: SlideNote[] = notes.map(note => ({
+          const formattedNotes: SlideNote[] = await Promise.all(notes.map(async note => ({
             note_id: note.id,
             slide_id: note.slide_id || '',
             slide_title: note.slide_title || '',
             slide_order: note.slide_order,
             note_text: note.note_text,
-            slide_image_uri: note.slide_image_uri,
+            slide_image_uri: await resolveNoteSlideImage(note),
+            brochure_title: note.brochure_title || '',
             created_at: note.created_at,
             updated_at: note.updated_at || note.created_at,
             follow_up_id: note.follow_up_id // Add follow_up_id for grouping
-          } as SlideNote & { follow_up_id?: string }))
+          } as SlideNote & { follow_up_id?: string })))
           
           console.log('Meeting data (local):', formattedDetails)
           console.log('Slide notes count (local):', formattedNotes.length)
@@ -146,6 +202,7 @@ const MeetingDetailsScreen = () => {
           setMeetingDetails(formattedDetails)
           setSlideNotes(formattedNotes)
           setFollowUps(followUpsData)
+          setGeneralNotes(generalNotesData)
           return
         }
       } catch (localError) {
@@ -206,6 +263,7 @@ const MeetingDetailsScreen = () => {
               if (result.success) {
                 Alert.alert('Success', 'Note deleted successfully')
                 loadMeetingDetails()
+                notifyMeetingChange()
               } else {
                 Alert.alert('Error', result.error || 'Failed to delete note')
               }
@@ -236,6 +294,7 @@ const MeetingDetailsScreen = () => {
         setNewNoteText('')
         setEditingNote(null)
         loadMeetingDetails()
+        notifyMeetingChange()
       } else {
         Alert.alert('Error', result.error || 'Failed to update note')
       }
@@ -243,6 +302,89 @@ const MeetingDetailsScreen = () => {
       console.error('MeetingDetailsScreen: Error updating note:', error)
       Alert.alert('Error', 'Failed to update note')
     }
+  }
+
+  const openAddGeneralNote = () => {
+    setEditingGeneralNote(null)
+    setGeneralNoteTitle('')
+    setGeneralNoteText('')
+    setShowGeneralNoteModal(true)
+  }
+
+  const openEditGeneralNote = (note: LocalMeetingGeneralNote) => {
+    setEditingGeneralNote(note)
+    setGeneralNoteTitle(note.title || '')
+    setGeneralNoteText(note.notes || '')
+    setShowGeneralNoteModal(true)
+  }
+
+  const handleSaveGeneralNote = async () => {
+    try {
+      if (!generalNoteText.trim()) {
+        Alert.alert('Error', 'Please enter a note')
+        return
+      }
+
+      let result
+      if (editingGeneralNote) {
+        result = await OfflineFirstService.updateMeetingGeneralNote(editingGeneralNote.id, {
+          title: generalNoteTitle.trim(),
+          notes: generalNoteText.trim(),
+        })
+      } else {
+        const localMeeting = await LocalDatabaseService.getMeetingById(meetingId)
+        result = await OfflineFirstService.createMeetingGeneralNote({
+          meeting_id: meetingId,
+          meeting_server_id: localMeeting?.server_id,
+          title: generalNoteTitle.trim(),
+          notes: generalNoteText.trim(),
+        })
+      }
+
+      if (result.success) {
+        Alert.alert('Success', editingGeneralNote ? 'Note updated successfully' : 'Note added successfully')
+        setShowGeneralNoteModal(false)
+        setEditingGeneralNote(null)
+        setGeneralNoteTitle('')
+        setGeneralNoteText('')
+        loadMeetingDetails()
+        notifyMeetingChange()
+      } else {
+        Alert.alert('Error', result.error || 'Failed to save note')
+      }
+    } catch (error) {
+      console.error('MeetingDetailsScreen: Error saving general note:', error)
+      Alert.alert('Error', 'Failed to save note')
+    }
+  }
+
+  const handleDeleteGeneralNote = (note: LocalMeetingGeneralNote) => {
+    Alert.alert(
+      'Delete Note',
+      'Are you sure you want to delete this note?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const result = await OfflineFirstService.deleteMeetingGeneralNote(note.id)
+              if (result.success) {
+                Alert.alert('Success', 'Note deleted successfully')
+                loadMeetingDetails()
+                notifyMeetingChange()
+              } else {
+                Alert.alert('Error', result.error || 'Failed to delete note')
+              }
+            } catch (error) {
+              console.error('MeetingDetailsScreen: Error deleting general note:', error)
+              Alert.alert('Error', 'Failed to delete note')
+            }
+          }
+        }
+      ]
+    )
   }
 
   const handleAddNote = async () => {
@@ -281,6 +423,7 @@ const MeetingDetailsScreen = () => {
         setNewNoteText('')
         setSelectedFollowUp(null) // Clear selected follow-up
         loadMeetingDetails()
+        notifyMeetingChange()
       } else {
         console.error('MeetingDetailsScreen: Failed to add note:', result.error)
         Alert.alert('Error', result.error || 'Failed to add note')
@@ -374,6 +517,7 @@ const MeetingDetailsScreen = () => {
           status: 'scheduled'
         })
         loadMeetingDetails()
+        notifyMeetingChange()
       } else {
         Alert.alert('Error', result.error || 'Failed to create follow-up')
       }
@@ -431,6 +575,7 @@ const MeetingDetailsScreen = () => {
         setShowEditFollowUpModal(false)
         setSelectedFollowUp(null)
         loadMeetingDetails()
+        notifyMeetingChange()
       } else {
         Alert.alert('Error', result.error || 'Failed to update follow-up')
       }
@@ -456,6 +601,7 @@ const MeetingDetailsScreen = () => {
               if (result.success) {
                 Alert.alert('Success', 'Follow-up deleted successfully')
                 loadMeetingDetails()
+                notifyMeetingChange()
               } else {
                 Alert.alert('Error', result.error || 'Failed to delete follow-up')
               }
@@ -747,6 +893,11 @@ const MeetingDetailsScreen = () => {
                       <Text style={styles.slideTitle}>
                         {slideNote.slide_title}
                       </Text>
+                      {slideNote.brochure_title ? (
+                        <Text style={styles.slideBrochureTitle} numberOfLines={1}>
+                          {slideNote.brochure_title}
+                        </Text>
+                      ) : null}
                       <Text style={styles.slideTimestamp}>
                         {formatDate(slideNote.created_at)}
                       </Text>
@@ -784,6 +935,59 @@ const MeetingDetailsScreen = () => {
               <Text style={styles.emptyStateText}>No slide notes found</Text>
               <Text style={styles.emptyStateSubtext}>
                 Click &quot;Add Note&quot; to add notes to this meeting
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* General Notes */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Ionicons name="reader" size={24} color="#8b5cf6" />
+            <Text style={styles.cardTitle}>General Notes ({generalNotes.length})</Text>
+            <TouchableOpacity
+              style={styles.addNoteButton}
+              onPress={openAddGeneralNote}
+            >
+              <Ionicons name="add" size={18} color="#ffffff" />
+              <Text style={styles.addNoteButtonText}>Add</Text>
+            </TouchableOpacity>
+          </View>
+
+          {generalNotes.length > 0 ? (
+            generalNotes.map((note) => (
+              <View key={note.id} style={styles.slideNoteCard}>
+                <View style={styles.slideNoteInfo}>
+                  {note.title ? (
+                    <Text style={styles.slideTitle}>{note.title}</Text>
+                  ) : null}
+                  <Text style={styles.slideTimestamp}>{formatDate(note.created_at)}</Text>
+                  <Text style={styles.slideNotePreview}>{note.notes}</Text>
+                </View>
+                <View style={styles.noteActions}>
+                  <TouchableOpacity
+                    style={styles.noteActionButton}
+                    onPress={() => openEditGeneralNote(note)}
+                  >
+                    <Ionicons name="create-outline" size={18} color="#6b7280" />
+                    <Text style={styles.noteActionText}>Edit</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.noteActionButton}
+                    onPress={() => handleDeleteGeneralNote(note)}
+                  >
+                    <Ionicons name="trash-outline" size={18} color="#ef4444" />
+                    <Text style={[styles.noteActionText, { color: '#ef4444' }]}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ))
+          ) : (
+            <View style={styles.emptyState}>
+              <Ionicons name="reader-outline" size={48} color="#9ca3af" />
+              <Text style={styles.emptyStateText}>No general notes</Text>
+              <Text style={styles.emptyStateSubtext}>
+                Click &quot;Add&quot; to write a general note for this meeting
               </Text>
             </View>
           )}
@@ -925,6 +1129,79 @@ const MeetingDetailsScreen = () => {
                 </View>
               </View>
             )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* General Note Modal (create / edit) */}
+      <Modal
+        visible={showGeneralNoteModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => {
+          setShowGeneralNoteModal(false)
+          setEditingGeneralNote(null)
+        }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>
+                {editingGeneralNote ? 'Edit General Note' : 'Add General Note'}
+              </Text>
+              <TouchableOpacity onPress={() => {
+                setShowGeneralNoteModal(false)
+                setEditingGeneralNote(null)
+              }}>
+                <Ionicons name="close" size={24} color="#6b7280" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.modalBody}>
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Title (Optional):</Text>
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="Enter a title..."
+                  placeholderTextColor="#9ca3af"
+                  value={generalNoteTitle}
+                  onChangeText={setGeneralNoteTitle}
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>Note:</Text>
+                <TextInput
+                  style={[styles.textInput, styles.textArea]}
+                  placeholder="Enter your note..."
+                  placeholderTextColor="#9ca3af"
+                  value={generalNoteText}
+                  onChangeText={setGeneralNoteText}
+                  multiline
+                  numberOfLines={6}
+                />
+              </View>
+
+              <View style={styles.modalActions}>
+                <TouchableOpacity
+                  style={styles.cancelButton}
+                  onPress={() => {
+                    setShowGeneralNoteModal(false)
+                    setEditingGeneralNote(null)
+                  }}
+                >
+                  <Text style={styles.cancelButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.saveButton}
+                  onPress={handleSaveGeneralNote}
+                >
+                  <Text style={styles.saveButtonText}>
+                    {editingGeneralNote ? 'Update' : 'Add Note'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
           </View>
         </View>
       </Modal>
@@ -1400,6 +1677,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: '#374151',
+  },
+  slideBrochureTitle: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#7c3aed',
+    marginTop: 2,
   },
   slideTimestamp: {
     fontSize: 12,

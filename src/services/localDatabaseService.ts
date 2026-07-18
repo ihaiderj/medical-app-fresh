@@ -82,8 +82,26 @@ export interface LocalMeetingNote {
   slide_title: string;
   slide_order: number;
   brochure_id: string;
+  brochure_title?: string;
   note_text: string;
   slide_image_uri?: string;
+  follow_up_id?: string;
+  created_at: string;
+  updated_at: string;
+  last_modified?: string;
+  version: number;
+  sync_status: 'pending' | 'synced' | 'conflict' | 'error';
+  is_deleted: boolean;
+  local_changes?: string;
+}
+
+export interface LocalMeetingGeneralNote {
+  id: string;
+  server_id?: string;
+  meeting_id: string;
+  meeting_server_id?: string;
+  title?: string;
+  notes: string;
   follow_up_id?: string;
   created_at: string;
   updated_at: string;
@@ -152,6 +170,7 @@ export interface LocalBrochureSync {
   brochure_data: string;
   last_modified?: string;
   created_at?: string;
+  updated_at?: string;
   version: number;
   sync_status: 'pending' | 'synced' | 'conflict' | 'error';
   is_deleted?: boolean;
@@ -755,12 +774,25 @@ export class LocalDatabaseService {
         }
       }
       
-      // Check if brochure_sync table has is_deleted column
+      // Check if brochure_sync table has is_deleted / updated_at columns
       if (await this.tableExists('brochure_sync')) {
         const brochureSyncColumnNames = await this.getTableColumnNames('brochure_sync');
         if (!brochureSyncColumnNames.includes('is_deleted')) {
           console.log('LocalDB: Missing is_deleted column in brochure_sync table');
           return true;
+        }
+        if (!brochureSyncColumnNames.includes('updated_at')) {
+          console.log('LocalDB: Missing updated_at column in brochure_sync table — will migrate');
+          // Soft mismatch: migration 009 adds the column without full recreate
+        }
+      }
+
+      // Check if meeting_notes table has brochure_title column
+      if (await this.tableExists('meeting_notes')) {
+        const meetingNotesColumnNames = await this.getTableColumnNames('meeting_notes');
+        if (!meetingNotesColumnNames.includes('brochure_title')) {
+          console.log('LocalDB: Missing brochure_title column in meeting_notes table — will migrate');
+          // Soft mismatch: migration 010 adds the column without full recreate
         }
       }
       
@@ -1054,8 +1086,27 @@ export class LocalDatabaseService {
         slide_title TEXT NOT NULL,
         slide_order INTEGER NOT NULL,
         brochure_id TEXT NOT NULL,
+        brochure_title TEXT,
         note_text TEXT NOT NULL,
         slide_image_uri TEXT,
+        follow_up_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_modified TEXT,
+        version INTEGER DEFAULT 1,
+        sync_status TEXT DEFAULT 'pending',
+        is_deleted INTEGER DEFAULT 0,
+        local_changes TEXT
+      );
+
+      -- Meeting general notes table (title + notes, not tied to a slide)
+      CREATE TABLE IF NOT EXISTS meeting_general_notes (
+        id TEXT PRIMARY KEY,
+        server_id TEXT,
+        meeting_id TEXT NOT NULL,
+        meeting_server_id TEXT,
+        title TEXT,
+        notes TEXT NOT NULL,
         follow_up_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -1095,6 +1146,7 @@ export class LocalDatabaseService {
         brochure_data TEXT NOT NULL,
         last_modified TEXT,
         created_at TEXT,
+        updated_at TEXT,
         version INTEGER DEFAULT 1,
         sync_status TEXT DEFAULT 'pending',
         is_deleted INTEGER DEFAULT 0,
@@ -1105,6 +1157,7 @@ export class LocalDatabaseService {
       CREATE TABLE IF NOT EXISTS saved_brochures (
         id TEXT PRIMARY KEY,
         server_id TEXT,
+        storage_id TEXT,
         mr_id TEXT NOT NULL,
         brochure_id TEXT NOT NULL,
         brochure_title TEXT NOT NULL,
@@ -1164,6 +1217,7 @@ export class LocalDatabaseService {
         brochure_data TEXT NOT NULL,
         last_modified TEXT,
         created_at TEXT,
+        updated_at TEXT,
         version INTEGER DEFAULT 1,
         sync_status TEXT DEFAULT 'pending',
         is_deleted INTEGER DEFAULT 0,
@@ -1264,12 +1318,18 @@ export class LocalDatabaseService {
       -- Saved brochures table
       CREATE TABLE IF NOT EXISTS saved_brochures (
         id TEXT PRIMARY KEY,
+        server_id TEXT,
+        storage_id TEXT,
         mr_id TEXT NOT NULL,
         brochure_id TEXT NOT NULL,
         brochure_title TEXT NOT NULL,
         brochure_data TEXT NOT NULL,
         last_modified TEXT,
         created_at TEXT NOT NULL,
+        updated_at TEXT,
+        saved_at TEXT,
+        last_accessed TEXT,
+        version INTEGER DEFAULT 1,
         sync_status TEXT DEFAULT 'pending',
         last_synced_at TEXT,
         needs_sync INTEGER DEFAULT 1,
@@ -1379,6 +1439,17 @@ export class LocalDatabaseService {
           await this.db.execAsync(statement);
           console.log(`LocalDB: Executed statement ${i + 1}/${statements.length}`);
         } catch (error) {
+          // Index creation is a non-fatal performance optimization. If it fails
+          // (e.g. it references a column added by a later migration, or an
+          // existing table from a partial prior creation lacks the column),
+          // log and continue so table creation still completes. The relevant
+          // ensure*Schema migrations will add the column and (re)create the
+          // index on a subsequent pass.
+          const isIndex = /CREATE\s+(UNIQUE\s+)?INDEX/i.test(statement);
+          if (isIndex) {
+            console.warn(`LocalDB: Skipping non-fatal index statement ${i + 1}/${statements.length}:`, error);
+            continue;
+          }
           console.error(`LocalDB: Failed to execute statement ${i + 1}:`, statement.substring(0, 100) + '...', error);
           throw error;
         }
@@ -1568,6 +1639,66 @@ export class LocalDatabaseService {
           console.error('LocalDB: Migration 008 failed, but continuing:', migrationError);
         }
       }
+
+      // Migration 9: Add updated_at to brochure_sync (required by updateBrochureSync)
+      if (currentVersion < 9) {
+        try {
+          await this.runMigration_009();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 009 failed, but continuing:', migrationError);
+        }
+      } else {
+        try {
+          await this.ensureBrochureSyncSchema();
+        } catch (error) {
+          console.log('LocalDB: Could not verify brochure_sync columns:', error);
+        }
+      }
+
+      // Migration 10: Add brochure_title to meeting_notes table
+      if (currentVersion < 10) {
+        try {
+          await this.runMigration_010();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 010 failed, but continuing:', migrationError);
+        }
+      } else {
+        try {
+          await this.ensureMeetingNotesSchema();
+        } catch (error) {
+          console.log('LocalDB: Could not verify meeting_notes columns:', error);
+        }
+      }
+
+      // Migration 11: Relax legacy NOT NULL constraint on meetings.location
+      if (currentVersion < 11) {
+        try {
+          await this.runMigration_011();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 011 failed, but continuing:', migrationError);
+        }
+      } else {
+        try {
+          await this.ensureMeetingsLocationNullable();
+        } catch (error) {
+          console.log('LocalDB: Could not verify meetings.location constraint:', error);
+        }
+      }
+
+      // Migration 12: Add meeting_general_notes table
+      if (currentVersion < 12) {
+        try {
+          await this.runMigration_012();
+        } catch (migrationError) {
+          console.error('LocalDB: Migration 012 failed, but continuing:', migrationError);
+        }
+      } else {
+        try {
+          await this.ensureMeetingGeneralNotesSchema();
+        } catch (error) {
+          console.log('LocalDB: Could not verify meeting_general_notes table:', error);
+        }
+      }
       
     } catch (error) {
       console.error('LocalDB: Migration error:', error);
@@ -1601,8 +1732,40 @@ export class LocalDatabaseService {
       await tableCheck.finalizeAsync();
       
       if (tables.length === 0) {
-        console.log('LocalDB: user_sessions table does not exist, will be created with correct schema');
-        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (2)');
+        console.log('LocalDB: user_sessions table missing — creating it with correct schema');
+        await this.db.execAsync(`
+          CREATE TABLE IF NOT EXISTS user_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            last_seen_at TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            sync_status TEXT DEFAULT 'pending',
+            local_changes TEXT
+          )
+        `);
+        try {
+          await this.db.execAsync('CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id)');
+          await this.db.execAsync('CREATE INDEX IF NOT EXISTS idx_user_sessions_device_id ON user_sessions(device_id)');
+          await this.db.execAsync('CREATE UNIQUE INDEX IF NOT EXISTS unique_user_device_session ON user_sessions(user_id, device_id)');
+        } catch (indexError) {
+          console.warn('LocalDB: Could not create user_sessions indexes:', indexError);
+        }
+        console.log('LocalDB: user_sessions table created');
+        try {
+          const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 2');
+          const versionResult = await versionCheck.executeAsync();
+          const versionRow = await versionResult.getFirstAsync();
+          await versionCheck.finalizeAsync();
+          if (!versionRow) {
+            await this.db.execAsync('INSERT INTO schema_version (version) VALUES (2)');
+          }
+        } catch {
+          // Version row may already exist; ignore.
+        }
+        console.log('LocalDB: Migration 002 completed');
         return;
       }
       
@@ -2116,6 +2279,370 @@ export class LocalDatabaseService {
     }
 
     console.log('LocalDB: Migration 008 completed');
+  }
+
+  /**
+   * Migration 009: Add updated_at to brochure_sync table
+   */
+  private static async runMigration_009(): Promise<void> {
+    console.log('LocalDB: Running migration 009 - Adding updated_at to brochure_sync...');
+
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+
+    await this.ensureBrochureSyncSchema();
+
+    // Repair follow-ups corrupted by the sync_status/updated_at value-order bug
+    try {
+      await this.db.execAsync(`
+        UPDATE meeting_followups
+        SET sync_status = 'pending',
+            updated_at = COALESCE(created_at, datetime('now'))
+        WHERE sync_status LIKE '____-__-__T%'
+           OR updated_at IN ('pending', 'synced', 'conflict', 'error')
+      `);
+      console.log('LocalDB: Repaired corrupted meeting_followups sync_status/updated_at');
+    } catch (error) {
+      console.warn('LocalDB: Could not repair meeting_followups:', error);
+    }
+
+    try {
+      const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 9');
+      const versionResult = await versionCheck.executeAsync();
+      const versionRow = await versionResult.getFirstAsync();
+      await versionCheck.finalizeAsync();
+
+      if (!versionRow) {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (9)');
+        console.log('LocalDB: Schema version updated to 9');
+      }
+    } catch {
+      try {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (9)');
+      } catch {
+        console.log('LocalDB: Schema version 9 already exists');
+      }
+    }
+
+    console.log('LocalDB: Migration 009 completed');
+  }
+
+  private static async ensureBrochureSyncSchema(): Promise<void> {
+    if (!this.db || !(await this.tableExists('brochure_sync'))) {
+      return;
+    }
+
+    const columns = await this.getTableColumnNames('brochure_sync');
+    if (!columns.includes('updated_at')) {
+      await this.db.execAsync('ALTER TABLE brochure_sync ADD COLUMN updated_at TEXT');
+      await this.db.runAsync(
+        `UPDATE brochure_sync SET updated_at = COALESCE(last_modified, created_at, ?) WHERE updated_at IS NULL`,
+        [new Date().toISOString()],
+      );
+      console.log('LocalDB: Added updated_at to brochure_sync table');
+    }
+  }
+
+  /**
+   * Migration 010: Add brochure_title to meeting_notes and backfill it from
+   * saved_brochures so slide notes carry the saved brochure's custom title.
+   */
+  private static async runMigration_010(): Promise<void> {
+    console.log('LocalDB: Running migration 010 - Adding brochure_title to meeting_notes...');
+
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+
+    await this.ensureMeetingNotesSchema();
+
+    // Backfill brochure_title for existing notes and re-queue synced ones so the
+    // server gets the title via a PATCH (reconciliation picks up pending rows).
+    try {
+      await this.backfillMeetingNoteBrochureTitles();
+    } catch (error) {
+      console.warn('LocalDB: Could not backfill meeting_notes brochure_title:', error);
+    }
+
+    try {
+      const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 10');
+      const versionResult = await versionCheck.executeAsync();
+      const versionRow = await versionResult.getFirstAsync();
+      await versionCheck.finalizeAsync();
+
+      if (!versionRow) {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (10)');
+        console.log('LocalDB: Schema version updated to 10');
+      }
+    } catch {
+      try {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (10)');
+      } catch {
+        console.log('LocalDB: Schema version 10 already exists');
+      }
+    }
+
+    console.log('LocalDB: Migration 010 completed');
+  }
+
+  private static async ensureMeetingNotesSchema(): Promise<void> {
+    if (!this.db || !(await this.tableExists('meeting_notes'))) {
+      return;
+    }
+
+    const columns = await this.getTableColumnNames('meeting_notes');
+    if (!columns.includes('brochure_title')) {
+      await this.db.execAsync('ALTER TABLE meeting_notes ADD COLUMN brochure_title TEXT');
+      console.log('LocalDB: Added brochure_title to meeting_notes table');
+    }
+  }
+
+  /**
+   * Migration 011: Older DBs created the meetings table with `location TEXT NOT NULL`,
+   * but meetings can legitimately have no location. Rebuild the table so the column
+   * is nullable, preserving all existing rows.
+   */
+  private static async runMigration_011(): Promise<void> {
+    console.log('LocalDB: Running migration 011 - Relaxing meetings.location NOT NULL...');
+
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+
+    await this.ensureMeetingsLocationNullable();
+
+    try {
+      const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 11');
+      const versionResult = await versionCheck.executeAsync();
+      const versionRow = await versionResult.getFirstAsync();
+      await versionCheck.finalizeAsync();
+
+      if (!versionRow) {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (11)');
+        console.log('LocalDB: Schema version updated to 11');
+      }
+    } catch {
+      try {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (11)');
+      } catch {
+        console.log('LocalDB: Schema version 11 already exists');
+      }
+    }
+
+    console.log('LocalDB: Migration 011 completed');
+  }
+
+  private static async ensureMeetingsLocationNullable(): Promise<void> {
+    if (!this.db || !(await this.tableExists('meetings'))) {
+      return;
+    }
+
+    const info = (await this.db.getAllAsync(`PRAGMA table_info(meetings)`)) as Array<{
+      name: string
+      notnull: number
+    }>;
+    const locationCol = info.find((c) => c.name === 'location');
+
+    // Already nullable (or column somehow missing) — nothing to do.
+    if (!locationCol || locationCol.notnull === 0) {
+      return;
+    }
+
+    console.log('LocalDB: meetings.location is NOT NULL — rebuilding table to allow NULL');
+
+    const existingCols = info.map((c) => c.name);
+    const desiredCols = [
+      'id', 'server_id', 'mr_id', 'doctor_id', 'doctor_server_id', 'brochure_id', 'title',
+      'scheduled_date', 'duration_minutes', 'status', 'location', 'purpose', 'notes',
+      'follow_up_required', 'follow_up_date', 'follow_up_time', 'follow_up_notes',
+      'presentation_slides', 'comments', 'created_at', 'updated_at', 'last_modified',
+      'version', 'sync_status', 'is_deleted', 'local_changes',
+    ];
+    const copyCols = desiredCols.filter((c) => existingCols.includes(c));
+
+    await this.db.execAsync('PRAGMA foreign_keys=OFF');
+    try {
+      await this.db.execAsync('BEGIN TRANSACTION');
+      await this.db.execAsync('ALTER TABLE meetings RENAME TO meetings_old');
+      await this.db.execAsync(`
+        CREATE TABLE meetings (
+          id TEXT PRIMARY KEY,
+          server_id TEXT,
+          mr_id TEXT NOT NULL,
+          doctor_id TEXT NOT NULL,
+          doctor_server_id TEXT,
+          brochure_id TEXT,
+          title TEXT NOT NULL,
+          scheduled_date TEXT NOT NULL,
+          duration_minutes INTEGER DEFAULT 30,
+          status TEXT DEFAULT 'scheduled',
+          location TEXT,
+          purpose TEXT,
+          notes TEXT,
+          follow_up_required INTEGER DEFAULT 0,
+          follow_up_date TEXT,
+          follow_up_time TEXT,
+          follow_up_notes TEXT,
+          presentation_slides TEXT,
+          comments TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_modified TEXT,
+          version INTEGER DEFAULT 1,
+          sync_status TEXT DEFAULT 'pending',
+          is_deleted INTEGER DEFAULT 0,
+          local_changes TEXT
+        )
+      `);
+      const colList = copyCols.join(', ');
+      await this.db.execAsync(
+        `INSERT INTO meetings (${colList}) SELECT ${colList} FROM meetings_old`,
+      );
+      await this.db.execAsync('DROP TABLE meetings_old');
+      await this.db.execAsync('COMMIT');
+      console.log('LocalDB: Rebuilt meetings table with nullable location');
+    } catch (error) {
+      try {
+        await this.db.execAsync('ROLLBACK');
+      } catch {
+        // ignore
+      }
+      throw error;
+    } finally {
+      await this.db.execAsync('PRAGMA foreign_keys=ON');
+    }
+  }
+
+  /**
+   * Migration 012: Add the meeting_general_notes table (general notes are a
+   * separate entity from slide notes on the backend).
+   */
+  private static async runMigration_012(): Promise<void> {
+    console.log('LocalDB: Running migration 012 - Adding meeting_general_notes table...');
+
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+
+    await this.ensureMeetingGeneralNotesSchema();
+
+    try {
+      const versionCheck = await this.db.prepareAsync('SELECT version FROM schema_version WHERE version = 12');
+      const versionResult = await versionCheck.executeAsync();
+      const versionRow = await versionResult.getFirstAsync();
+      await versionCheck.finalizeAsync();
+
+      if (!versionRow) {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (12)');
+        console.log('LocalDB: Schema version updated to 12');
+      }
+    } catch {
+      try {
+        await this.db.execAsync('INSERT INTO schema_version (version) VALUES (12)');
+      } catch {
+        console.log('LocalDB: Schema version 12 already exists');
+      }
+    }
+
+    console.log('LocalDB: Migration 012 completed');
+  }
+
+  private static async ensureMeetingGeneralNotesSchema(): Promise<void> {
+    if (!this.db) {
+      return;
+    }
+    if (!(await this.tableExists('meeting_general_notes'))) {
+      await this.db.execAsync(`
+        CREATE TABLE IF NOT EXISTS meeting_general_notes (
+          id TEXT PRIMARY KEY,
+          server_id TEXT,
+          meeting_id TEXT NOT NULL,
+          meeting_server_id TEXT,
+          title TEXT,
+          notes TEXT NOT NULL,
+          follow_up_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_modified TEXT,
+          version INTEGER DEFAULT 1,
+          sync_status TEXT DEFAULT 'pending',
+          is_deleted INTEGER DEFAULT 0,
+          local_changes TEXT
+        )
+      `);
+      console.log('LocalDB: Created meeting_general_notes table');
+    }
+  }
+
+  /**
+   * Resolve a note's local brochure id (a saved copy's storage id, which is
+   * never synced) to a server-known brochure id and the saved copy's custom title.
+   */
+  static async resolveNoteBrochure(
+    localBrochureId: string | undefined | null,
+  ): Promise<{ serverBrochureId: string; brochureTitle: string }> {
+    const raw = String(localBrochureId || '').trim();
+    if (!raw || this.isUsingAsyncStorage()) {
+      return { serverBrochureId: resolveServerBrochureId(raw) || raw, brochureTitle: '' };
+    }
+
+    try {
+      const canonical = resolveServerBrochureId(raw);
+      const rows = (await this.db.getAllAsync(
+        `SELECT * FROM saved_brochures WHERE is_deleted = 0`,
+      )) as any[];
+
+      const match = rows.find(
+        (row) =>
+          row.storage_id === raw ||
+          row.id === raw ||
+          row.server_id === raw ||
+          row.brochure_id === raw ||
+          resolveServerBrochureId(row.brochure_id) === canonical,
+      );
+
+      if (match) {
+        const serverBrochureId =
+          match.server_id || resolveServerBrochureId(match.brochure_id) || canonical || raw;
+        const brochureTitle = match.custom_title || match.brochure_title || '';
+        return { serverBrochureId, brochureTitle };
+      }
+    } catch (error) {
+      console.warn('LocalDB: resolveNoteBrochure failed:', error);
+    }
+
+    return { serverBrochureId: resolveServerBrochureId(raw) || raw, brochureTitle: '' };
+  }
+
+  private static async backfillMeetingNoteBrochureTitles(): Promise<void> {
+    if (!this.db) return;
+
+    const notes = (await this.db.getAllAsync(
+      `SELECT id, brochure_id, server_id, brochure_title FROM meeting_notes WHERE is_deleted = 0`,
+    )) as Array<{ id: string; brochure_id: string; server_id?: string; brochure_title?: string }>;
+
+    for (const note of notes) {
+      if (note.brochure_title && note.brochure_title.trim()) continue;
+
+      const { brochureTitle } = await this.resolveNoteBrochure(note.brochure_id);
+      if (!brochureTitle) continue;
+
+      // Set the title locally. If the note is already on the server, mark it
+      // pending so reconciliation PATCHes the title up; otherwise keep it synced-safe.
+      if (note.server_id) {
+        await this.db.runAsync(
+          `UPDATE meeting_notes SET brochure_title = ?, sync_status = 'pending', updated_at = ? WHERE id = ?`,
+          [brochureTitle, new Date().toISOString(), note.id],
+        );
+      } else {
+        await this.db.runAsync(
+          `UPDATE meeting_notes SET brochure_title = ? WHERE id = ?`,
+          [brochureTitle, note.id],
+        );
+      }
+      console.log(`LocalDB: Backfilled brochure_title="${brochureTitle}" for note ${note.id}`);
+    }
   }
 
   // ==================== DOCTORS CRUD ====================
@@ -3706,10 +4233,22 @@ export class LocalDatabaseService {
       is_deleted: false
     };
 
+    // Resolve the saved brochure's custom title if not supplied, so the note
+    // carries a human-readable brochure title for display and server sync.
+    if (!note.brochure_title && note.brochure_id) {
+      try {
+        const { brochureTitle } = await this.resolveNoteBrochure(note.brochure_id);
+        if (brochureTitle) note.brochure_title = brochureTitle;
+      } catch {
+        // Non-fatal — title can be backfilled later.
+      }
+    }
+
     try {
       const valuesArray = [
         note.id, note.server_id || null, note.meeting_id, note.meeting_server_id || null,
         note.slide_id, note.slide_title, note.slide_order, note.brochure_id,
+        note.brochure_title || null,
         note.note_text, note.slide_image_uri || null, note.follow_up_id || null,
         note.created_at, note.updated_at,
         note.last_modified || null, note.version, note.sync_status,
@@ -3719,10 +4258,10 @@ export class LocalDatabaseService {
       await this.db.runAsync(`
         INSERT INTO meeting_notes (
           id, server_id, meeting_id, meeting_server_id, slide_id, slide_title, 
-          slide_order, brochure_id, note_text, slide_image_uri, follow_up_id,
+          slide_order, brochure_id, brochure_title, note_text, slide_image_uri, follow_up_id,
           created_at, updated_at, 
           last_modified, version, sync_status, is_deleted, local_changes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, valuesArray);
 
       if (!skipSyncQueue) {
@@ -3822,7 +4361,7 @@ export class LocalDatabaseService {
 
       // Build dynamic update query
       Object.entries(finalUpdates).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue') {
+        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue' && key !== 'sync_status' && key !== 'updated_at') {
           updateFields.push(`${key} = ?`);
           values.push(value);
         }
@@ -3883,6 +4422,177 @@ export class LocalDatabaseService {
       console.log('LocalDB: Meeting note deleted:', id);
     } catch (error) {
       console.error('LocalDB: Failed to delete meeting note:', error);
+      throw error;
+    }
+  }
+
+  // ==================== MEETING GENERAL NOTES CRUD ====================
+
+  static async createMeetingGeneralNote(
+    noteData: Omit<LocalMeetingGeneralNote, 'id' | 'created_at' | 'updated_at' | 'version' | 'sync_status' | 'is_deleted'> & {
+      id?: string
+      created_at?: string
+      updated_at?: string
+      version?: number
+      sync_status?: LocalMeetingGeneralNote['sync_status']
+      skipSyncQueue?: boolean
+    },
+  ): Promise<string> {
+    await this.initialize();
+    await this.ensureMeetingGeneralNotesSchema();
+
+    const skipSyncQueue = noteData.skipSyncQueue || false;
+    const id = noteData.id || generateUUID();
+    const now = new Date().toISOString();
+
+    const note: LocalMeetingGeneralNote = {
+      id,
+      server_id: noteData.server_id,
+      meeting_id: noteData.meeting_id,
+      meeting_server_id: noteData.meeting_server_id,
+      title: noteData.title,
+      notes: noteData.notes,
+      follow_up_id: noteData.follow_up_id,
+      created_at: noteData.created_at || now,
+      updated_at: noteData.updated_at || now,
+      last_modified: noteData.last_modified,
+      version: noteData.version || 1,
+      sync_status: noteData.sync_status || (skipSyncQueue ? 'synced' : 'pending'),
+      is_deleted: false,
+      local_changes: noteData.local_changes,
+    };
+
+    try {
+      await this.db.runAsync(`
+        INSERT INTO meeting_general_notes (
+          id, server_id, meeting_id, meeting_server_id, title, notes, follow_up_id,
+          created_at, updated_at, last_modified, version, sync_status, is_deleted, local_changes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        note.id, note.server_id || null, note.meeting_id, note.meeting_server_id || null,
+        note.title || null, note.notes, note.follow_up_id || null,
+        note.created_at, note.updated_at, note.last_modified || null,
+        note.version, note.sync_status, note.is_deleted ? 1 : 0, note.local_changes || null,
+      ]);
+
+      if (!skipSyncQueue) {
+        await this.addToSyncQueue('create', 'meeting_general_notes', id, note);
+      }
+
+      console.log('LocalDB: Meeting general note created locally:', id);
+      return id;
+    } catch (error) {
+      console.error('LocalDB: Failed to create meeting general note:', error);
+      throw error;
+    }
+  }
+
+  static async getMeetingGeneralNotes(meetingId: string): Promise<LocalMeetingGeneralNote[]> {
+    await this.initialize();
+    await this.ensureMeetingGeneralNotesSchema();
+
+    try {
+      const result = await this.db.getAllAsync(`
+        SELECT * FROM meeting_general_notes
+        WHERE meeting_id = ? AND is_deleted = 0
+        ORDER BY created_at
+      `, [meetingId]);
+
+      return result.map((row: any) => ({
+        ...row,
+        is_deleted: Boolean(row.is_deleted),
+      })) as LocalMeetingGeneralNote[];
+    } catch (error) {
+      console.error('LocalDB: Failed to get meeting general notes:', error);
+      return [];
+    }
+  }
+
+  static async getMeetingGeneralNoteById(id: string): Promise<LocalMeetingGeneralNote | null> {
+    await this.initialize();
+    await this.ensureMeetingGeneralNotesSchema();
+
+    try {
+      const result = await this.db.getFirstAsync(`
+        SELECT * FROM meeting_general_notes WHERE id = ?
+      `, [id]);
+      if (!result) return null;
+      return { ...result, is_deleted: Boolean((result as any).is_deleted) } as LocalMeetingGeneralNote;
+    } catch (error) {
+      console.error('LocalDB: Failed to get meeting general note by ID:', error);
+      return null;
+    }
+  }
+
+  static async updateMeetingGeneralNote(
+    id: string,
+    updates: Partial<LocalMeetingGeneralNote> & { skipSyncQueue?: boolean },
+  ): Promise<void> {
+    await this.initialize();
+    await this.ensureMeetingGeneralNotesSchema();
+
+    try {
+      const skipSyncQueue = updates.skipSyncQueue || false;
+      const now = new Date().toISOString();
+      const updateFields: string[] = [];
+      const values: any[] = [];
+
+      Object.entries(updates).forEach(([key, value]) => {
+        if (
+          key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue' &&
+          key !== 'sync_status' && key !== 'updated_at' && key !== 'version'
+        ) {
+          updateFields.push(`${key} = ?`);
+          values.push(value);
+        }
+      });
+
+      const syncStatus = skipSyncQueue ? (updates.sync_status || 'synced') : 'pending';
+      updateFields.push('updated_at = ?', 'version = version + 1', 'sync_status = ?');
+      values.push(now, syncStatus, id);
+
+      await this.db.runAsync(`
+        UPDATE meeting_general_notes SET ${updateFields.join(', ')} WHERE id = ?
+      `, values);
+
+      if (!skipSyncQueue) {
+        const updated = await this.getMeetingGeneralNoteById(id);
+        if (updated) {
+          await this.addToSyncQueue('update', 'meeting_general_notes', id, updated);
+        }
+      }
+
+      console.log('LocalDB: Meeting general note updated:', id);
+    } catch (error) {
+      console.error('LocalDB: Failed to update meeting general note:', error);
+      throw error;
+    }
+  }
+
+  static async deleteMeetingGeneralNote(id: string): Promise<void> {
+    await this.initialize();
+    await this.ensureMeetingGeneralNotesSchema();
+
+    try {
+      const now = new Date().toISOString();
+      const note = await this.getMeetingGeneralNoteById(id);
+
+      await this.db.runAsync(`
+        UPDATE meeting_general_notes
+        SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ?
+        WHERE id = ?
+      `, [now, 'pending', id]);
+
+      if (note) {
+        await this.addToSyncQueue('delete', 'meeting_general_notes', id, {
+          ...note,
+          is_deleted: true,
+        });
+      }
+
+      console.log('LocalDB: Meeting general note deleted:', id);
+    } catch (error) {
+      console.error('LocalDB: Failed to delete meeting general note:', error);
       throw error;
     }
   }
@@ -4058,9 +4768,9 @@ export class LocalDatabaseService {
       const updateFields = [];
       const values = [];
 
-      // Build dynamic update query
+      // Build dynamic update query — skip sync_status here; set once at the end with correct value order
       Object.entries(updateData).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at') {
+        if (key !== 'id' && key !== 'created_at' && key !== 'sync_status' && key !== 'updated_at') {
           updateFields.push(`${key} = ?`);
           if (key === 'is_deleted') {
             values.push(value ? 1 : 0);
@@ -4070,21 +4780,19 @@ export class LocalDatabaseService {
         }
       });
 
-      updateFields.push('updated_at = ?', 'version = version + 1');
-      if (updates.sync_status) {
-        updateFields.push('sync_status = ?');
-        values.push(updates.sync_status, now, id);
-      } else {
-        updateFields.push('sync_status = ?');
-        values.push('pending', now, id);
-      }
+      const syncStatus = skipSyncQueue
+        ? (updates.sync_status || 'synced')
+        : (updates.sync_status || 'pending');
+
+      updateFields.push('updated_at = ?', 'version = version + 1', 'sync_status = ?');
+      values.push(now, syncStatus, id);
 
       if (this.isUsingAsyncStorage()) {
         const data = await AsyncStorage.getItem('meeting_followups');
         const followUps: LocalMeetingFollowUp[] = data ? JSON.parse(data) : [];
         const index = followUps.findIndex(fu => fu.id === id);
         if (index >= 0) {
-          followUps[index] = { ...followUps[index], ...updateData, updated_at: now };
+          followUps[index] = { ...followUps[index], ...updateData, updated_at: now, sync_status: syncStatus as any };
           await AsyncStorage.setItem('meeting_followups', JSON.stringify(followUps));
         }
       } else {
@@ -4201,6 +4909,39 @@ export class LocalDatabaseService {
       });
     } catch (error) {
       console.error('LocalDB: Failed to upsert meeting note:', error);
+      throw error;
+    }
+  }
+
+  static async upsertMeetingGeneralNote(note: LocalMeetingGeneralNote): Promise<void> {
+    await this.initialize();
+    await this.ensureMeetingGeneralNotesSchema();
+
+    try {
+      const existing = await this.getMeetingGeneralNoteById(note.id);
+      if (existing) {
+        await this.updateMeetingGeneralNote(note.id, { ...note, skipSyncQueue: true });
+        return;
+      }
+
+      if (note.server_id) {
+        const byServerId = await this.db.getFirstAsync(
+          `SELECT * FROM meeting_general_notes WHERE server_id = ? AND is_deleted = 0`,
+          [note.server_id],
+        );
+        if (byServerId) {
+          await this.updateMeetingGeneralNote((byServerId as { id: string }).id, {
+            ...note,
+            id: (byServerId as { id: string }).id,
+            skipSyncQueue: true,
+          });
+          return;
+        }
+      }
+
+      await this.createMeetingGeneralNote({ ...note, skipSyncQueue: true });
+    } catch (error) {
+      console.error('LocalDB: Failed to upsert meeting general note:', error);
       throw error;
     }
   }
@@ -4435,6 +5176,7 @@ export class LocalDatabaseService {
       id,
       ...syncData,
       created_at: now,
+      updated_at: now,
       version: 1,
       sync_status: 'pending',
       local_changes: JSON.stringify({}) // Initialize local_changes
@@ -4443,11 +5185,11 @@ export class LocalDatabaseService {
     try {
       await this.db.runAsync(`
         INSERT INTO brochure_sync (
-          id, server_id, mr_id, brochure_id, brochure_title, brochure_data, last_modified, created_at, version, sync_status, local_changes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, server_id, mr_id, brochure_id, brochure_title, brochure_data, last_modified, created_at, updated_at, version, sync_status, local_changes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         sync.id, sync.server_id || null, sync.mr_id, sync.brochure_id, sync.brochure_title || null, sync.brochure_data,
-        sync.last_modified || null, sync.created_at, sync.version, sync.sync_status, sync.local_changes || null
+        sync.last_modified || now, sync.created_at, sync.updated_at, sync.version, sync.sync_status, sync.local_changes
       ]);
 
       // Add to sync queue
@@ -5122,6 +5864,78 @@ export class LocalDatabaseService {
       return id;
     } catch (error) {
       console.error('LocalDB: Failed to create activity log:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Upsert an activity log coming from the server (sync-down). Does NOT queue a
+   * sync operation — these rows already exist on the backend.
+   */
+  static async upsertActivityLog(log: LocalActivityLog): Promise<void> {
+    await this.initialize();
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const key = `activity_logs_${log.mr_id}`;
+        const data = await AsyncStorage.getItem(key);
+        const logs: LocalActivityLog[] = data ? JSON.parse(data) : [];
+        const idx = logs.findIndex(
+          l => l.id === log.id || (!!log.server_id && l.server_id === log.server_id),
+        );
+        if (idx >= 0) {
+          logs[idx] = { ...logs[idx], ...log };
+        } else {
+          logs.push(log);
+        }
+        await AsyncStorage.setItem(key, JSON.stringify(logs));
+        return;
+      }
+
+      // Prefer matching an existing row by server_id so we don't create dupes.
+      let targetId = log.id;
+      if (log.server_id) {
+        const existing = await this.db.getFirstAsync(
+          `SELECT id FROM activity_logs WHERE server_id = ?`,
+          [log.server_id],
+        );
+        if (existing) {
+          targetId = (existing as { id: string }).id;
+        }
+      }
+
+      await this.db.runAsync(
+        `INSERT INTO activity_logs (
+          id, server_id, user_id, mr_id, action, details, metadata, created_at, timestamp, version, sync_status, is_deleted, local_changes, needs_sync
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(id) DO UPDATE SET
+          server_id = excluded.server_id,
+          action = excluded.action,
+          details = excluded.details,
+          metadata = excluded.metadata,
+          created_at = excluded.created_at,
+          timestamp = excluded.timestamp,
+          sync_status = excluded.sync_status,
+          is_deleted = excluded.is_deleted,
+          needs_sync = 0`,
+        [
+          targetId,
+          log.server_id || null,
+          log.user_id,
+          log.mr_id,
+          log.activity_type,
+          log.description,
+          log.metadata || null,
+          log.created_at || new Date().toISOString(),
+          log.created_at || new Date().toISOString(),
+          log.version || 1,
+          'synced',
+          log.is_deleted ? 1 : 0,
+          log.local_changes || null,
+        ],
+      );
+    } catch (error) {
+      console.error('LocalDB: Failed to upsert activity log:', error);
       throw error;
     }
   }

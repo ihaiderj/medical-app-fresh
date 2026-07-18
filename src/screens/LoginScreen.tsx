@@ -5,8 +5,7 @@ import { Ionicons } from "@expo/vector-icons"
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { AuthService } from "../services/AuthService"
 // import { SmartSyncService } from "../services/smartSyncService" // DELETED
-// import { LoginSyncService, LoginSyncProgress } from "../services/loginSyncService" // DELETED
-// import LoginSyncScreen from "../components/LoginSyncScreen" // DELETED
+import LoginSyncScreen, { LoginSyncProgress } from "../components/LoginSyncScreen"
 import { ExtendedAuthService } from "../services/extendedAuthService"
 import { NetworkService } from "../services/networkService"
 import { OfflineBrochureService } from "../services/offlineBrochureService"
@@ -707,16 +706,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
       </SafeAreaView>
       
       {/* Login Sync Screen */}
-      {/* TODO: Implement sync screen UI if needed */}
-      {/* <LoginSyncScreen
-        visible={showSyncScreen && !currentPromptIndex}
-        syncProgress={syncProgress}
-        onSyncComplete={() => setShowSyncScreen(false)}
-        onSyncError={(error) => {
-          setShowSyncScreen(false)
-          Alert.alert('Sync Error', error)
-        }}
-      /> */}
+      <LoginSyncScreen visible={showSyncScreen} syncProgress={syncProgress} />
 
       {/* Brochure Sync Prompts */}
       {/* TODO: Implement brochure sync prompts if needed */}

@@ -7,6 +7,7 @@ import { BrochureManagementService } from './brochureManagementService'
 import { apiClient } from './apiClient'
 import { TokenStorage } from './tokenStorage'
 import { resolveServerBrochureId } from '../utils/brochureTypeUtils'
+import { resolveMediaUrl } from '../config/apiConfig'
 import { SyncReconciliationService } from './syncReconciliationService'
 import { FirstTimeLoginService } from './firstTimeLoginService'
 import AsyncStorage from '@react-native-async-storage/async-storage'
@@ -297,6 +298,9 @@ export class SyncService {
             case 'meeting_slide_notes':
               success = await this.syncMeetingNote(op, userId)
               break
+            case 'meeting_general_notes':
+              success = await this.syncMeetingGeneralNote(op, userId)
+              break
             case 'meeting_followups':
               success = await this.syncMeetingFollowUp(op, userId)
               break
@@ -367,7 +371,7 @@ export class SyncService {
    * Sort operations by dependency order
    */
   private static sortOperationsByDependency(ops: any[]): any[] {
-    const tableOrder = ['doctors', 'meetings', 'meeting_notes', 'meeting_slide_notes', 'meeting_followups', 'saved_brochures', 'brochure_sync', 'activity_logs']
+    const tableOrder = ['doctors', 'meetings', 'meeting_notes', 'meeting_slide_notes', 'meeting_general_notes', 'meeting_followups', 'saved_brochures', 'brochure_sync', 'activity_logs']
     const actionOrder: Record<string, number> = { create: 0, update: 1, delete: 2 }
     return ops.sort((a, b) => {
       const aIndex = tableOrder.indexOf(a.table_name)
@@ -723,6 +727,8 @@ export class SyncService {
       case 'meeting_notes':
       case 'meeting_slide_notes':
         return this.syncMeetingNote(op, userId)
+      case 'meeting_general_notes':
+        return this.syncMeetingGeneralNote(op, userId)
       case 'meeting_followups':
         return this.syncMeetingFollowUp(op, userId)
       case 'activity_logs':
@@ -757,7 +763,7 @@ export class SyncService {
           purpose: data.purpose || '',
           scheduled_date: data.scheduled_date,
           duration_minutes: data.duration_minutes || 30,
-          location: data.location,
+          location: data.location ?? null,
           notes: data.notes,
         })
 
@@ -781,7 +787,7 @@ export class SyncService {
           scheduled_date: data.scheduled_date,
           duration_minutes: data.duration_minutes,
           status: data.status,
-          location: data.location,
+          location: data.location ?? null,
           purpose: data.purpose,
           notes: data.notes
         })
@@ -839,25 +845,44 @@ export class SyncService {
         followUpServerId = followUp?.server_id || undefined
       }
 
+      // The note's brochure_id is a local saved-copy storage id (never synced).
+      // Resolve it to a server-known id and the saved copy's custom title.
+      const { serverBrochureId, brochureTitle } = await LocalDatabaseService.resolveNoteBrochure(
+        data.brochure_id,
+      )
+      const resolvedBrochureTitle = (data.brochure_title && String(data.brochure_title).trim())
+        ? String(data.brochure_title)
+        : brochureTitle
+
       if (op.operation_type === 'create') {
         const result = await MRService.addSlideNote({
           meeting_id: meeting.server_id,
           slide_id: data.slide_id,
           slide_title: data.slide_title,
           slide_order: data.slide_order ?? 0,
-          brochure_id: data.brochure_id || '',
+          brochure_id: serverBrochureId || data.brochure_id || '',
+          brochure_title: resolvedBrochureTitle || undefined,
           note_text: data.note_text || '',
           follow_up_id: followUpServerId,
         })
 
         if (result.success && result.data) {
+          const noteServerId =
+            result.data.note_id ||
+            (result.data as { id?: string }).id
+          if (!noteServerId) {
+            console.error('❌ SYNC NOTE: Create succeeded but no note id in response', result.data)
+            return false
+          }
           await LocalDatabaseService.updateMeetingNote(op.record_id, {
-            server_id: result.data.note_id || (result.data as { id?: string }).id,
+            server_id: noteServerId,
             sync_status: 'synced',
             skipSyncQueue: true,
           })
+          console.log('✅ SYNC NOTE: Created on server with id', noteServerId)
           return true
         }
+        console.error('❌ SYNC NOTE: Create failed', (result as any).error)
         return false
       } else if (op.operation_type === 'update') {
         if (!data.server_id) {
@@ -868,6 +893,7 @@ export class SyncService {
           data.server_id,
           data.note_text || '',
           meeting.server_id,
+          resolvedBrochureTitle || undefined,
         )
         if (result.success) {
           await LocalDatabaseService.updateMeetingNote(op.record_id, {
@@ -927,14 +953,23 @@ export class SyncService {
         })
 
         if (result.success && result.data) {
-          const followUpId = result.data.followup_id || result.data.id
+          const followUpId =
+            (result.data as any).follow_up_id ||
+            (result.data as any).followup_id ||
+            (result.data as any).id
+          if (!followUpId) {
+            console.error('❌ SYNC FOLLOW-UP: Create succeeded but no follow-up id in response', result.data)
+            return false
+          }
           await LocalDatabaseService.updateMeetingFollowUp(op.record_id, {
             server_id: followUpId,
             sync_status: 'synced',
             skipSyncQueue: true,
           })
+          console.log('✅ SYNC FOLLOW-UP: Created on server with id', followUpId)
           return true
         }
+        console.error('❌ SYNC FOLLOW-UP: Create failed', (result as any).error)
         return false
       } else if (op.operation_type === 'update') {
         if (!data.server_id) {
@@ -977,6 +1012,82 @@ export class SyncService {
       return false
     } catch (error) {
       console.error('❌ SYNC FOLLOW-UP: Error:', error)
+      return false
+    }
+  }
+
+  /**
+   * Sync a general meeting note (title + notes) — separate entity from slide notes.
+   */
+  private static async syncMeetingGeneralNote(op: any, userId: string): Promise<boolean> {
+    try {
+      const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
+      console.log(`🔄 SYNC GENERAL NOTE: ${op.operation_type}`, data)
+
+      const meeting = await LocalDatabaseService.getMeetingById(data.meeting_id)
+      if (!meeting || !meeting.server_id) {
+        console.error('❌ SYNC GENERAL NOTE: Meeting not found or missing server_id')
+        return false
+      }
+
+      if (op.operation_type === 'create') {
+        const result = await MRService.addGeneralNote({
+          meeting_id: meeting.server_id,
+          title: data.title || '',
+          notes: data.notes || '',
+        })
+        if (result.success && result.data) {
+          const noteServerId = result.data.note_id
+          if (!noteServerId) {
+            console.error('❌ SYNC GENERAL NOTE: Create succeeded but no id', result.data)
+            return false
+          }
+          await LocalDatabaseService.updateMeetingGeneralNote(op.record_id, {
+            server_id: noteServerId,
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
+          console.log('✅ SYNC GENERAL NOTE: Created on server with id', noteServerId)
+          return true
+        }
+        console.error('❌ SYNC GENERAL NOTE: Create failed', (result as any).error)
+        return false
+      } else if (op.operation_type === 'update') {
+        if (!data.server_id) {
+          return this.syncMeetingGeneralNote({ ...op, operation_type: 'create' }, userId)
+        }
+        const result = await MRService.updateGeneralNote(data.server_id, {
+          title: data.title || '',
+          notes: data.notes || '',
+        })
+        if (result.success) {
+          await LocalDatabaseService.updateMeetingGeneralNote(op.record_id, {
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
+          return true
+        }
+        return false
+      } else if (op.operation_type === 'delete') {
+        if (!data.server_id) {
+          console.log('✅ SYNC GENERAL NOTE: Skipping server delete — note was never synced')
+          await LocalDatabaseService.updateMeetingGeneralNote(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+          return true
+        }
+        const result = await MRService.deleteGeneralNote(data.server_id)
+        if (result.success) {
+          await LocalDatabaseService.updateMeetingGeneralNote(op.record_id, {
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
+          return true
+        }
+        return false
+      }
+
+      return false
+    } catch (error) {
+      console.error('❌ SYNC GENERAL NOTE: Error:', error)
       return false
     }
   }
@@ -1166,16 +1277,17 @@ export class SyncService {
     try {
       const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
       console.log(`🔄 SYNC BROCHURE CHANGES: ${op.operation_type}`, {
-        brochureId: data.brochureId,
-        title: data.title,
+        brochureId: data.brochureId || data.brochure_id,
+        title: data.title || data.brochure_title,
         slidesCount: data.slides?.length || 0,
         groupsCount: data.groups?.length || 0
       })
 
-      const brochureId = data.brochureId
+      const brochureId = data.brochureId || data.brochure_id
       if (!brochureId) {
-        console.error('❌ SYNC BROCHURE CHANGES: Missing brochureId')
-        return false
+        // Stale/corrupt queue row — drop it so it does not block sync forever
+        console.warn('⚠️ SYNC BROCHURE CHANGES: Missing brochureId — marking operation complete to clear queue')
+        return true
       }
 
       // Get brochure data
@@ -1269,8 +1381,9 @@ export class SyncService {
           // Update local brochure_sync record with server_id
           await LocalDatabaseService.updateBrochureSync(op.record_id, {
             server_id: saveResult.data.id,
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           console.log(`✅ SYNC BROCHURE CHANGES: Successfully synced brochure changes (${successfulUploads.length}/${slides.length} slides uploaded)`)
           return true
         } else {
@@ -1285,8 +1398,9 @@ export class SyncService {
         const deleteResult = await MRService.deleteBrochureSync(userId, brochureId)
         if (deleteResult.success) {
           await LocalDatabaseService.updateBrochureSync(op.record_id, {
-            sync_status: 'synced'
-          }, true) // skipSyncQueue = true
+            sync_status: 'synced',
+            skipSyncQueue: true,
+          })
           return true
         }
         console.error(`❌ SYNC BROCHURE CHANGES: Failed to delete brochure sync:`, deleteResult.error)
@@ -1548,7 +1662,8 @@ export class SyncService {
                   slide_id: note.slide_id,
                   slide_title: note.slide_title,
                   slide_order: note.slide_order ?? 0,
-                  brochure_id: meeting.brochure_id || '',
+                  brochure_id: note.brochure_id || meeting.brochure_id || '',
+                  brochure_title: note.brochure_title || '',
                   note_text: note.note_text,
                   created_at: note.created_at,
                   updated_at: note.updated_at || note.created_at,
@@ -1716,6 +1831,7 @@ export class SyncService {
       meetings: 'meetings',
       meeting_notes: 'meeting_slide_notes',
       meeting_slide_notes: 'meeting_slide_notes',
+      meeting_general_notes: 'meeting_general_notes',
       meeting_followups: 'meeting_followups',
       saved_brochures: 'saved_brochures',
       brochure_sync: 'brochure_sync',
@@ -1796,6 +1912,29 @@ export class SyncService {
         payload.server_id = merged.server_id
       }
 
+      return payload
+    }
+
+    if (op.table_name === 'meeting_general_notes') {
+      const local = await LocalDatabaseService.getMeetingGeneralNoteById(op.record_id)
+      const merged = { ...(local || {}), ...data } as Record<string, unknown>
+      const meeting = await LocalDatabaseService.getMeetingById(String(merged.meeting_id || ''))
+      const meetingServerId = meeting?.server_id || merged.meeting_server_id
+
+      if (op.operation_type === 'delete') {
+        return { server_id: merged.server_id, is_deleted: true }
+      }
+
+      const payload: Record<string, unknown> = {
+        meeting_id: meetingServerId,
+        title: merged.title || '',
+        notes: merged.notes || '',
+      }
+      if (op.operation_type === 'update') {
+        payload.server_id = merged.server_id
+      }
+      // If the parent meeting has no server id yet the push will fail and the
+      // individual REST fallback returns false, so it stays queued for retry.
       return payload
     }
 
@@ -2078,6 +2217,13 @@ export class SyncService {
           await LocalDatabaseService.updateMeetingNote(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
         }
         break
+      case 'meeting_general_notes':
+        if (op.operation_type === 'delete') {
+          await LocalDatabaseService.updateMeetingGeneralNote(op.record_id, { sync_status: 'synced', skipSyncQueue: true })
+        } else if (serverId) {
+          await LocalDatabaseService.updateMeetingGeneralNote(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
+        }
+        break
       case 'meeting_followups':
         if (serverId) {
           await LocalDatabaseService.updateMeetingFollowUp(op.record_id, { server_id: serverId, sync_status: 'synced', skipSyncQueue: true })
@@ -2111,12 +2257,21 @@ export class SyncService {
         doctors: any[]
         meetings: any[]
         meeting_slide_notes: any[]
+        meeting_notes: any[]
+        meeting_general_notes: any[]
         meeting_followups: any[]
         saved_brochures: any[]
         brochure_sync: any[]
         activity_logs: any[]
         sync_timestamp: string
       }>('/api/sync/pull/', { query: { since } })
+
+      console.log(
+        `⬇️ SYNC PULL: received doctors=${data.doctors?.length || 0} meetings=${data.meetings?.length || 0} ` +
+          `slide_notes=${data.meeting_slide_notes?.length || 0} general_notes=${(data.meeting_general_notes?.length || 0) + (data.meeting_notes?.length || 0)} ` +
+          `followups=${data.meeting_followups?.length || 0} saved_brochures=${data.saved_brochures?.length || 0} ` +
+          `brochure_sync=${data.brochure_sync?.length || 0} activity_logs=${data.activity_logs?.length || 0}`,
+      )
 
       let synced = 0
       let failed = 0
@@ -2137,7 +2292,9 @@ export class SyncService {
             email: doctor.email,
             location: doctor.location,
             notes: doctor.notes ?? '',
-            profile_image_url: doctor.profile_image_url,
+            profile_image_url: doctor.profile_image_url
+              ? resolveMediaUrl(doctor.profile_image_url)
+              : doctor.profile_image_url,
             created_at: doctor.created_at,
             updated_at: doctor.updated_at || doctor.created_at,
             sync_status: 'synced',
@@ -2207,10 +2364,14 @@ export class SyncService {
             continue
           }
 
+          // Slide images are never stored per-copy on the backend — they only
+          // exist in the source brochure's ZIP. Point the copy's storage_id at
+          // the canonical source brochure so the viewer auto-downloads the ZIP
+          // (via availableBrochures.file_url) instead of opening an empty copy.
           await LocalDatabaseService.upsertSavedBrochure({
             id: serverSavedId,
             server_id: serverSavedId,
-            storage_id: savedBrochure.storage_id || serverSavedId,
+            storage_id: canonicalBrochureId || savedBrochure.storage_id || serverSavedId,
             mr_id: userId,
             brochure_id: canonicalBrochureId,
             brochure_title: savedBrochure.brochure_title,
@@ -2277,6 +2438,7 @@ export class SyncService {
             slide_title: note.slide_title,
             slide_order: note.slide_order ?? 0,
             brochure_id: note.brochure_id || meeting.brochure_id || '',
+            brochure_title: note.brochure_title || '',
             note_text: note.note_text,
             slide_image_uri: note.slide_image_uri,
             follow_up_id: note.follow_up_id,
@@ -2293,12 +2455,162 @@ export class SyncService {
         }
       }
 
+      // General notes are returned by the backend under `meeting_notes`
+      // (and/or `meeting_general_notes`). Support both keys.
+      const generalNotes = [
+        ...(data.meeting_general_notes || []),
+        ...(data.meeting_notes || []),
+      ]
+      for (const gnote of generalNotes) {
+        if (gnote.is_deleted) continue
+        try {
+          const meeting = await LocalDatabaseService.getMeetingByServerId(gnote.meeting_id)
+          if (!meeting) {
+            failed++
+            continue
+          }
+          await LocalDatabaseService.upsertMeetingGeneralNote({
+            id: `gnote_${gnote.note_id || gnote.id}`,
+            server_id: String(gnote.note_id || gnote.id),
+            meeting_id: meeting.id,
+            meeting_server_id: gnote.meeting_id,
+            title: gnote.title || '',
+            notes: gnote.notes || gnote.note_text || '',
+            created_at: gnote.created_at,
+            updated_at: gnote.updated_at || gnote.created_at,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`General note ${gnote.note_id || gnote.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      // Per-copy brochure edits (custom brochure content). Without this the
+      // saved custom brochures ("33"/"66") open empty after a fresh install.
+      for (const bsync of data.brochure_sync || []) {
+        try {
+          if (bsync.is_deleted) continue
+          const bdata = bsync.brochure_data
+          await LocalDatabaseService.upsertBrochureSync({
+            id: String(bsync.id || bsync.server_id),
+            server_id: String(bsync.server_id || bsync.id),
+            mr_id: userId,
+            brochure_id: resolveServerBrochureId(String(bsync.brochure_id || '')),
+            brochure_title: bsync.brochure_title,
+            brochure_data:
+              typeof bdata === 'string' ? bdata : JSON.stringify(bdata || {}),
+            last_modified: bsync.last_modified || bsync.updated_at,
+            created_at: bsync.created_at,
+            version: bsync.version || 1,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Brochure sync ${bsync.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
+      // Activity logs — populate the dashboard history.
+      for (const alog of data.activity_logs || []) {
+        try {
+          if (alog.is_deleted) continue
+          // Backend note: the meaningful field is `activity_type` (`action` is a
+          // legacy column that is always empty). Likewise `description` is the
+          // human-readable text; `details` is an empty {} object on all rows.
+          await LocalDatabaseService.upsertActivityLog({
+            id: `activity_${alog.id}`,
+            server_id: String(alog.id),
+            user_id: alog.user_id || userId,
+            mr_id: userId,
+            activity_type: alog.activity_type || alog.action || '',
+            description:
+              alog.description ||
+              (typeof alog.details === 'string' ? alog.details : '') ||
+              '',
+            metadata:
+              typeof alog.metadata === 'string'
+                ? alog.metadata
+                : alog.metadata
+                  ? JSON.stringify(alog.metadata)
+                  : undefined,
+            created_at: alog.created_at || alog.timestamp,
+            version: 1,
+            sync_status: 'synced',
+            is_deleted: false,
+          })
+          synced++
+        } catch (error) {
+          failed++
+          errors.push(`Activity log ${alog.id}: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        }
+      }
+
       try {
         const brochuresResult = await MRService.getAssignedBrochures(userId)
+        const availableBrochures = brochuresResult.success ? brochuresResult.data || [] : []
         if (brochuresResult.success) {
-          await LocalDatabaseService.syncBrochuresFromServer(brochuresResult.data || [])
+          await LocalDatabaseService.syncBrochuresFromServer(availableBrochures)
           const { OfflineBrochureService } = await import('./offlineBrochureService')
-          await OfflineBrochureService.cacheBrochures(userId, brochuresResult.data || [])
+          await OfflineBrochureService.cacheBrochures(userId, availableBrochures)
+        }
+
+        // Pre-download the source ZIP for every brochure referenced by a saved
+        // copy so the slide images are on-device and viewable OFFLINE right after
+        // first login (instead of being lazily fetched on first view).
+        const sourceIds = Array.from(
+          new Set(
+            (data.saved_brochures || [])
+              .filter((sb: any) => !sb.is_deleted)
+              .map((sb: any) => resolveServerBrochureId(String(sb.brochure_id || '')))
+              .filter(Boolean),
+          ),
+        ) as string[]
+
+        for (let i = 0; i < sourceIds.length; i++) {
+          const srcId = sourceIds[i]
+          try {
+            const dir = `${FileSystem.documentDirectory}brochures/${srcId}/`
+            const dataJsonInfo = await FileSystem.getInfoAsync(`${dir}brochure_data.json`)
+            const slidesInfo = await FileSystem.getInfoAsync(`${dir}slides`)
+            if (dataJsonInfo.exists && slidesInfo.exists) {
+              continue // already downloaded — skip
+            }
+
+            const avail = availableBrochures.find(
+              (b: any) => (b.brochure_id || b.id) === srcId,
+            ) as any
+            const fileUrl = avail?.file_url
+            if (!fileUrl) continue
+
+            this.reportProgress(
+              'Downloading brochures',
+              `Downloading brochure ${i + 1} of ${sourceIds.length} for offline use...`,
+              90,
+              i + 1,
+              sourceIds.length,
+            )
+
+            await FileSystem.makeDirectoryAsync(dir, { intermediates: true })
+            const zipPath = `${dir}temp.zip`
+            const dl = await FileStorageService.downloadFile(fileUrl, zipPath)
+            if (dl.success) {
+              await BrochureManagementService.processZipFile(
+                srcId,
+                zipPath,
+                avail.title || avail.brochure_title || 'Brochure',
+              )
+              console.log(`⬇️ SYNC PULL: Pre-downloaded brochure ${srcId} for offline use`)
+            } else {
+              console.warn(`⚠️ SYNC PULL: Brochure ${srcId} ZIP download failed:`, dl.error)
+            }
+          } catch (err) {
+            console.warn(`⚠️ SYNC PULL: Failed to pre-download brochure ${srcId}:`, err)
+          }
         }
       } catch (error) {
         console.warn('⚠️ SYNC PULL: Failed to refresh available brochures:', error)
@@ -2308,6 +2620,7 @@ export class SyncService {
         await AsyncStorage.setItem(this.LAST_SYNC_KEY, data.sync_timestamp)
       }
 
+      console.log(`⬇️ SYNC PULL: persisted synced=${synced} failed=${failed}`)
       this.reportProgress('Complete', `Downloaded: ${synced}, Failed: ${failed}`, 100)
       return {
         success: failed === 0,

@@ -108,6 +108,10 @@ export interface SlideNote {
   slide_title: string
   slide_order: number
   note_text: string
+  brochure_id?: string
+  brochure_title?: string
+  slide_image_uri?: string
+  follow_up_id?: string
   created_at: string
   updated_at: string
 }
@@ -186,8 +190,8 @@ export class MRService {
       const followUpsResult = await this.getMeetingFollowUps(meetingId)
       if (!followUpsResult.success || !followUpsResult.data) continue
 
-      for (const row of followUpsResult.data as Array<{ followup_id?: string; id?: string }>) {
-        const followUpId = String(row.followup_id || row.id || '').trim()
+      for (const row of followUpsResult.data as Array<{ follow_up_id?: string; followup_id?: string; id?: string }>) {
+        const followUpId = String(row.follow_up_id || row.followup_id || row.id || '').trim()
         if (followUpId) ids.push(followUpId)
       }
     }
@@ -213,7 +217,9 @@ export class MRService {
       if (!detailsResult.success || !detailsResult.data?.slide_notes) continue
 
       for (const note of detailsResult.data.slide_notes) {
-        const noteId = String(note.note_id || '').trim()
+        const noteId = String(
+          (note as any).note_id || (note as any).id || '',
+        ).trim()
         if (noteId) ids.push(noteId)
       }
     }
@@ -463,21 +469,27 @@ export class MRService {
     slide_title?: string
     slide_order?: number
     brochure_id?: string
+    brochure_title?: string
     note_text: string
     slide_image_uri?: string
     follow_up_id?: string
     timestamp?: string
   }): Promise<{ success: boolean; data?: { note_id: string }; error?: string }> {
     try {
-      const data = await apiClient.post<{ note_id: string }>(`/api/mr/meetings/${noteData.meeting_id}/notes/`, {
+      const data = await apiClient.post<any>(`/api/mr/meetings/${noteData.meeting_id}/notes/`, {
         slide_id: noteData.slide_id,
         slide_title: noteData.slide_title,
         slide_order: noteData.slide_order ?? 0,
         brochure_id: noteData.brochure_id,
+        brochure_title: noteData.brochure_title,
         note_text: noteData.note_text,
         follow_up_id: noteData.follow_up_id,
       })
-      return { success: true, data }
+      const noteId = data?.note_id || data?.id
+      if (!noteId) {
+        return { success: false, error: 'Note created but server returned no id' }
+      }
+      return { success: true, data: { note_id: String(noteId) } }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to add slide note') }
     }
@@ -527,7 +539,7 @@ export class MRService {
     status?: 'scheduled' | 'completed' | 'cancelled'
   }): Promise<{ success: boolean; data?: { follow_up_id: string }; error?: string }> {
     try {
-      const data = await apiClient.post<{ follow_up_id: string }>(
+      const data = await apiClient.post<any>(
         `/api/mr/meetings/${followUpData.meeting_id}/followups/`,
         {
           follow_up_date: followUpData.follow_up_date,
@@ -536,7 +548,11 @@ export class MRService {
           status: followUpData.status || 'scheduled',
         },
       )
-      return { success: true, data: { follow_up_id: data.follow_up_id } }
+      const followUpId = data?.follow_up_id || data?.followup_id || data?.id
+      if (!followUpId) {
+        return { success: false, error: 'Follow-up created but server returned no id' }
+      }
+      return { success: true, data: { follow_up_id: String(followUpId) } }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to create follow-up') }
     }
@@ -581,12 +597,17 @@ export class MRService {
     noteId: string,
     noteText: string,
     meetingId?: string,
+    brochureTitle?: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
       if (!meetingId) {
         return { success: false, error: 'Meeting ID required for slide note update' }
       }
-      await apiClient.patch(`/api/mr/meetings/${meetingId}/notes/${noteId}/`, { note_text: noteText })
+      const payload: { note_text: string; brochure_title?: string } = { note_text: noteText }
+      if (brochureTitle !== undefined) {
+        payload.brochure_title = brochureTitle
+      }
+      await apiClient.patch(`/api/mr/meetings/${meetingId}/notes/${noteId}/`, payload)
       return { success: true }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to update slide note') }
@@ -602,6 +623,58 @@ export class MRService {
       return { success: true }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to delete slide note') }
+    }
+  }
+
+  // ==================== GENERAL MEETING NOTES ====================
+
+  static async addGeneralNote(noteData: {
+    meeting_id: string
+    title?: string
+    notes: string
+  }): Promise<{ success: boolean; data?: { note_id: string }; error?: string }> {
+    try {
+      const data = await apiClient.post<any>(`/api/mr/meetings/${noteData.meeting_id}/general-notes/`, {
+        title: noteData.title || '',
+        notes: noteData.notes,
+      })
+      const noteId = data?.note_id || data?.id
+      if (!noteId) {
+        return { success: false, error: 'General note created but server returned no id' }
+      }
+      return { success: true, data: { note_id: String(noteId) } }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to add general note') }
+    }
+  }
+
+  static async updateGeneralNote(
+    noteId: string,
+    updates: { title?: string; notes?: string },
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      await apiClient.patch(`/api/mr/general-notes/${noteId}/`, updates)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to update general note') }
+    }
+  }
+
+  static async deleteGeneralNote(noteId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      await apiClient.delete(`/api/mr/general-notes/${noteId}/`)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to delete general note') }
+    }
+  }
+
+  static async getGeneralNotes(meetingId: string): Promise<{ success: boolean; data?: any[]; error?: string }> {
+    try {
+      const data = await apiClient.get<any[]>(`/api/mr/meetings/${meetingId}/general-notes/`)
+      return { success: true, data: data || [] }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to fetch general notes') }
     }
   }
 

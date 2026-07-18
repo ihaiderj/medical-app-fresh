@@ -464,8 +464,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
       
       let derivedStatus = meeting.status
 
-      if (derivedStatus !== 'cancelled') {
-        // If there is a pending (future) follow-up, the meeting is "scheduled"
+      if (derivedStatus !== 'cancelled' && derivedStatus !== 'completed') {
+        // If there is a pending (future) follow-up, the meeting is scheduled.
         const latestFU = meeting.latest_follow_up
         if (latestFU && latestFU.status !== 'completed' && latestFU.status !== 'cancelled') {
           const fuDate = new Date(latestFU.follow_up_date)
@@ -475,17 +475,14 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
           } else {
             fuDate.setHours(23, 59, 59)
           }
-          if (fuDate >= now) {
-            derivedStatus = 'follow-up-scheduled'
-          } else {
-            derivedStatus = 'completed'
-          }
-        } else if (derivedStatus !== 'completed') {
-          // No active follow-up: auto-complete if meeting date passed
+          // Future follow-up → scheduled; past unresolved follow-up → expired.
+          derivedStatus = fuDate >= now ? 'follow-up-scheduled' : 'expired'
+        } else {
+          // No active follow-up: expired if the meeting date has passed.
           if (meeting.scheduled_date) {
             const meetingDate = new Date(meeting.scheduled_date)
             if (meetingDate < now) {
-              derivedStatus = 'completed'
+              derivedStatus = 'expired'
             }
           }
         }
@@ -537,6 +534,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
         return "#3b82f6"
       case "cancelled":
         return "#ef4444"
+      case "expired":
+        return "#b45309"
       default:
         return "#6b7280"
     }
@@ -585,14 +584,23 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
 
       const meetingId = selectedMeeting.id || selectedMeeting.meeting_id
       
-      // Validate: scheduled_date must not be in the past
+      // Validate: a meeting cannot be MOVED to a past date. Editing an existing
+      // past meeting (e.g. to change notes) is allowed as long as the date is
+      // not changed to an earlier past date.
       if (meetingForm.scheduled_date) {
         const selected = new Date(meetingForm.scheduled_date)
         const today = new Date()
         today.setHours(0, 0, 0, 0)
         selected.setHours(0, 0, 0, 0)
-        if (selected < today) {
-          Alert.alert("Invalid Date", "Meeting date cannot be in the past.")
+
+        const originalDateStr = selectedMeeting.scheduled_date
+          ? new Date(selectedMeeting.scheduled_date).toISOString().split('T')[0]
+          : ''
+        const selectedDateStr = meetingForm.scheduled_date.split('T')[0]
+        const dateChanged = originalDateStr !== selectedDateStr
+
+        if (selected < today && dateChanged) {
+          Alert.alert("Invalid Date", "Meeting date cannot be moved to a past date.")
           return
         }
       }

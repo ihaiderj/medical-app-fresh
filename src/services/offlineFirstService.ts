@@ -3,7 +3,7 @@
  * Provides offline-first CRUD operations for all entities
  * Automatically syncs with server when online
  */
-import { LocalDatabaseService, LocalDoctor, LocalMeeting, LocalMeetingNote, LocalMeetingFollowUp, LocalDoctorAssignment, LocalSavedBrochure } from './localDatabaseService';
+import { LocalDatabaseService, LocalDoctor, LocalMeeting, LocalMeetingNote, LocalMeetingGeneralNote, LocalMeetingFollowUp, LocalDoctorAssignment, LocalSavedBrochure } from './localDatabaseService';
 import { NetworkService } from './networkService';
 import { AuthService } from './AuthService';
 import type { MRDashboardStats, MRRecentActivity, MRUpcomingMeeting } from './MRService';
@@ -109,6 +109,20 @@ export interface UpdateMeetingNoteRequest {
   slide_order?: number;
   note_text?: string;
   slide_image_uri?: string;
+  follow_up_id?: string;
+}
+
+export interface CreateMeetingGeneralNoteRequest {
+  meeting_id: string;
+  meeting_server_id?: string;
+  title?: string;
+  notes: string;
+  follow_up_id?: string;
+}
+
+export interface UpdateMeetingGeneralNoteRequest {
+  title?: string;
+  notes?: string;
   follow_up_id?: string;
 }
 
@@ -517,6 +531,55 @@ export class OfflineFirstService {
       await this.enqueueMeetingNoteSyncByMeeting(note.meeting_id);
     } catch (error) {
       console.warn('OfflineFirst: meeting note sync by id failed', error);
+    }
+  }
+
+  // ==================== MEETING GENERAL NOTES ====================
+
+  static async createMeetingGeneralNote(payload: CreateMeetingGeneralNoteRequest): Promise<ServiceResponse<{ id: string }>> {
+    try {
+      const id = await LocalDatabaseService.createMeetingGeneralNote({
+        meeting_id: payload.meeting_id,
+        meeting_server_id: payload.meeting_server_id,
+        title: payload.title,
+        notes: payload.notes,
+        follow_up_id: payload.follow_up_id,
+      });
+      const isOnline = await NetworkService.isOnline();
+      return { success: true, data: { id }, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to create general note' };
+    }
+  }
+
+  static async updateMeetingGeneralNote(id: string, updates: UpdateMeetingGeneralNoteRequest): Promise<ServiceResponse<void>> {
+    try {
+      await LocalDatabaseService.updateMeetingGeneralNote(id, updates as Partial<LocalMeetingGeneralNote>);
+      const isOnline = await NetworkService.isOnline();
+      return { success: true, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to update general note' };
+    }
+  }
+
+  static async deleteMeetingGeneralNote(id: string): Promise<ServiceResponse<void>> {
+    try {
+      await LocalDatabaseService.deleteMeetingGeneralNote(id);
+      const isOnline = await NetworkService.isOnline();
+      return { success: true, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete general note' };
+    }
+  }
+
+  static async getMeetingGeneralNotes(meetingId: string): Promise<ServiceResponse<LocalMeetingGeneralNote[]>> {
+    try {
+      await LocalDatabaseService.ensureReady();
+      const notes = await LocalDatabaseService.getMeetingGeneralNotes(meetingId);
+      const isOnline = await NetworkService.isOnline();
+      return { success: true, data: notes, isOffline: !isOnline };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to load general notes' };
     }
   }
 

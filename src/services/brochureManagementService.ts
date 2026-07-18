@@ -1527,7 +1527,16 @@ export class BrochureManagementService {
       console.log('BrochureSync: Downloaded groups count:', syncData.groups.length)
       console.log('BrochureSync: Downloaded slide titles:', syncData.slides.slice(0, 3).map(s => s.title))
       console.log('BrochureSync: Downloaded group names:', syncData.groups.map(g => g.name))
-      
+
+      // A change set with no slides carries no renderable content — it means the
+      // brochure simply has no per-user modifications on the server. Applying it
+      // verbatim would wipe the freshly-extracted images (0 slides). Preserve the
+      // local slides instead of destroying them.
+      if (!syncData.slides || syncData.slides.length === 0) {
+        console.log('BrochureSync: Server change set has 0 slides — preserving local slides, not overwriting')
+        return { success: true }
+      }
+
       const brochureDir = `${FileSystem.documentDirectory}brochures/${brochureId}/`
       const now = new Date().toISOString()
       

@@ -423,6 +423,27 @@ export class SyncReconciliationService {
 
     for (const meeting of meetings) {
       const followUps = await LocalDatabaseService.getMeetingFollowUps(meeting.id)
+
+      // Fetch the meeting's server follow-ups once so we can adopt an existing
+      // record (matched by date+time) instead of creating a duplicate on the server.
+      let serverFollowUps: Array<{ id: string; key: string }> = []
+      const adoptedServerIds = new Set<string>()
+      if (meeting.server_id) {
+        try {
+          const res = await MRService.getMeetingFollowUps(String(meeting.server_id))
+          if (res.success && Array.isArray(res.data)) {
+            serverFollowUps = (res.data as Array<Record<string, unknown>>)
+              .map((row) => {
+                const id = String(row.follow_up_id || row.followup_id || row.id || '').trim()
+                return { id, key: this.followUpKey(row.follow_up_date, row.follow_up_time) }
+              })
+              .filter((r) => r.id)
+          }
+        } catch {
+          // Non-fatal: fall back to create-if-missing behaviour below.
+        }
+      }
+
       for (const followUp of followUps) {
         if (followUp.is_deleted) continue
 
@@ -442,17 +463,36 @@ export class SyncReconciliationService {
           if (!operation) continue
           if (operation === 'create' && !meeting.server_id) continue
 
+          // Before creating a duplicate, try to adopt a matching server follow-up.
+          if (operation === 'create') {
+            const localKey = this.followUpKey(followUp.follow_up_date, followUp.follow_up_time)
+            const match = serverFollowUps.find(
+              (s) => s.key === localKey && !adoptedServerIds.has(s.id),
+            )
+            if (match) {
+              adoptedServerIds.add(match.id)
+              await LocalDatabaseService.updateMeetingFollowUp(followUp.id, {
+                server_id: match.id,
+                sync_status: 'synced',
+                skipSyncQueue: true,
+              })
+              console.log(
+                `🔗 RECONCILE: Adopted existing server follow-up ${match.id} for local ${followUp.id} (avoided duplicate)`,
+              )
+              continue
+            }
+          }
+
           if (clearServerId) {
             await LocalDatabaseService.resetMeetingFollowUpServerSync(followUp.id)
             clearedStaleServerIds++
           }
 
           await LocalDatabaseService.addToSyncQueue(operation, 'meeting_followups', followUp.id, followUp)
-          await LocalDatabaseService.updateMeetingFollowUp(
-            followUp.id,
-            { sync_status: 'pending' },
-            true,
-          )
+          await LocalDatabaseService.updateMeetingFollowUp(followUp.id, {
+            sync_status: 'pending',
+            skipSyncQueue: true,
+          })
           queued++
           console.log(`🔄 RECONCILE: Queued meeting_followups ${operation} for ${followUp.id}`)
         } catch (error) {
@@ -464,6 +504,20 @@ export class SyncReconciliationService {
     }
 
     return { queued, clearedStaleServerIds, errors }
+  }
+
+  /** Normalized key for matching a follow-up by its date + time (HH:MM). */
+  private static followUpKey(date: unknown, time: unknown): string {
+    const d = String(date ?? '').trim()
+    const t = String(time ?? '').trim().slice(0, 5)
+    return `${d}|${t}`
+  }
+
+  /** Normalized key for matching a meeting note by its slide + text. */
+  private static noteKey(slideId: unknown, noteText: unknown): string {
+    const s = String(slideId ?? '').trim()
+    const t = String(noteText ?? '').trim()
+    return `${s}|${t}`
   }
 
   private static async reconcileMeetingNotes(mrId: string): Promise<{
@@ -486,6 +540,11 @@ export class SyncReconciliationService {
 
     console.log(`🔄 RECONCILE meeting_notes: local=${notes.length} server=${serverIds.size}`)
 
+    // Cache of server notes per meeting (server_id) so we can adopt existing
+    // records (matched by slide + note text) instead of creating duplicates.
+    const serverNotesCache = new Map<string, Array<{ id: string; key: string }>>()
+    const adoptedNoteServerIds = new Set<string>()
+
     for (const note of notes) {
       if (note.is_deleted) continue
 
@@ -507,13 +566,56 @@ export class SyncReconciliationService {
         const meeting = await LocalDatabaseService.getMeetingById(note.meeting_id)
         if (operation === 'create' && (!meeting || !meeting.server_id)) continue
 
+        // Before creating a duplicate, try to adopt a matching server note.
+        if (operation === 'create' && meeting?.server_id) {
+          const serverMeetingId = String(meeting.server_id)
+          if (!serverNotesCache.has(serverMeetingId)) {
+            let list: Array<{ id: string; key: string }> = []
+            try {
+              const res = await MRService.getMeetingDetails(serverMeetingId)
+              const slideNotes = (res.success && res.data
+                ? (res.data as { slide_notes?: Array<Record<string, unknown>> }).slide_notes
+                : undefined) || []
+              list = slideNotes
+                .map((row) => {
+                  const id = String(row.note_id || row.id || '').trim()
+                  return { id, key: this.noteKey(row.slide_id, row.note_text) }
+                })
+                .filter((r) => r.id)
+            } catch {
+              // Non-fatal.
+            }
+            serverNotesCache.set(serverMeetingId, list)
+          }
+
+          const localKey = this.noteKey(note.slide_id, note.note_text)
+          const match = (serverNotesCache.get(serverMeetingId) || []).find(
+            (s) => s.key === localKey && !adoptedNoteServerIds.has(s.id),
+          )
+          if (match) {
+            adoptedNoteServerIds.add(match.id)
+            await LocalDatabaseService.updateMeetingNote(note.id, {
+              server_id: match.id,
+              sync_status: 'synced',
+              skipSyncQueue: true,
+            })
+            console.log(
+              `🔗 RECONCILE: Adopted existing server note ${match.id} for local ${note.id} (avoided duplicate)`,
+            )
+            continue
+          }
+        }
+
         if (clearServerId) {
           await LocalDatabaseService.resetMeetingNoteServerSync(note.id)
           clearedStaleServerIds++
         }
 
         await LocalDatabaseService.addToSyncQueue(operation, 'meeting_notes', note.id, note)
-        await LocalDatabaseService.updateMeetingNote(note.id, { sync_status: 'pending' }, true)
+        await LocalDatabaseService.updateMeetingNote(note.id, {
+          sync_status: 'pending',
+          skipSyncQueue: true,
+        })
         queued++
         console.log(`🔄 RECONCILE: Queued meeting_notes ${operation} for ${note.id}`)
       } catch (error) {
@@ -540,7 +642,7 @@ export class SyncReconciliationService {
 
       try {
         await LocalDatabaseService.addToSyncQueue(op, 'brochure_sync', sync.id, sync)
-        await LocalDatabaseService.updateBrochureSync(sync.id, { sync_status: 'pending' }, true)
+        await LocalDatabaseService.updateBrochureSync(sync.id, { sync_status: 'pending', skipSyncQueue: true })
         queued++
       } catch (error) {
         errors.push(`brochure_sync ${sync.id}: ${error instanceof Error ? error.message : 'Unknown'}`)
