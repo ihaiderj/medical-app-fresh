@@ -25,6 +25,7 @@ import DoctorSelectionModal from "../../components/DoctorSelectionModal"
 import { MRService } from "../../services/MRService"
 import { AuthService } from "../../services/AuthService"
 import { OfflineFirstService } from "../../services/offlineFirstService"
+import { LocalDatabaseService, LocalMeetingNote } from "../../services/localDatabaseService"
 import { useModalQueue } from "../../hooks/useModalQueue"
 import { useAppData } from "../../context/AppDataContext"
 import { useGlobalForms } from "../../context/GlobalFormContext"
@@ -44,7 +45,7 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
   const modalQueue = useModalQueue()
   
   // Global state management
-  const { notifyDoctorChange, notifyMeetingChange } = useAppData()
+  const { notifyDoctorChange, notifyMeetingChange, notifyActivityChange } = useAppData()
   const { showDoctorForm, showMeetingForm } = useGlobalForms()
   
   const [slides, setSlides] = useState<BrochureSlide[]>([])
@@ -68,6 +69,13 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
   const [showDoctorSelectionModal, setShowDoctorSelectionModal] = useState(false)
   const [doctorSelectionContext, setDoctorSelectionContext] = useState<'meeting' | null>(null)
   const [isLoadingDoctors, setIsLoadingDoctors] = useState(false)
+  const [slideNotes, setSlideNotes] = useState<LocalMeetingNote[]>([])
+  const [showManageNoteModal, setShowManageNoteModal] = useState(false)
+  const [managingNote, setManagingNote] = useState<LocalMeetingNote | null>(null)
+  const [manageNoteText, setManageNoteText] = useState('')
+  const [isManageNoteEditing, setIsManageNoteEditing] = useState(false)
+  const [isSavingManageNote, setIsSavingManageNote] = useState(false)
+  const [meetingTitleById, setMeetingTitleById] = useState<Record<string, string>>({})
   const [newMeetingForm, setNewMeetingForm] = useState({
     doctor_id: '',
     title: '',
@@ -151,12 +159,124 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
         
         console.log('DoctorGroupViewer: Slides with fixed paths:', slidesWithFixedPaths.length)
         setSlides(slidesWithFixedPaths)
+        await loadSlideNotesForSlides(slidesWithFixedPaths)
       }
     } catch (error) {
       console.error('Error loading group slides:', error)
     } finally {
       setIsLoading(false)
     }
+  }
+
+  const loadSlideNotesForSlides = async (groupSlides: BrochureSlide[] = slides) => {
+    try {
+      await LocalDatabaseService.ensureReady()
+      const ids = groupSlides.map((s) => s.id).filter(Boolean)
+      const notes = await LocalDatabaseService.getMeetingNotesForBrochureSlides(
+        brochureId,
+        ids.length > 0 ? ids : (Array.isArray(slideIds) ? slideIds : []),
+      )
+      setSlideNotes(notes)
+
+      const titles: Record<string, string> = {}
+      const meetingIds = [...new Set(notes.map((n) => n.meeting_id).filter(Boolean))]
+      for (const meetingId of meetingIds) {
+        try {
+          const meeting = await LocalDatabaseService.getMeetingById(meetingId)
+          if (meeting) {
+            titles[meetingId] =
+              meeting.title ||
+              `Meeting ${new Date(meeting.scheduled_date).toLocaleDateString()}`
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+      setMeetingTitleById(titles)
+    } catch (error) {
+      console.warn('DoctorGroupViewer: Failed to load slide notes:', error)
+      setSlideNotes([])
+    }
+  }
+
+  const loadSlideNotes = async () => loadSlideNotesForSlides(slides)
+
+  const notesForSlide = (slideId?: string | null) =>
+    slideNotes.filter((n) => n.slide_id === slideId)
+
+  const openManageNotesForSlide = (slide: BrochureSlide | null) => {
+    if (!slide) return
+    const notes = notesForSlide(slide.id)
+    if (notes.length === 0) return
+    const note = notes[0]
+    setManagingNote(note)
+    setManageNoteText(note.note_text || '')
+    setIsManageNoteEditing(false)
+    setShowManageNoteModal(true)
+  }
+
+  const handleUpdateManagedNote = async () => {
+    if (!managingNote || !manageNoteText.trim()) {
+      Alert.alert('Error', 'Please enter a note')
+      return
+    }
+    setIsSavingManageNote(true)
+    try {
+      const result = await OfflineFirstService.updateMeetingNote(managingNote.id, {
+        note_text: manageNoteText.trim(),
+      })
+      if (result.success) {
+        notifyActivityChange()
+        await loadSlideNotes()
+        setIsManageNoteEditing(false)
+        setManagingNote({ ...managingNote, note_text: manageNoteText.trim() })
+        Alert.alert('Success', 'Note updated')
+      } else {
+        Alert.alert('Error', result.error || 'Failed to update note')
+      }
+    } catch (error) {
+      console.error('DoctorGroupViewer: Failed to update note:', error)
+      Alert.alert('Error', 'Failed to update note')
+    } finally {
+      setIsSavingManageNote(false)
+    }
+  }
+
+  const handleDeleteManagedNote = () => {
+    if (!managingNote) return
+    Alert.alert(
+      'Delete Note',
+      `Delete the note for "${managingNote.slide_title || 'this slide'}"?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            setIsSavingManageNote(true)
+            try {
+              const result = await OfflineFirstService.deleteMeetingNote(managingNote.id)
+              if (result.success) {
+                notifyActivityChange()
+                await loadSlideNotes()
+                setShowManageNoteModal(false)
+                setManagingNote(null)
+                setManageNoteText('')
+                setIsManageNoteEditing(false)
+                Alert.alert('Success', 'Note deleted')
+              } else {
+                Alert.alert('Error', result.error || 'Failed to delete note')
+              }
+            } catch (error) {
+              console.error('DoctorGroupViewer: Failed to delete note:', error)
+              Alert.alert('Error', 'Failed to delete note')
+            } finally {
+              setIsSavingManageNote(false)
+            }
+          },
+        },
+      ],
+    )
   }
 
   const handlePreviousSlide = () => {
@@ -391,6 +511,8 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
       console.log('Note save result:', noteResult)
 
       if (noteResult.success) {
+        notifyActivityChange()
+        await loadSlideNotes()
         Alert.alert('Success', 'Note saved successfully!', [
           {
             text: 'OK',
@@ -459,6 +581,8 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
 
   // Safety check for current slide
   const currentSlide = slides && slides.length > 0 ? slides[Math.min(currentSlideIndex, slides.length - 1)] : null
+  const currentSlideNotes = notesForSlide(currentSlide?.id)
+  const currentSlideHasNotes = currentSlideNotes.length > 0
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
@@ -478,18 +602,33 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
                 <Text style={styles.groupNameText}>{groupName || 'Group'}</Text>
               </View>
 
-              {/* Add Notes Button - Absolute Center */}
+              {/* Add Notes + existing-note badge - Absolute Center */}
               <View style={styles.headerCenterContainer}>
-                <TouchableOpacity 
-                  style={styles.headerNotesButton} 
-                  onPress={() => {
-                    setCurrentSlideForNotes(currentSlide)
-                    loadAvailableMeetings() // Load meetings before opening modal
-                    setShowNotesModal(true)
-                  }}
-                >
-                  <Ionicons name="create" size={24} color="#ffffff" />
-                </TouchableOpacity>
+                <View style={styles.headerNotesRow}>
+                  {currentSlideHasNotes && (
+                    <TouchableOpacity
+                      style={styles.headerViewNoteButton}
+                      onPress={() => openManageNotesForSlide(currentSlide)}
+                    >
+                      <Ionicons name="document-text" size={22} color="#ffffff" />
+                      <View style={styles.noteBadge}>
+                        <Text style={styles.noteBadgeText}>
+                          {currentSlideNotes.length > 9 ? '9+' : String(currentSlideNotes.length)}
+                        </Text>
+                      </View>
+                    </TouchableOpacity>
+                  )}
+                  <TouchableOpacity 
+                    style={styles.headerNotesButton} 
+                    onPress={() => {
+                      setCurrentSlideForNotes(currentSlide)
+                      loadAvailableMeetings()
+                      setShowNotesModal(true)
+                    }}
+                  >
+                    <Ionicons name="create" size={24} color="#ffffff" />
+                  </TouchableOpacity>
+                </View>
               </View>
 
               {/* Spacer to balance layout */}
@@ -613,12 +752,168 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
                       </Text>
                       <Text style={styles.slideListItemOrder}>Slide #{index + 1}</Text>
                     </View>
+                    {notesForSlide(item.id).length > 0 && (
+                      <TouchableOpacity
+                        style={styles.slideListNoteBadge}
+                        onPress={() => {
+                          setCurrentSlideIndex(index)
+                          setShowSlideList(false)
+                          openManageNotesForSlide(item)
+                        }}
+                      >
+                        <Ionicons name="document-text" size={18} color="#10b981" />
+                      </TouchableOpacity>
+                    )}
                     {currentSlideIndex === index && (
                       <Ionicons name="checkmark-circle" size={24} color="#8b5cf6" />
                     )}
                   </TouchableOpacity>
                 )}
               />
+            </View>
+          </View>
+        </Modal>
+
+        {/* Manage existing slide note (view / edit / delete) */}
+        <Modal
+          visible={showManageNoteModal}
+          transparent
+          animationType="slide"
+          onRequestClose={() => {
+            setShowManageNoteModal(false)
+            setManagingNote(null)
+            setIsManageNoteEditing(false)
+          }}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>
+                  {isManageNoteEditing ? 'Edit Slide Note' : 'Slide Note'}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => {
+                    setShowManageNoteModal(false)
+                    setManagingNote(null)
+                    setIsManageNoteEditing(false)
+                  }}
+                >
+                  <Ionicons name="close" size={24} color="#6b7280" />
+                </TouchableOpacity>
+              </View>
+
+              {managingNote && (
+                <ScrollView style={styles.modalBody}>
+                  <View style={styles.slideInfoSection}>
+                    <Text style={styles.inputLabel}>Slide</Text>
+                    <Text style={styles.manageNoteSlideTitle}>
+                      #{managingNote.slide_order} — {managingNote.slide_title || 'Untitled'}
+                    </Text>
+                    <Text style={styles.manageNoteMeta}>
+                      Meeting:{' '}
+                      {meetingTitleById[managingNote.meeting_id] ||
+                        `${String(managingNote.meeting_id).slice(0, 8)}…`}
+                    </Text>
+                    {notesForSlide(managingNote.slide_id).length > 1 && (
+                      <ScrollView
+                        horizontal
+                        showsHorizontalScrollIndicator={false}
+                        style={styles.notePickerRow}
+                      >
+                        {notesForSlide(managingNote.slide_id).map((note) => (
+                          <TouchableOpacity
+                            key={note.id}
+                            style={[
+                              styles.notePickerChip,
+                              managingNote.id === note.id && styles.notePickerChipActive,
+                            ]}
+                            onPress={() => {
+                              setManagingNote(note)
+                              setManageNoteText(note.note_text || '')
+                              setIsManageNoteEditing(false)
+                            }}
+                          >
+                            <Text
+                              style={[
+                                styles.notePickerChipText,
+                                managingNote.id === note.id && styles.notePickerChipTextActive,
+                              ]}
+                              numberOfLines={1}
+                            >
+                              {meetingTitleById[note.meeting_id] || 'Note'}
+                            </Text>
+                          </TouchableOpacity>
+                        ))}
+                      </ScrollView>
+                    )}
+                  </View>
+
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.inputLabel}>Note</Text>
+                    {isManageNoteEditing ? (
+                      <TextInput
+                        style={[styles.input, styles.textArea]}
+                        placeholder="Enter your note..."
+                        multiline
+                        numberOfLines={5}
+                        value={manageNoteText}
+                        onChangeText={setManageNoteText}
+                        placeholderTextColor="#9ca3af"
+                        editable={!isSavingManageNote}
+                      />
+                    ) : (
+                      <View style={styles.manageNoteReadonly}>
+                        <Text style={styles.manageNoteReadonlyText}>
+                          {managingNote.note_text || '(empty)'}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                </ScrollView>
+              )}
+
+              <View style={styles.modalActions}>
+                {!isManageNoteEditing ? (
+                  <>
+                    <TouchableOpacity
+                      style={styles.deleteNoteButton}
+                      onPress={handleDeleteManagedNote}
+                      disabled={isSavingManageNote}
+                    >
+                      <Text style={styles.deleteNoteButtonText}>Delete</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.saveButton}
+                      onPress={() => setIsManageNoteEditing(true)}
+                      disabled={isSavingManageNote}
+                    >
+                      <Text style={styles.saveButtonText}>Edit</Text>
+                    </TouchableOpacity>
+                  </>
+                ) : (
+                  <>
+                    <TouchableOpacity
+                      style={styles.cancelButton}
+                      onPress={() => {
+                        setIsManageNoteEditing(false)
+                        setManageNoteText(managingNote?.note_text || '')
+                      }}
+                      disabled={isSavingManageNote}
+                    >
+                      <Text style={styles.cancelButtonText}>Cancel</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.saveButton}
+                      onPress={handleUpdateManagedNote}
+                      disabled={isSavingManageNote}
+                    >
+                      <Text style={styles.saveButtonText}>
+                        {isSavingManageNote ? 'Saving…' : 'Save'}
+                      </Text>
+                    </TouchableOpacity>
+                  </>
+                )}
+              </View>
             </View>
           </View>
         </Modal>
@@ -995,6 +1290,103 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     pointerEvents: "auto",  // Button itself captures touches
+  },
+  headerNotesRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    pointerEvents: "auto",
+  },
+  headerViewNoteButton: {
+    padding: 10,
+    backgroundColor: "rgba(59, 130, 246, 0.95)",
+    borderRadius: 24,
+    width: 48,
+    height: 48,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  noteBadge: {
+    position: "absolute",
+    top: -2,
+    right: -2,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: "#ef4444",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 4,
+  },
+  noteBadgeText: {
+    color: "#ffffff",
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  slideListNoteBadge: {
+    marginRight: 8,
+    padding: 6,
+    backgroundColor: "#ecfdf5",
+    borderRadius: 16,
+  },
+  manageNoteSlideTitle: {
+    fontSize: 15,
+    fontWeight: "600",
+    color: "#1f2937",
+    marginTop: 4,
+  },
+  manageNoteMeta: {
+    fontSize: 13,
+    color: "#6b7280",
+    marginTop: 6,
+  },
+  notePickerRow: {
+    marginTop: 12,
+  },
+  notePickerChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 16,
+    backgroundColor: "#f1f5f9",
+    marginRight: 8,
+    maxWidth: 160,
+  },
+  notePickerChipActive: {
+    backgroundColor: "#8b5cf6",
+  },
+  notePickerChipText: {
+    fontSize: 12,
+    color: "#475569",
+    fontWeight: "600",
+  },
+  notePickerChipTextActive: {
+    color: "#ffffff",
+  },
+  manageNoteReadonly: {
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    borderRadius: 10,
+    padding: 12,
+    minHeight: 100,
+  },
+  manageNoteReadonlyText: {
+    fontSize: 15,
+    color: "#1e293b",
+    lineHeight: 22,
+  },
+  deleteNoteButton: {
+    flex: 1,
+    backgroundColor: "#fee2e2",
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: "center",
+    marginRight: 8,
+  },
+  deleteNoteButtonText: {
+    color: "#dc2626",
+    fontSize: 15,
+    fontWeight: "600",
   },
   headerSpacer: {
     width: 48,  // Same width as close button to balance layout

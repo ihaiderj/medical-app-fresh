@@ -598,14 +598,20 @@ export class MRService {
     noteText: string,
     meetingId?: string,
     brochureTitle?: string,
+    slideTitle?: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
       if (!meetingId) {
         return { success: false, error: 'Meeting ID required for slide note update' }
       }
-      const payload: { note_text: string; brochure_title?: string } = { note_text: noteText }
+      const payload: { note_text: string; brochure_title?: string; slide_title?: string } = {
+        note_text: noteText,
+      }
       if (brochureTitle !== undefined) {
         payload.brochure_title = brochureTitle
+      }
+      if (slideTitle !== undefined) {
+        payload.slide_title = slideTitle
       }
       await apiClient.patch(`/api/mr/meetings/${meetingId}/notes/${noteId}/`, payload)
       return { success: true }
@@ -700,12 +706,32 @@ export class MRService {
     activityType: string,
     description: string,
     metadata?: unknown,
+    extras?: {
+      entity_type?: string
+      entity_id?: string
+      details?: string
+    },
   ): Promise<{ success: boolean; data?: unknown; error?: string }> {
     try {
+      let parsedMeta: Record<string, unknown> | undefined
+      if (typeof metadata === 'string') {
+        try {
+          parsedMeta = JSON.parse(metadata)
+        } catch {
+          parsedMeta = { raw: metadata }
+        }
+      } else if (metadata && typeof metadata === 'object') {
+        parsedMeta = metadata as Record<string, unknown>
+      }
+
       const data = await apiClient.post('/api/activity-logs/', {
         activity_type: activityType,
+        action: activityType,
         description,
-        metadata,
+        details: extras?.details || description,
+        entity_type: extras?.entity_type,
+        entity_id: extras?.entity_id || parsedMeta?.server_id || parsedMeta?.entity_id,
+        metadata: parsedMeta ?? metadata,
       })
       return { success: true, data }
     } catch (error) {
@@ -929,32 +955,50 @@ export class MRService {
     mr_id: string
     brochure_id: string
     brochure_title: string
-    brochure_data_url: string
+    brochure_data?: {
+      slides?: unknown[]
+      groups?: unknown[]
+      totalSlides?: number
+      brochure_data_url?: string
+    }
+    /** @deprecated prefer brochure_data.slides/groups — kept for older callers */
+    brochure_data_url?: string
     last_modified: string
   }): Promise<{ success: boolean; data?: { id?: string; last_modified?: string }; error?: string }> {
     try {
-      const brochureDataPath = `${FileSystem.documentDirectory}brochures/${params.brochure_id}/brochure_data.json`
-      let brochureData: { slides?: unknown[]; groups?: unknown[]; totalSlides?: number } = { slides: [], groups: [] }
+      const provided = params.brochure_data || {}
+      let slides = provided.slides
+      let groups = provided.groups
+      let totalSlides = provided.totalSlides
 
-      try {
-        const fileInfo = await FileSystem.getInfoAsync(brochureDataPath)
-        if (fileInfo.exists) {
-          const fileContent = await FileSystem.readAsStringAsync(brochureDataPath)
-          brochureData = JSON.parse(fileContent)
+      // Fallback: read local file if caller still only passes a URL / no structured data.
+      if ((!slides || !groups) && !provided.brochure_data_url && !params.brochure_data_url) {
+        try {
+          const brochureDataPath = `${FileSystem.documentDirectory}brochures/${params.brochure_id}/brochure_data.json`
+          const fileInfo = await FileSystem.getInfoAsync(brochureDataPath)
+          if (fileInfo.exists) {
+            const fileContent = await FileSystem.readAsStringAsync(brochureDataPath)
+            const parsed = JSON.parse(fileContent)
+            slides = slides || parsed.slides || []
+            groups = groups || parsed.groups || []
+            totalSlides = totalSlides || parsed.totalSlides || (slides as unknown[])?.length || 0
+          }
+        } catch (fileError) {
+          console.warn('Could not read local brochure data file:', fileError)
         }
-      } catch (fileError) {
-        console.warn('Could not read local brochure data file:', fileError)
       }
+
+      const brochureDataUrl = provided.brochure_data_url || params.brochure_data_url
 
       const data = await apiClient.put<{ id?: string; last_modified?: string }>('/api/mr/brochure-sync/', {
         brochure_id: params.brochure_id,
         brochure_title: params.brochure_title,
         brochure_data: {
-          brochure_data_url: resolveMediaUrl(params.brochure_data_url),
-          slides: brochureData.slides || [],
-          groups: brochureData.groups || [],
+          ...(brochureDataUrl ? { brochure_data_url: resolveMediaUrl(brochureDataUrl) } : {}),
+          slides: slides || [],
+          groups: groups || [],
           last_modified: params.last_modified,
-          total_slides: brochureData.totalSlides || brochureData.slides?.length || 0,
+          total_slides: totalSlides || (slides as unknown[])?.length || 0,
         },
       })
 

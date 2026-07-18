@@ -58,7 +58,23 @@ interface SlideManagementScreenProps {
 }
 
 export default function SlideManagementScreen({ navigation, route }: SlideManagementScreenProps) {
-  const { brochureId, brochureTitle } = route.params || {}
+  const { brochureId, brochureTitle, savedBrochureId, customTitle } = route.params || {}
+
+  const getBrochureSyncHints = () => ({
+    savedBrochureId: savedBrochureId as string | undefined,
+    customTitle: (customTitle || brochureTitle) as string | undefined,
+  })
+
+  const markBrochureModified = (
+    userId?: string,
+    activity?: { type: string; description: string; metadata?: Record<string, unknown> },
+  ) =>
+    BrochureManagementService.markBrochureAsModified(
+      brochureId,
+      userId,
+      activity,
+      getBrochureSyncHints(),
+    )
 
   // Modal queue for iOS-safe modal transitions
   const modalQueue = useModalQueue()
@@ -147,20 +163,19 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
     
     return () => {
       // Trigger exit sync when leaving the screen
-      console.log('SlideManagement: Component unmounting, triggering exit sync')
-      performExitSync()
+      console.log('SlideManagement: Component unmounting, queuing brochure changes')
+      queueBrochureChangesOnExit()
       ScreenOrientation.unlockAsync()
       subscription?.remove()
     }
   }, [])
 
-  // Perform sync when exiting view mode
-  const performExitSync = async () => {
+  // Queue brochure changes when leaving — upload only via SyncService.syncNow()
+  const queueBrochureChangesOnExit = async () => {
     try {
-      console.log('🔵 BROCHURE_SYNC: Exiting view mode, checking for changes to sync')
+      console.log('🔵 BROCHURE_SYNC: Exiting view mode, ensuring changes are queued (no upload)')
       const userResult = await AuthService.getCurrentUser()
       if (userResult.success && userResult.user && userResult.user.role === 'mr') {
-        // Check if current brochure needs sync
         const brochureResult = await BrochureManagementService.getBrochureData(brochureId)
         if (brochureResult.success && brochureResult.data) {
           console.log('🔵 BROCHURE_SYNC: Brochure sync status check:')
@@ -168,41 +183,36 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           console.log('🔵 BROCHURE_SYNC: - isModified:', brochureResult.data.isModified)
           console.log('🔵 BROCHURE_SYNC: - Brochure ID:', brochureId)
           console.log('🔵 BROCHURE_SYNC: - Brochure Title:', brochureTitle)
-          
+          console.log('🔵 BROCHURE_SYNC: - Saved brochure hint:', savedBrochureId || 'none')
+
           if (brochureResult.data.needsSync || brochureResult.data.isModified) {
-            console.log('🔵 BROCHURE_SYNC: Found changes to sync, uploading to server')
+            console.log('🔵 BROCHURE_SYNC: Found local changes — queuing for SyncService.syncNow()')
             console.log('🔵 BROCHURE_SYNC: Current local slides count:', brochureResult.data.slides.length)
             console.log('🔵 BROCHURE_SYNC: Current local groups count:', brochureResult.data.groups.length)
-            console.log('🔵 BROCHURE_SYNC: Current slide titles:', brochureResult.data.slides.slice(0, 5).map(s => s.title))
-            console.log('🔵 BROCHURE_SYNC: Current group names:', brochureResult.data.groups.map(g => g.name))
-            console.log('🔵 BROCHURE_SYNC: All slide IDs:', brochureResult.data.slides.map(s => s.id))
-            console.log('🔵 BROCHURE_SYNC: All group IDs:', brochureResult.data.groups.map(g => g.id))
-          
-          const uploadResult = await BrochureManagementService.syncBrochureToServer(
-            userResult.user.id,
-            brochureId,
-            brochureTitle,
-            brochureResult.data.slides,
-            brochureResult.data.groups
-          )
 
-          if (uploadResult.success) {
-              console.log('🔵 BROCHURE_SYNC: Upload successful, marking as synced')
-              console.log('🔵 BROCHURE_SYNC: Server lastModified:', uploadResult.lastModified)
-            await BrochureManagementService.markBrochureAsSynced(brochureId)
-              console.log('🔵 BROCHURE_SYNC: Changes synced successfully on exit')
+            const queueResult = await BrochureManagementService.syncBrochureToServer(
+              userResult.user.id,
+              brochureId,
+              (customTitle || brochureTitle) as string,
+              brochureResult.data.slides,
+              brochureResult.data.groups,
+              getBrochureSyncHints(),
+            )
+
+            if (queueResult.success) {
+              console.log('🔵 BROCHURE_SYNC: Changes queued — tap Sync on dashboard when ready to upload')
             } else {
-              console.error('🔵 BROCHURE_SYNC: Upload failed:', uploadResult.error)
-          }
+              console.warn('🔵 BROCHURE_SYNC: Queue on exit failed:', queueResult.error)
+            }
           } else {
-            console.log('🔵 BROCHURE_SYNC: No changes to sync, brochure is up to date')
-        }
+            console.log('🔵 BROCHURE_SYNC: No changes to queue, brochure is up to date')
+          }
         }
       } else {
-        console.log('🔵 BROCHURE_SYNC: Skipping sync - user is not MR role')
+        console.log('🔵 BROCHURE_SYNC: Skipping queue - user is not MR role')
       }
     } catch (error) {
-      console.error('🔵 BROCHURE_SYNC: Exit sync error:', error)
+      console.warn('🔵 BROCHURE_SYNC: Exit queue error:', error)
     }
   }
 
@@ -494,7 +504,24 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         console.log(`🟡 SLIDE_RENAME: Marking brochure ${brochureId} as modified for sync`)
         const userResult = await AuthService.getCurrentUser()
         const userId = userResult.success && userResult.user ? userResult.user.id : undefined
-        await BrochureManagementService.markBrochureAsModified(brochureId, userId)
+        await markBrochureModified(userId, {
+          type: 'slide_renamed',
+          description:
+            successCount === 1
+              ? `Renamed slide to: ${renamedSlides[0]?.newTitle}`
+              : `Renamed ${successCount} slides`,
+          metadata: {
+            renamed_slides: renamedSlides,
+            // Prefer backend drill-down keys for single rename
+            ...(successCount === 1 && renamedSlides[0]
+              ? {
+                  slide_id: renamedSlides[0].slideId,
+                  from: renamedSlides[0].oldTitle,
+                  to: renamedSlides[0].newTitle,
+                }
+              : {}),
+          },
+        })
         console.log(`🟡 SLIDE_RENAME: Brochure marked as modified, will sync on next sync operation`)
         
         const message = successCount === 1 
@@ -560,7 +587,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         groupName,
         selectedSlides,
         '#8b5cf6',
-        groupCreationMode === 'doctor' && selectedDoctor ? selectedDoctor.id : undefined
+        groupCreationMode === 'doctor' && selectedDoctor ? selectedDoctor.id : undefined,
+        getBrochureSyncHints(),
       )
 
       console.log('🟢 GROUP_CREATE: Group creation result:', {
@@ -582,7 +610,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         console.log(`🟢 GROUP_CREATE: Marking brochure ${brochureId} as modified for sync`)
         AuthService.getCurrentUser().then(userResult => {
           const userId = userResult.success && userResult.user ? userResult.user.id : undefined
-          return BrochureManagementService.markBrochureAsModified(brochureId, userId)
+          // Activity already logged by createSlideGroup; only re-queue if needed without duplicate activity
+          return markBrochureModified(userId)
         }).then(() => {
           console.log(`🟢 GROUP_CREATE: Brochure marked as modified, will sync on next sync operation`)
         }).catch(err => {
@@ -847,8 +876,10 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         // Use OfflineFirstService to save to local DB first (offline-first architecture)
         const newMeetingResult = await OfflineFirstService.createMeeting({
           mr_id: userResult.user.id,
-          doctor_id: selectedDoctor.id || selectedDoctor.server_id,
-          doctor_server_id: selectedDoctor.server_id,
+          // Always prefer the local doctor row id. Falling back to server_id alone
+          // can make MeetingsScreen treat the meeting as orphaned before/during sync.
+          doctor_id: selectedDoctor.id || selectedDoctor.doctor_id || selectedDoctor.server_id,
+          doctor_server_id: selectedDoctor.server_id || selectedDoctor.doctor_id,
           brochure_id: brochureId || undefined,
           title: newMeetingForm.title.trim(),
           purpose: newMeetingForm.purpose.trim(),
@@ -967,7 +998,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
           text: 'Delete',
           style: 'destructive',
           onPress: async () => {
-            const result = await BrochureManagementService.deleteSlide(brochureId, slide.id)
+            const result = await BrochureManagementService.deleteSlide(
+              brochureId,
+              slide.id,
+              getBrochureSyncHints(),
+            )
             if (result.success) {
               loadBrochureData()
               Alert.alert('Success', 'Slide deleted successfully')
@@ -1088,7 +1123,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
               )
 
               // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
-              await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+              await markBrochureModified(undefined, {
+                type: 'group_deleted',
+                description: `Deleted slide group: ${group.name}`,
+                metadata: { group_id: selectedGroup, group_name: group.name },
+              }).catch(err => {
                 console.warn('Failed to mark brochure as modified after group deletion:', err);
               });
 
@@ -1114,6 +1153,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
       // Update group name
       const groupIndex = brochureData.groups.findIndex(g => g.id === selectedGroup)
       if (groupIndex !== -1) {
+        const oldGroupName = brochureData.groups[groupIndex].name
         brochureData.groups[groupIndex].name = newGroupName.trim()
         brochureData.updatedAt = new Date().toISOString()
 
@@ -1125,7 +1165,16 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         )
 
         // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
-        await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+        await markBrochureModified(undefined, {
+          type: 'group_renamed',
+          description: `Renamed slide group to: ${newGroupName.trim()}`,
+          metadata: {
+            group_id: selectedGroup,
+            group_name: newGroupName.trim(),
+            from: oldGroupName,
+            to: newGroupName.trim(),
+          },
+        }).catch(err => {
           console.warn('Failed to mark brochure as modified after group rename:', err);
         });
 
@@ -1161,7 +1210,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         const addResult = await BrochureManagementService.addSlideImage(
           brochureId,
           asset.uri,
-          slideTitle
+          slideTitle,
+          getBrochureSyncHints(),
         )
 
         if (addResult.success) {
@@ -1232,7 +1282,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
       // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
       console.log('🟢 GROUP_ADD_SLIDES: Marking brochure as modified for sync')
-      await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+      await markBrochureModified(undefined, {
+        type: 'group_slides_added',
+        description: `Added ${newSlideIds.length} slide(s) to a group`,
+        metadata: { group_id: groupId, slide_ids: newSlideIds },
+      }).catch(err => {
         console.warn('🟢 GROUP_ADD_SLIDES: Failed to mark brochure as modified:', err);
       });
 
@@ -1310,6 +1364,17 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                 `${brochureDir}brochure_data.json`,
                 JSON.stringify(brochureData, null, 2)
               )
+
+              await markBrochureModified(undefined, {
+                type: 'slide_deleted',
+                description:
+                  deletedCount === 1
+                    ? 'Deleted 1 slide'
+                    : `Deleted ${deletedCount} slides`,
+                metadata: { deleted_count: deletedCount, slide_ids: selectedSlides },
+              }).catch(err => {
+                console.warn('Failed to mark brochure as modified after bulk slide delete:', err);
+              });
 
               exitSelectionMode()
               loadBrochureData()
@@ -1397,7 +1462,11 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
 
               // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
               console.log('🟡 GROUP_REMOVE_SLIDES: Marking brochure as modified for sync')
-              await BrochureManagementService.markBrochureAsModified(brochureId).catch(err => {
+              await markBrochureModified(undefined, {
+                type: 'group_slides_removed',
+                description: `Removed ${selectedSlides.length} slide(s) from a group`,
+                metadata: { group_id: selectedGroup, slide_ids: selectedSlides },
+              }).catch(err => {
                 console.warn('🟡 GROUP_REMOVE_SLIDES: Failed to mark brochure as modified:', err);
               });
 
@@ -1435,8 +1504,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
         <TouchableOpacity
           style={styles.backButton}
           onPress={async () => {
-            // Trigger exit sync before navigation
-            await performExitSync()
+            // Queue local changes only — upload via Sync button / dashboard SyncService.syncNow()
+            await queueBrochureChangesOnExit()
             navigation.goBack()
           }}
         >
@@ -1449,9 +1518,23 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
              {/* Manual Sync Button - Available in Both Orientations */}
              <TouchableOpacity
                style={styles.syncButton}
-               onPress={() => {
-                 // TODO: Replace with SyncService.syncUp() when ready
-                 console.warn('Sync button: SmartSyncService deleted, use SyncService.syncUp() instead')
+               onPress={async () => {
+                 try {
+                   const { SyncService } = await import('../../services/SyncService')
+                   const userResult = await AuthService.getCurrentUser()
+                   if (userResult.success && userResult.user) {
+                     await markBrochureModified(userResult.user.id)
+                   }
+                   const result = await SyncService.syncNow()
+                   if (result.success) {
+                     Alert.alert('Sync', result.message || 'Changes synced successfully')
+                   } else {
+                     Alert.alert('Sync', result.message || 'Some changes could not be synced yet')
+                   }
+                 } catch (err) {
+                   console.warn('Manual sync failed:', err)
+                   Alert.alert('Sync', 'Failed to sync. Changes remain queued for next sync.')
+                 }
                }}
              >
                <Ionicons
@@ -1604,23 +1687,27 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                       <TouchableOpacity style={styles.compactIconButton} onPress={handleAddSlide}>
                         <Ionicons name="add-circle" size={16} color="#8b5cf6" />
                       </TouchableOpacity>
-                      <TouchableOpacity style={styles.compactIconButton} onPress={() => {
-                        if (selectedSlides.length === 0) {
-                          Alert.alert('Info', 'Select slides first by long pressing them')
-                          return
-                        }
-                        if (selectedSlides.length === 1) {
-                          const slideToRename = slides.find(slide => slide.id === selectedSlides[0])
-                          setNewSlideTitle(slideToRename?.title || '')
-                        } else {
-                          setNewSlideTitle('')
-                        }
-                        setShowRenameModal(true)
-                      }}>
-                        <Ionicons name="create" size={16} color="#6b7280" />
-                      </TouchableOpacity>
                     </>
                   )}
+
+                  <TouchableOpacity
+                    style={selectedGroup ? styles.compactGroupActionButton : styles.compactIconButton}
+                    onPress={() => {
+                      if (selectedSlides.length === 0) {
+                        Alert.alert('Info', 'Select slides first by long pressing them')
+                        return
+                      }
+                      if (selectedSlides.length === 1) {
+                        const slideToRename = slides.find(slide => slide.id === selectedSlides[0])
+                        setNewSlideTitle(slideToRename?.title || '')
+                      } else {
+                        setNewSlideTitle('')
+                      }
+                      setShowRenameModal(true)
+                    }}
+                  >
+                    <Ionicons name="create" size={16} color={selectedGroup ? "#3b82f6" : "#6b7280"} />
+                  </TouchableOpacity>
 
                   {selectedGroup ? (
                     <>
@@ -1631,7 +1718,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                           setShowRenameGroupModal(true)
                         }
                       }}>
-                        <Ionicons name="create" size={16} color="#8b5cf6" />
+                        <Ionicons name="pencil" size={16} color="#8b5cf6" />
                       </TouchableOpacity>
                       <TouchableOpacity style={styles.compactGroupActionButton} onPress={() => handleDeleteGroup()}>
                         <Ionicons name="trash" size={16} color="#ef4444" />
@@ -1787,27 +1874,30 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                     >
                       <Ionicons name="add-circle" size={18} color="#8b5cf6" />
                     </TouchableOpacity>
-
-                    <TouchableOpacity
-                      style={styles.iconButton}
-                      onPress={() => {
-                        if (selectedSlides.length === 0) {
-                          Alert.alert('Info', 'Select slides first by long pressing them')
-                          return
-                        }
-                        if (selectedSlides.length === 1) {
-                          const slideToRename = slides.find(slide => slide.id === selectedSlides[0])
-                          setNewSlideTitle(slideToRename?.title || '')
-                        } else {
-                          setNewSlideTitle('')
-                        }
-                        setShowRenameModal(true)
-                      }}
-                    >
-                      <Ionicons name="create" size={18} color="#6b7280" />
-                    </TouchableOpacity>
                   </>
                 )}
+
+                <TouchableOpacity
+                  style={selectedGroup ? styles.groupActionButton : styles.iconButton}
+                  onPress={() => {
+                    if (selectedSlides.length === 0) {
+                      Alert.alert('Info', 'Select slides first by long pressing them')
+                      return
+                    }
+                    if (selectedSlides.length === 1) {
+                      const slideToRename = slides.find(slide => slide.id === selectedSlides[0])
+                      setNewSlideTitle(slideToRename?.title || '')
+                    } else {
+                      setNewSlideTitle('')
+                    }
+                    setShowRenameModal(true)
+                  }}
+                >
+                  <Ionicons name="create" size={18} color={selectedGroup ? "#3b82f6" : "#6b7280"} />
+                  {selectedGroup ? (
+                    <Text style={[styles.groupActionText, { color: "#3b82f6" }]}>Rename Slide</Text>
+                  ) : null}
+                </TouchableOpacity>
 
                 {selectedGroup ? (
                   <>
@@ -1821,7 +1911,7 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
                         }
                       }}
                     >
-                      <Ionicons name="create" size={18} color="#8b5cf6" />
+                      <Ionicons name="pencil" size={18} color="#8b5cf6" />
                       <Text style={styles.groupActionText}>Rename Group</Text>
                     </TouchableOpacity>
 

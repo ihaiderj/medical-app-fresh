@@ -1,0 +1,16 @@
+---
+description: Every new local write must log activity and queue sync when needed
+alwaysApply: true
+---
+
+# Offline-first mutations (MR app)
+
+When adding **any new create / update / delete** that changes user data:
+
+1. **Write local SQLite first** (`LocalDatabaseService` / `OfflineFirstService`).
+2. **Queue for sync** via `addToSyncQueue` (or the LocalDB helper that already queues) unless the op is server-authoritative and marked `skipSyncQueue`.
+3. **Activity log** for user-visible changes (`logMeetingRelatedActivity` / `createActivityLog`) with a clear type + message (e.g. `slide_note_updated`).
+4. **Notify UI** when relevant (`notifyActivityChange`, meeting/doctor/brochure notifies).
+5. **Wire SyncService** if a new table/entity is involved (push enrich, dependency order, reconcile).
+
+Do not add fire-and-forget API calls that bypass the queue for MR data the user expects to backup with Sync.

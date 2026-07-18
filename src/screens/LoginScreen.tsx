@@ -507,7 +507,7 @@ export default function LoginScreen({ navigation }: LoginScreenProps) {
                 }
               });
               
-              const syncResult = await SyncService.syncUpFull(result.user.id);
+              const syncResult = await SyncService.syncNow(result.user.id);
               if (syncResult.success) {
                 console.log('✅ LOGIN DEBUG: Backup sync completed successfully');
                 

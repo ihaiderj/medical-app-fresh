@@ -3907,6 +3907,25 @@ export class LocalDatabaseService {
 
       // Cascade soft-delete follow-ups and notes for this meeting
       await this.cascadeSoftDeleteMeetingChildren(id);
+
+      if (meeting) {
+        try {
+          await this.createActivityLog({
+            user_id: meeting.mr_id,
+            mr_id: meeting.mr_id,
+            activity_type: 'meeting_deleted',
+            description: `Deleted meeting: ${meeting.title}`,
+            metadata: JSON.stringify({
+              meeting_id: id,
+              doctor_id: meeting.doctor_id,
+              server_id: meeting.server_id ?? null,
+            }),
+            is_deleted: false,
+          });
+        } catch (activityError) {
+          console.warn('LocalDB: Failed to log meeting delete activity:', activityError);
+        }
+      }
       
       console.log('LocalDB: Meeting deleted (with cascade):', id);
     } catch (error) {
@@ -3946,9 +3965,59 @@ export class LocalDatabaseService {
         });
       }
 
-      console.log(`LocalDB: Cascade-deleted ${followUps.length} follow-ups and ${notes.length} notes for meeting ${meetingId}`);
+      // Soft-delete general notes as well
+      let generalNotesCount = 0;
+      try {
+        await this.ensureMeetingGeneralNotesSchema();
+        const generalNotes = await this.db.getAllAsync<any>(
+          `SELECT * FROM meeting_general_notes WHERE meeting_id = ? AND is_deleted = 0`, [meetingId]
+        );
+        generalNotesCount = generalNotes.length;
+        for (const gnote of generalNotes) {
+          await this.db.runAsync(
+            `UPDATE meeting_general_notes SET is_deleted = 1, updated_at = ?, sync_status = 'pending' WHERE id = ?`,
+            [now, gnote.id]
+          );
+          await this.addToSyncQueue('delete', 'meeting_general_notes', gnote.id, {
+            ...gnote, is_deleted: true,
+          });
+        }
+      } catch (gErr) {
+        console.warn('LocalDB: Cascade soft-delete of general notes failed:', gErr);
+      }
+
+      console.log(
+        `LocalDB: Cascade-deleted ${followUps.length} follow-ups, ${notes.length} slide notes, ` +
+          `${generalNotesCount} general notes for meeting ${meetingId}`,
+      );
     } catch (error) {
       console.warn('LocalDB: Cascade soft-delete partial failure (meeting children):', error);
+    }
+  }
+
+  /**
+   * Best-effort activity log for meeting-related user actions (notes / follow-ups).
+   * Never throws — activity logging must not block the primary CRUD.
+   */
+  private static async logMeetingRelatedActivity(
+    meetingId: string,
+    activityType: string,
+    description: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      const meeting = await this.getMeetingById(meetingId);
+      if (!meeting?.mr_id) return;
+      await this.createActivityLog({
+        user_id: meeting.mr_id,
+        mr_id: meeting.mr_id,
+        activity_type: activityType,
+        description,
+        metadata: JSON.stringify({ meeting_id: meetingId, ...(metadata || {}) }),
+        is_deleted: false,
+      });
+    } catch (error) {
+      console.warn(`LocalDB: Failed to log ${activityType}:`, error);
     }
   }
 
@@ -4266,6 +4335,17 @@ export class LocalDatabaseService {
 
       if (!skipSyncQueue) {
         await this.addToSyncQueue('create', 'meeting_notes', id, note);
+        await this.logMeetingRelatedActivity(
+          note.meeting_id,
+          'slide_note_added',
+          `Added slide note: ${note.slide_title || 'Untitled slide'}`,
+          {
+            note_id: id,
+            slide_id: note.slide_id,
+            brochure_id: note.brochure_id,
+            brochure_title: note.brochure_title,
+          },
+        );
       }
       
       console.log('LocalDB: Meeting note created locally:', id);
@@ -4303,6 +4383,60 @@ export class LocalDatabaseService {
       })) as LocalMeetingNote[];
     } catch (error) {
       console.error('LocalDB: Failed to get meeting notes:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Notes for a saved brochure presentation (by brochure/storage id and/or slide ids).
+   */
+  static async getMeetingNotesForBrochureSlides(
+    brochureId: string,
+    slideIds: string[] = [],
+  ): Promise<LocalMeetingNote[]> {
+    await this.initialize();
+
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const data = await AsyncStorage.getItem('meeting_notes');
+        const notes: LocalMeetingNote[] = data ? JSON.parse(data) : [];
+        const slideSet = new Set(slideIds.filter(Boolean));
+        return notes
+          .filter(
+            (n) =>
+              !n.is_deleted &&
+              (n.brochure_id === brochureId || (slideSet.size > 0 && slideSet.has(n.slide_id))),
+          )
+          .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+      }
+
+      if (slideIds.length === 0) {
+        const result = await this.db.getAllAsync(
+          `SELECT * FROM meeting_notes
+           WHERE brochure_id = ? AND is_deleted = 0
+           ORDER BY updated_at DESC`,
+          [brochureId],
+        );
+        return (result || []).map((row: any) => ({
+          ...row,
+          is_deleted: Boolean(row.is_deleted),
+        })) as LocalMeetingNote[];
+      }
+
+      const placeholders = slideIds.map(() => '?').join(',');
+      const result = await this.db.getAllAsync(
+        `SELECT * FROM meeting_notes
+         WHERE is_deleted = 0
+           AND (brochure_id = ? OR slide_id IN (${placeholders}))
+         ORDER BY updated_at DESC`,
+        [brochureId, ...slideIds],
+      );
+      return (result || []).map((row: any) => ({
+        ...row,
+        is_deleted: Boolean(row.is_deleted),
+      })) as LocalMeetingNote[];
+    } catch (error) {
+      console.error('LocalDB: Failed to get meeting notes for brochure slides:', error);
       throw error;
     }
   }
@@ -4347,21 +4481,32 @@ export class LocalDatabaseService {
   /**
    * Update meeting note
    */
-  static async updateMeetingNote(id: string, updates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean }): Promise<void> {
+  static async updateMeetingNote(
+    id: string,
+    updates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean; skipActivityLog?: boolean },
+  ): Promise<void> {
     await this.initialize();
     
     try {
       const skipSyncQueue = updates.skipSyncQueue || false;
+      const skipActivityLog = updates.skipActivityLog || false;
       const now = new Date().toISOString();
       const updateFields = [];
       const values = [];
 
       // Create a mutable copy of updates to modify
-      let finalUpdates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean } = { ...updates };
+      let finalUpdates: Partial<LocalMeetingNote> & { skipSyncQueue?: boolean; skipActivityLog?: boolean } = { ...updates };
 
       // Build dynamic update query
       Object.entries(finalUpdates).forEach(([key, value]) => {
-        if (key !== 'id' && key !== 'created_at' && key !== 'skipSyncQueue' && key !== 'sync_status' && key !== 'updated_at') {
+        if (
+          key !== 'id' &&
+          key !== 'created_at' &&
+          key !== 'skipSyncQueue' &&
+          key !== 'skipActivityLog' &&
+          key !== 'sync_status' &&
+          key !== 'updated_at'
+        ) {
           updateFields.push(`${key} = ?`);
           values.push(value);
         }
@@ -4377,9 +4522,21 @@ export class LocalDatabaseService {
 
       // Add to sync queue only if not skipping
       if (!skipSyncQueue) {
-      const updatedNote = await this.getMeetingNoteById(id);
-      if (updatedNote) {
-        await this.addToSyncQueue('update', 'meeting_notes', id, updatedNote);
+        const updatedNote = await this.getMeetingNoteById(id);
+        if (updatedNote) {
+          await this.addToSyncQueue('update', 'meeting_notes', id, updatedNote);
+          if (!skipActivityLog) {
+            await this.logMeetingRelatedActivity(
+              updatedNote.meeting_id,
+              'slide_note_updated',
+              `Updated slide note: ${updatedNote.slide_title || 'Untitled slide'}`,
+              {
+                note_id: id,
+                slide_id: updatedNote.slide_id,
+                brochure_id: updatedNote.brochure_id,
+              },
+            );
+          }
         }
       }
 
@@ -4388,6 +4545,224 @@ export class LocalDatabaseService {
       console.error('LocalDB: Failed to update meeting note:', error);
       throw error;
     }
+  }
+
+  /**
+   * Whether the note's brochure_id still maps to an active (non-deleted) saved brochure.
+   * Prefer exact saved-copy ids (storage/id/server). A shared source brochure_id alone is
+   * not enough if the note's brochure_title points at a deleted custom title (e.g. "66").
+   */
+  static async isMeetingNoteBrochureActive(
+    brochureId?: string | null,
+    brochureTitle?: string | null,
+  ): Promise<boolean> {
+    const raw = String(brochureId || '').trim();
+    if (!raw) return false;
+    await this.initialize();
+
+    const title = String(brochureTitle || '').trim().toLowerCase();
+
+    const matchesRow = (row: {
+      id?: string
+      storage_id?: string
+      brochure_id?: string
+      server_id?: string
+      custom_title?: string
+      brochure_title?: string
+      is_deleted?: boolean
+    }) => {
+      if (row.is_deleted) return false;
+      // Exact saved-copy identity
+      if (row.storage_id === raw || row.id === raw || row.server_id === raw) return true;
+      return false;
+    };
+
+    const catalogMatchesRow = (
+      row: { brochure_id?: string; is_deleted?: boolean },
+      canonical: string,
+    ) => {
+      if (row.is_deleted) return false;
+      return (
+        row.brochure_id === raw ||
+        resolveServerBrochureId(row.brochure_id || '') === canonical
+      );
+    };
+
+    const titleMatchesActive = (
+      rows: Array<{ custom_title?: string; brochure_title?: string; is_deleted?: boolean }>,
+    ) => {
+      if (!title) return true;
+      return rows.some((row) => {
+        if (row.is_deleted) return false;
+        const custom = String(row.custom_title || '').trim().toLowerCase();
+        const base = String(row.brochure_title || '').trim().toLowerCase();
+        return custom === title || base === title;
+      });
+    };
+
+    if (this.isUsingAsyncStorage()) {
+      const data = await AsyncStorage.getItem('saved_brochures');
+      const rows: LocalSavedBrochure[] = data ? JSON.parse(data) : [];
+      const active = rows.filter((r) => !r.is_deleted);
+      if (active.some(matchesRow)) return true;
+      const canonical = resolveServerBrochureId(raw);
+      const catalogHits = active.filter((r) => catalogMatchesRow(r, canonical));
+      if (catalogHits.length === 0) return false;
+      // Shared source id — only keep if title still belongs to an active copy
+      return titleMatchesActive(catalogHits);
+    }
+
+    try {
+      const rows = (await this.db.getAllAsync(
+        `SELECT id, storage_id, brochure_id, server_id, custom_title, brochure_title
+         FROM saved_brochures WHERE is_deleted = 0`,
+      )) as Array<{
+        id: string
+        storage_id?: string
+        brochure_id?: string
+        server_id?: string
+        custom_title?: string
+        brochure_title?: string
+      }>;
+      if (rows.some((row) => matchesRow(row))) return true;
+      const canonical = resolveServerBrochureId(raw);
+      const catalogHits = rows.filter((r) => catalogMatchesRow(r, canonical));
+      if (catalogHits.length === 0) return false;
+      return titleMatchesActive(catalogHits);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Refresh note brochure_title (and optionally slide_title) from the live saved copy.
+   * Returns number of notes updated/queued.
+   */
+  static async refreshMeetingNoteBrochureTitlesForMr(mrId: string): Promise<number> {
+    await this.initialize();
+    const notes = await this.getMeetingNotesForMr(mrId);
+    let updated = 0;
+    for (const note of notes) {
+      if (note.is_deleted || !note.brochure_id) continue;
+      const { brochureTitle } = await this.resolveNoteBrochure(note.brochure_id);
+      if (!brochureTitle || brochureTitle === note.brochure_title) continue;
+      // Prefer exact saved-copy title when resolve finds one
+      await this.updateMeetingNote(note.id, {
+        brochure_title: brochureTitle,
+        skipActivityLog: true,
+      });
+      updated++;
+    }
+    if (updated > 0) {
+      console.log(`LocalDB: Refreshed brochure_title on ${updated} meeting note(s)`);
+    }
+    return updated;
+  }
+
+  /**
+   * Keep meeting note slide titles in sync after a slide rename; queue note updates for sync.
+   */
+  static async cascadeSlideTitleToMeetingNotes(
+    brochureId: string,
+    slideId: string,
+    newTitle: string,
+  ): Promise<number> {
+    await this.initialize();
+    const title = String(newTitle || '').trim();
+    if (!title || !slideId) return 0;
+
+    const brochureKeys = new Set<string>([brochureId].filter(Boolean));
+    try {
+      const saved = await this.getSavedBrochureRecordById(brochureId);
+      if (saved) {
+        if (saved.id) brochureKeys.add(saved.id);
+        if (saved.storage_id) brochureKeys.add(saved.storage_id);
+        if (saved.brochure_id) brochureKeys.add(String(saved.brochure_id));
+      } else {
+        // brochureId may be a storage_id — find matching saved rows
+        if (!this.isUsingAsyncStorage() && this.db) {
+          const rows = (await this.db.getAllAsync(
+            `SELECT id, storage_id, brochure_id FROM saved_brochures
+             WHERE is_deleted = 0 AND (id = ? OR storage_id = ?)`,
+            [brochureId, brochureId],
+          )) as Array<{ id: string; storage_id?: string; brochure_id?: string }>;
+          for (const row of rows) {
+            if (row.id) brochureKeys.add(row.id);
+            if (row.storage_id) brochureKeys.add(row.storage_id);
+            if (row.brochure_id) brochureKeys.add(String(row.brochure_id));
+          }
+        }
+      }
+    } catch {
+      // continue with brochureId only
+    }
+
+    const notes = await this.getMeetingNotesForBrochureSlides(brochureId, [slideId]);
+    const keys = brochureKeys;
+    let updated = 0;
+    for (const note of notes) {
+      if (note.slide_id !== slideId) continue;
+      // Prefer notes tied to this saved copy; still allow exact brochure_id match
+      if (note.brochure_id && keys.size > 0 && !keys.has(note.brochure_id) && note.brochure_id !== brochureId) {
+        continue;
+      }
+      if (note.slide_title === title) continue;
+      await this.updateMeetingNote(note.id, {
+        slide_title: title,
+        skipActivityLog: true,
+      });
+      updated++;
+    }
+
+    if (updated > 0) {
+      console.log(
+        `LocalDB: Cascaded slide title "${title}" to ${updated} meeting note(s) for slide ${slideId}`,
+      );
+    }
+    return updated;
+  }
+
+  /**
+   * Soft-delete meeting notes that belong to a saved brochure being deleted.
+   */
+  static async deleteMeetingNotesForSavedBrochure(
+    saved: Pick<LocalSavedBrochure, 'id' | 'storage_id' | 'brochure_id' | 'custom_title' | 'brochure_title'>,
+  ): Promise<number> {
+    await this.initialize();
+    const keys = new Set<string>();
+    if (saved.id) keys.add(saved.id);
+    if (saved.storage_id) keys.add(saved.storage_id);
+    if (saved.brochure_id) keys.add(String(saved.brochure_id));
+    if (keys.size === 0) return 0;
+
+    const keyList = Array.from(keys);
+    let notes: LocalMeetingNote[] = [];
+    if (this.isUsingAsyncStorage()) {
+      const data = await AsyncStorage.getItem('meeting_notes');
+      const all: LocalMeetingNote[] = data ? JSON.parse(data) : [];
+      notes = all.filter((n) => !n.is_deleted && n.brochure_id && keys.has(n.brochure_id));
+    } else {
+      const placeholders = keyList.map(() => '?').join(',');
+      const rows = (await this.db.getAllAsync(
+        `SELECT * FROM meeting_notes WHERE is_deleted = 0 AND brochure_id IN (${placeholders})`,
+        keyList,
+      )) as any[];
+      notes = (rows || []).map((row) => ({
+        ...row,
+        is_deleted: Boolean(row.is_deleted),
+      })) as LocalMeetingNote[];
+    }
+
+    for (const note of notes) {
+      await this.deleteMeetingNote(note.id);
+    }
+
+    if (notes.length > 0) {
+      console.log(
+        `LocalDB: Soft-deleted ${notes.length} meeting note(s) for deleted brochure ${saved.custom_title || saved.brochure_title || saved.id}`,
+      );
+    }
+    return notes.length;
   }
 
   /**
@@ -4417,6 +4792,12 @@ export class LocalDatabaseService {
           slide_id: note.slide_id,
           is_deleted: true,
         });
+        await this.logMeetingRelatedActivity(
+          note.meeting_id,
+          'slide_note_deleted',
+          `Deleted slide note: ${note.slide_title || 'Untitled slide'}`,
+          { note_id: id, slide_id: note.slide_id, server_id: note.server_id },
+        );
       }
       
       console.log('LocalDB: Meeting note deleted:', id);
@@ -4477,6 +4858,12 @@ export class LocalDatabaseService {
 
       if (!skipSyncQueue) {
         await this.addToSyncQueue('create', 'meeting_general_notes', id, note);
+        await this.logMeetingRelatedActivity(
+          note.meeting_id,
+          'general_note_added',
+          `Added general note: ${note.title || 'Untitled'}`,
+          { note_id: id, title: note.title },
+        );
       }
 
       console.log('LocalDB: Meeting general note created locally:', id);
@@ -4559,6 +4946,12 @@ export class LocalDatabaseService {
         const updated = await this.getMeetingGeneralNoteById(id);
         if (updated) {
           await this.addToSyncQueue('update', 'meeting_general_notes', id, updated);
+          await this.logMeetingRelatedActivity(
+            updated.meeting_id,
+            'general_note_updated',
+            `Updated general note: ${updated.title || 'Untitled'}`,
+            { note_id: id, title: updated.title },
+          );
         }
       }
 
@@ -4588,6 +4981,12 @@ export class LocalDatabaseService {
           ...note,
           is_deleted: true,
         });
+        await this.logMeetingRelatedActivity(
+          note.meeting_id,
+          'general_note_deleted',
+          `Deleted general note: ${note.title || 'Untitled'}`,
+          { note_id: id, server_id: note.server_id },
+        );
       }
 
       console.log('LocalDB: Meeting general note deleted:', id);
@@ -4744,6 +5143,16 @@ export class LocalDatabaseService {
       const skipSyncQueue = followUpData.skipSyncQueue || false;
       if (!skipSyncQueue) {
         await this.addToSyncQueue('create', 'meeting_followups', id, followUp);
+        await this.logMeetingRelatedActivity(
+          followUp.meeting_id,
+          'follow_up_added',
+          `Added follow-up for ${followUp.follow_up_date}${followUp.follow_up_time ? ` at ${followUp.follow_up_time}` : ''}`,
+          {
+            follow_up_id: id,
+            follow_up_date: followUp.follow_up_date,
+            follow_up_time: followUp.follow_up_time,
+          },
+        );
       }
       
       console.log('LocalDB: Meeting follow-up created locally:', id);
@@ -4806,6 +5215,17 @@ export class LocalDatabaseService {
         const updatedFollowUp = await this.getMeetingFollowUpById(id);
         if (updatedFollowUp) {
           await this.addToSyncQueue('update', 'meeting_followups', id, updatedFollowUp);
+          await this.logMeetingRelatedActivity(
+            updatedFollowUp.meeting_id,
+            'follow_up_updated',
+            `Updated follow-up for ${updatedFollowUp.follow_up_date}${updatedFollowUp.follow_up_time ? ` at ${updatedFollowUp.follow_up_time}` : ''}`,
+            {
+              follow_up_id: id,
+              follow_up_date: updatedFollowUp.follow_up_date,
+              follow_up_time: updatedFollowUp.follow_up_time,
+              status: updatedFollowUp.status,
+            },
+          );
         }
       }
 
@@ -4854,6 +5274,13 @@ export class LocalDatabaseService {
         meeting_id: followUp.meeting_id,
         is_deleted: true,
       });
+
+      await this.logMeetingRelatedActivity(
+        followUp.meeting_id,
+        'follow_up_deleted',
+        `Deleted follow-up for ${followUp.follow_up_date}${followUp.follow_up_time ? ` at ${followUp.follow_up_time}` : ''}`,
+        { follow_up_id: id, server_id: followUp.server_id },
+      );
       
       // Also delete associated notes
       const notes = await this.getMeetingNotes(followUp.meeting_id);
@@ -5332,44 +5759,82 @@ export class LocalDatabaseService {
       slides: any[];
       groups: any[];
       lastModified: string;
+      /** Local filesystem folder key (may differ from saved brochure server id). */
+      storageId?: string;
+      savedBrochureId?: string;
+      customTitle?: string;
     }
   ): Promise<void> {
     await this.initialize();
     
     try {
-      // Check if brochure_sync record already exists
+      // Prefer linking brochure_sync to the saved copy's server id (admin requirement).
+      const saved = await this.resolveSavedBrochureForSync(mrId, brochureId, {
+        savedBrochureId: brochureData.savedBrochureId,
+        customTitle: brochureData.customTitle || brochureData.title,
+      });
+
+      const syncBrochureId = saved?.server_id || saved?.id || brochureId;
+      const syncTitle =
+        saved?.custom_title ||
+        brochureData.customTitle ||
+        brochureData.title ||
+        saved?.brochure_title ||
+        'Brochure';
+      const storageId =
+        brochureData.storageId ||
+        (saved ? getSavedBrochureStorageId(saved) : brochureId);
+
+      // Resolve group doctorIds to server UUIDs when available.
+      const groups = await Promise.all(
+        (brochureData.groups || []).map(async (group: any) => {
+          const rawDoctorId = group.doctorId || group.doctor_id;
+          if (!rawDoctorId) return group;
+          const serverDoctorId = await this.resolveDoctorServerId(rawDoctorId);
+          return {
+            ...group,
+            doctorId: serverDoctorId || rawDoctorId,
+          };
+        }),
+      );
+
+      // Check if brochure_sync record already exists for this saved-copy key
       const existing = await this.db.getFirstAsync(`
         SELECT id FROM brochure_sync 
         WHERE brochure_id = ? AND mr_id = ? AND is_deleted = 0
-      `, [brochureId, mrId]);
+      `, [syncBrochureId, mrId]);
 
       const now = new Date().toISOString();
+      const payloadData = JSON.stringify({
+        storage_id: storageId,
+        saved_brochure_id: saved?.id || brochureData.savedBrochureId || null,
+        slides: brochureData.slides,
+        groups,
+      });
       
       if (existing) {
         // Update existing record
-        await this.updateBrochureSync(existing.id, {
-          brochure_title: brochureData.title,
-          brochure_data: JSON.stringify({
-            slides: brochureData.slides,
-            groups: brochureData.groups
-          }),
+        await this.updateBrochureSync((existing as { id: string }).id, {
+          brochure_title: syncTitle,
+          brochure_data: payloadData,
           last_modified: brochureData.lastModified,
           updated_at: now
         });
-        console.log('LocalDB: Brochure sync updated and queued:', existing.id);
+        console.log(
+          `LocalDB: Brochure sync updated and queued: ${(existing as { id: string }).id} → brochure_id=${syncBrochureId} title=${syncTitle}`,
+        );
       } else {
         // Create new record
         const id = await this.createBrochureSync({
           mr_id: mrId,
-          brochure_id: brochureId,
-          brochure_title: brochureData.title,
-          brochure_data: JSON.stringify({
-            slides: brochureData.slides,
-            groups: brochureData.groups
-          }),
+          brochure_id: syncBrochureId,
+          brochure_title: syncTitle,
+          brochure_data: payloadData,
           last_modified: brochureData.lastModified
         });
-        console.log('LocalDB: Brochure sync created and queued:', id);
+        console.log(
+          `LocalDB: Brochure sync created and queued: ${id} → brochure_id=${syncBrochureId} title=${syncTitle}`,
+        );
       }
     } catch (error) {
       console.error('LocalDB: Failed to add brochure to sync queue:', error);
@@ -5486,6 +5951,106 @@ export class LocalDatabaseService {
     } catch (error) {
       console.error('LocalDB: Failed to get saved brochures:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Resolve which saved brochure a brochure_sync push should attach to.
+   * Backend expects brochure_sync.brochure_id = SavedBrochure.server_id
+   * (not the local storage folder id / source brochure id).
+   */
+  static async resolveSavedBrochureForSync(
+    mrId: string,
+    storageOrLocalId: string,
+    hints?: { savedBrochureId?: string; customTitle?: string },
+  ): Promise<LocalSavedBrochure | null> {
+    await this.initialize();
+
+    if (hints?.savedBrochureId) {
+      const byHint =
+        (await this.getSavedBrochureRecordById(hints.savedBrochureId)) ||
+        (await this.getSavedBrochureById(hints.savedBrochureId));
+      if (byHint && byHint.mr_id === mrId && !byHint.is_deleted) {
+        return byHint;
+      }
+      // Also try matching server_id
+      try {
+        const byServer = await this.db.getFirstAsync(
+          `SELECT * FROM saved_brochures WHERE server_id = ? AND mr_id = ? AND is_deleted = 0`,
+          [hints.savedBrochureId, mrId],
+        );
+        if (byServer) {
+          return { ...byServer, is_deleted: Boolean((byServer as any).is_deleted) } as LocalSavedBrochure;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const all = await this.getSavedBrochures(mrId);
+    const matches = all.filter((b) => {
+      const storageId = getSavedBrochureStorageId(b);
+      return (
+        b.id === storageOrLocalId ||
+        b.server_id === storageOrLocalId ||
+        storageId === storageOrLocalId ||
+        b.brochure_id === storageOrLocalId ||
+        resolveServerBrochureId(b.brochure_id) === resolveServerBrochureId(storageOrLocalId)
+      );
+    });
+
+    if (matches.length === 0) return null;
+    if (matches.length === 1) return matches[0];
+
+    // Prefer exact id / storage matches over shared source brochure_id matches
+    const exact = matches.filter((b) => {
+      const storageId = getSavedBrochureStorageId(b);
+      return (
+        b.id === storageOrLocalId ||
+        b.server_id === storageOrLocalId ||
+        storageId === storageOrLocalId
+      );
+    });
+    if (exact.length === 1) return exact[0];
+    const pool = exact.length > 0 ? exact : matches;
+
+    if (hints?.customTitle) {
+      const byTitle = pool.find(
+        (b) => (b.custom_title || '').trim() === hints.customTitle!.trim(),
+      );
+      if (byTitle) return byTitle;
+    }
+
+    // Prefer a row that already has a server_id, then most recently updated/accessed.
+    return pool.sort((a, b) => {
+      const aServer = a.server_id ? 1 : 0;
+      const bServer = b.server_id ? 1 : 0;
+      if (aServer !== bServer) return bServer - aServer;
+      const aTime = Date.parse(a.updated_at || a.last_accessed || a.saved_at || a.created_at || '') || 0;
+      const bTime = Date.parse(b.updated_at || b.last_accessed || b.saved_at || b.created_at || '') || 0;
+      return bTime - aTime;
+    })[0];
+  }
+
+  /**
+   * Resolve a doctor local/server id to the server UUID for brochure group doctorId.
+   */
+  static async resolveDoctorServerId(doctorId?: string | null): Promise<string | undefined> {
+    if (!doctorId) return undefined;
+    try {
+      const byId = await this.getDoctorById(doctorId);
+      if (byId?.server_id) return byId.server_id;
+      if (byId && !byId.server_id) {
+        // Not synced yet — return undefined so caller can keep local or skip
+        return undefined;
+      }
+      const byServer = await this.getDoctorByServerId(doctorId);
+      if (byServer?.server_id) return byServer.server_id;
+      // If the id itself looks like it already is the server id on a row's server_id match fail,
+      // still return it when getDoctorByServerId found nothing but getDoctorRecord might have it as server_id
+      return undefined;
+    } catch {
+      return undefined;
     }
   }
 
@@ -5756,6 +6321,7 @@ export class LocalDatabaseService {
         const updated = brochures.filter((brochure) => brochure.id !== id);
         await AsyncStorage.setItem('saved_brochures', JSON.stringify(updated));
         if (existing) {
+          await this.deleteMeetingNotesForSavedBrochure(existing);
           await this.addToSyncQueue('delete', 'saved_brochures', id, {
             server_id: existing.server_id,
             mr_id: existing.mr_id,
@@ -5776,6 +6342,10 @@ export class LocalDatabaseService {
         SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ? 
         WHERE id = ?
       `, [now, 'pending', id]);
+
+      if (existing) {
+        await this.deleteMeetingNotesForSavedBrochure(existing);
+      }
 
       // Add to sync queue with fields required by /api/sync/push/
       await this.addToSyncQueue('delete', 'saved_brochures', id, {
@@ -6916,12 +7486,25 @@ export class LocalDatabaseService {
           `SELECT COUNT(*) as count FROM doctors WHERE mr_id = ? AND is_deleted = 0`,
           [mrId],
         );
+        // Count as scheduled if: (a) the meeting date is still upcoming, OR
+        // (b) there is a pending future follow-up — even when the original
+        // meeting date has already passed.
         const scheduledResult = await db.getFirstAsync(
-          `SELECT COUNT(*) as count FROM meetings 
-           WHERE mr_id = ? 
-           AND status != 'cancelled' 
-           AND date(substr(scheduled_date, 1, 10)) >= date('now') 
-           AND is_deleted = 0`,
+          `SELECT COUNT(DISTINCT m.id) as count
+           FROM meetings m
+           WHERE m.mr_id = ?
+             AND m.is_deleted = 0
+             AND COALESCE(m.status, '') NOT IN ('cancelled', 'completed')
+             AND (
+               date(substr(m.scheduled_date, 1, 10)) >= date('now')
+               OR EXISTS (
+                 SELECT 1 FROM meeting_followups fu
+                 WHERE fu.meeting_id = m.id
+                   AND fu.is_deleted = 0
+                   AND COALESCE(fu.status, '') NOT IN ('cancelled', 'completed')
+                   AND date(substr(fu.follow_up_date, 1, 10)) >= date('now')
+               )
+             )`,
           [mrId],
         );
         const monthlyResult = await db.getFirstAsync(

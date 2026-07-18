@@ -189,7 +189,14 @@ export class DataCleanupService {
       for (const meeting of meetings) {
         if (meeting.doctor_id) {
           try {
-            const doctor = await LocalDatabaseService.getDoctorById(meeting.doctor_id);
+            let doctor = await LocalDatabaseService.getDoctorById(meeting.doctor_id);
+            if (!doctor) {
+              // doctor_id may actually be a server UUID
+              doctor = await LocalDatabaseService.getDoctorByServerId(meeting.doctor_id);
+            }
+            if (!doctor && meeting.doctor_server_id) {
+              doctor = await LocalDatabaseService.getDoctorByServerId(meeting.doctor_server_id);
+            }
             if (!doctor || doctor.is_deleted) {
               console.warn(`🧹 CLEANUP ORPHANED: Found orphaned meeting "${meeting.title}" (${meeting.id}) - doctor ${meeting.doctor_id} not found`);
               try {
@@ -205,19 +212,8 @@ export class DataCleanupService {
               }
             }
           } catch (error) {
-            // Doctor lookup failed - mark meeting as orphaned
-            console.warn(`🧹 CLEANUP ORPHANED: Found orphaned meeting "${meeting.title}" (${meeting.id}) - doctor lookup failed`);
-            try {
-              await LocalDatabaseService.updateMeeting(meeting.id, {
-                is_deleted: true,
-                sync_status: 'synced',
-                skipSyncQueue: true
-              });
-              result.removed++;
-              console.log(`✅ CLEANUP ORPHANED: Removed orphaned meeting ${meeting.id}`);
-            } catch (deleteError) {
-              result.errors.push(`Failed to remove orphaned meeting ${meeting.id}: ${deleteError}`);
-            }
+            // Doctor lookup failed — do NOT delete the meeting; keep it for retry.
+            console.warn(`🧹 CLEANUP ORPHANED: Doctor lookup failed for meeting "${meeting.title}" (${meeting.id}) — keeping meeting:`, error);
           }
         }
       }

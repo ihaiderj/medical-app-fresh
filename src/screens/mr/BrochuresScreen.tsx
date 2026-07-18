@@ -168,61 +168,79 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           return
         }
       }
-      
-      // Load available brochures from admin (refresh from server when online)
+
       const isOnline = await NetworkService.isOnline()
       wasOnlineRef.current = isOnline
 
+      // 1) Always paint from local DB/cache first (works when Wi‑Fi is on but API is down)
+      console.log('BrochuresScreen: Loading local brochures first (offline-first)')
+      const localResult = await OfflineBrochureService.getLocalAvailableBrochures(userId)
+      setAvailableBrochures(localResult.available)
+      const syncTime = localResult.lastSync || lastSync || Date.now()
+      applyConnectionState(
+        isOnline ? 'cached' : 'offline',
+        isOnline
+          ? `Using local data • checking server…`
+          : `Offline • last sync ${formatSyncAge(syncTime)}`,
+        syncTime,
+        true,
+        !isOnline,
+      )
+      const uniqueCategories = [
+        'All',
+        ...new Set(localResult.available.map((b) => b.category).filter(Boolean)),
+      ]
+      setCategories(uniqueCategories)
+
+      // Saved copies are always local-first
+      await loadSavedBrochures(userId)
+
+      // Show the screen immediately — don't block on network or thumbnails
+      setIsLoading(false)
+      loadBrochureThumbnailsForBrochures(localResult.available).catch(() => {})
+
+      // 2) Optional background refresh when the device reports connectivity
       if (isOnline) {
         const refreshResult = await BrochureRefreshService.refreshFromServer(userId)
         if (refreshResult.success) {
-          const syncTime = Date.now()
+          const now = Date.now()
           setAvailableBrochures(refreshResult.brochures)
           const detail =
             refreshResult.filesInvalidated && refreshResult.filesInvalidated > 0
               ? `Synced just now • ${refreshResult.filesInvalidated} saved brochure(s) updated on server`
-              : `Synced ${formatSyncAge(syncTime)}`
-          applyConnectionState('online', detail, syncTime, false, false)
-          const uniqueCategories = ["All", ...new Set(refreshResult.brochures.map((b) => b.category).filter(Boolean))]
-          setCategories(uniqueCategories)
-          await loadBrochureThumbnailsForBrochures(refreshResult.brochures)
+              : `Synced ${formatSyncAge(now)}`
+          applyConnectionState('online', detail, now, false, false)
+          const cats = [
+            'All',
+            ...new Set(refreshResult.brochures.map((b) => b.category).filter(Boolean)),
+          ]
+          setCategories(cats)
+          loadBrochureThumbnailsForBrochures(refreshResult.brochures).catch(() => {})
+          // Reload saved in case admin metadata changed
+          await loadSavedBrochures(userId)
           if (showRefreshAlert) {
             NetworkAlerts.refreshSuccess(refreshResult.brochures.length)
           }
         } else {
-          await loadAvailableBrochures(userId)
           applyConnectionState(
-            'sync_failed',
-            refreshResult.error || 'Could not reach server. Showing cached brochures.',
-            lastSync,
+            refreshResult.offline ? 'offline' : 'sync_failed',
+            refreshResult.error || 'Could not reach server. Showing local brochures.',
+            syncTime,
             true,
-            false,
+            !!refreshResult.offline,
           )
           if (showRefreshAlert) {
-            NetworkAlerts.refreshFailed()
+            if (refreshResult.offline) NetworkAlerts.refreshOffline()
+            else NetworkAlerts.refreshFailed()
           }
         }
-      } else {
-        await loadAvailableBrochures(userId)
-        applyConnectionState(
-          'offline',
-          `Offline • last sync ${formatSyncAge(lastSync)}`,
-          lastSync,
-          true,
-          true,
-        )
-        if (showRefreshAlert) {
-          NetworkAlerts.refreshOffline()
-        }
+      } else if (showRefreshAlert) {
+        NetworkAlerts.refreshOffline()
       }
-      
-      // Load saved brochures from local storage (metadata already merged when online)
-      await loadSavedBrochures(userId)
     } catch (error) {
       console.error('Error loading data:', error)
       setAvailableBrochures([])
       setSavedBrochures([])
-    } finally {
       setIsLoading(false)
     }
   }
@@ -231,7 +249,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
     try {
       console.log('Loading available brochures for user (offline-first):', userId)
       
-      // Use offline-first brochure service
+      // Local first; optional short server refresh inside the service
       const result = await OfflineBrochureService.getAvailableBrochures(userId)
       
       console.log('Brochure result:', {
@@ -266,7 +284,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       const uniqueCategories = ["All", ...new Set(result.available.map(b => b.category).filter(Boolean))]
       setCategories(uniqueCategories)
       
-      // Load thumbnails for ZIP brochures
+      // Load thumbnails for ZIP brochures (non-blocking for callers that already cleared loading)
       await loadBrochureThumbnailsForBrochures(result.available)
       
       // Show cache status to user
@@ -311,14 +329,29 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           }
           
           let storageId = getSavedBrochureStorageId(localBrochure)
-          
+
+          // Migrate legacy shared storage (storage_id === source brochure) to a per-copy folder
+          try {
+            const ensured = await BrochureManagementService.ensureIndependentSavedBrochureStorage({
+              id: localBrochure.id,
+              server_id: localBrochure.server_id,
+              brochure_id: localBrochure.brochure_id,
+              storage_id: localBrochure.storage_id || storageId,
+            })
+            storageId = ensured.storageId
+          } catch (migrateErr) {
+            console.warn('LoadSaved: Independent storage migration failed:', migrateErr)
+          }
+
           let brochureDataResult = await BrochureManagementService.getBrochureData(storageId)
-          // Legacy copies stored slides under source brochure_id before independent-copy support
+          // Legacy: content only under source brochure_id — clone into this copy's folder
           if (!brochureDataResult.success && localBrochure.brochure_id !== storageId) {
-            const legacyResult = await BrochureManagementService.getBrochureData(localBrochure.brochure_id)
-            if (legacyResult.success) {
-              storageId = localBrochure.brochure_id
-              brochureDataResult = legacyResult
+            const copyResult = await BrochureManagementService.copyBrochureFolder(
+              localBrochure.brochure_id,
+              storageId,
+            )
+            if (copyResult.success) {
+              brochureDataResult = await BrochureManagementService.getBrochureData(storageId)
             }
           }
           // Check if file exists locally
@@ -859,7 +892,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
 
   const ensureBrochureAvailableWithChanges = async (
     brochure: SavedBrochure,
-    brochureId: string,
+    storageId: string,
   ): Promise<BrochurePrepareResult> => {
     try {
       let userId = user?.id
@@ -873,23 +906,31 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         return { success: false, error: 'User information not available' }
       }
 
+      // storageId = this copy's folder; sourceBrochureId = Available brochure / ZIP source
+      const sourceBrochureId = brochure.brochure_id || brochure.id
+      const syncLookupId = brochure.localId || storageId
+
       const serverBrochure = availableBrochures.find(
-        (item) => (item.brochure_id || item.id) === brochureId,
+        (item) => (item.brochure_id || item.id) === sourceBrochureId,
       )
-      const refreshResult = await BrochureRefreshService.ensureLatestAdminFile(userId, brochureId, serverBrochure)
+      const refreshResult = await BrochureRefreshService.ensureLatestAdminFile(
+        userId,
+        sourceBrochureId,
+        serverBrochure,
+      )
       const adminFileRefreshed = refreshResult.refreshed
       if (refreshResult.error && !refreshResult.refreshed) {
         return { success: false, adminFileRefreshed, error: refreshResult.error }
       }
 
       // Check if we're already downloading this brochure
-      if (downloadingBrochures.has(brochureId || brochure.title)) {
+      if (downloadingBrochures.has(storageId || brochure.title)) {
         console.log('View: Brochure already downloading, skipping duplicate download')
         return { success: true, adminFileRefreshed }
       }
 
-      // Check if brochure data exists locally
-      const localBrochureResult = await BrochureManagementService.getBrochureData(brochureId)
+      // Check if brochure data exists locally in THIS copy's folder
+      const localBrochureResult = await BrochureManagementService.getBrochureData(storageId)
       
       // CRITICAL: Also check if actual image files exist, not just the JSON metadata
       let imageFilesExist = false
@@ -908,27 +949,19 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         } else {
           console.log('View: Local brochure data missing completely')
         }
-        
-        // CRITICAL FIX: When image files are missing, we need the original ZIP file
-        // Find the original brochure to get the file_url
-        let originalBrochureId = brochureId
-        
-        // If brochureId has timestamp suffix (e.g., "id_123456"), extract original ID
-        if (brochureId.includes('_')) {
-          const parts = brochureId.split('_')
-          // Check if last part is a timestamp (all digits)
-          if (parts.length > 1 && /^\d+$/.test(parts[parts.length - 1])) {
-            originalBrochureId = parts.slice(0, -1).join('_')
-            console.log('View: Extracted original brochure ID:', originalBrochureId)
+
+        // Prefer cloning from source folder if already extracted, else download ZIP into this copy
+        const sourceData = await BrochureManagementService.getBrochureData(sourceBrochureId)
+        if (sourceData.success && sourceData.data?.slides?.length) {
+          const clone = await BrochureManagementService.copyBrochureFolder(sourceBrochureId, storageId)
+          if (clone.success) {
+            console.log('View: Cloned source brochure into independent copy folder', storageId)
           }
         }
         
-        // Try to find file_url from multiple sources
         let fileUrl: string | null = null
-        
-        // 1. First, check availableBrochures array
         const originalBrochure = availableBrochures.find(
-          available => (available.brochure_id || available.id) === originalBrochureId
+          available => (available.brochure_id || available.id) === sourceBrochureId
         )
         
         if (originalBrochure && originalBrochure.file_url) {
@@ -936,17 +969,15 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           console.log('View: Found file_url in availableBrochures')
         }
         
-        // 2. If not found, check the saved brochure's file_url property
         if (!fileUrl && brochure.file_url) {
           fileUrl = brochure.file_url
           console.log('View: Found file_url in saved brochure data')
         }
         
-        // 3. If still not found, try to fetch from server using brochure ID
         if (!fileUrl) {
           console.log('View: file_url not found locally, fetching brochure details from server')
           try {
-            const brochureDetails = await MRService.getBrochureById(originalBrochureId)
+            const brochureDetails = await MRService.getBrochureById(sourceBrochureId)
             if (brochureDetails && brochureDetails.file_url) {
               fileUrl = brochureDetails.file_url
               console.log('View: Found file_url from server')
@@ -956,11 +987,11 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           }
         }
 
-        if (fileUrl) {
-          console.log('View: Downloading original ZIP file to get images')
+        const stillMissing = !(await BrochureManagementService.getBrochureData(storageId)).success
+        if (stillMissing && fileUrl) {
+          console.log('View: Downloading original ZIP file into copy folder', storageId)
           
-          // Download the ZIP file to get actual image files
-          const downloadDir = FileSystem.documentDirectory + `brochures/${brochureId}/`
+          const downloadDir = FileSystem.documentDirectory + `brochures/${storageId}/`
           const dirInfo = await FileSystem.getInfoAsync(downloadDir)
           if (!dirInfo.exists) {
             await FileSystem.makeDirectoryAsync(downloadDir, { intermediates: true })
@@ -977,22 +1008,21 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
             if (downloadResult.success) {
               console.log('View: ZIP downloaded, processing...')
               await BrochureManagementService.processZipFile(
-                brochureId,
+                storageId,
                 zipPath,
-                brochure.title
+                brochure.customTitle || brochure.title
               )
               console.log('View: ZIP processed successfully, images extracted')
               
-              // Now download and apply user's modifications (if any)
               const changesResult = await BrochureManagementService.downloadBrochureChanges(
                 userId,
-                brochureId
+                syncLookupId
               )
 
               if (changesResult.success && changesResult.data) {
                 console.log('View: Applying user modifications on top of fresh images')
                 await BrochureManagementService.applyBrochureChanges(
-                  brochureId,
+                  storageId,
                   changesResult.data
                 )
               }
@@ -1007,7 +1037,7 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
               error: zipError instanceof Error ? zipError.message : 'Could not load brochure images',
             }
           }
-        } else {
+        } else if (stillMissing) {
           const isOnline = await NetworkService.isOnline()
           if (!isOnline) {
             return { success: false, offlineBlocked: true, adminFileRefreshed }
@@ -1023,12 +1053,10 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
       // Check for and apply server changes (for both newly downloaded and existing files)
       console.log('View: Checking for server changes to apply latest modifications')
       
-      // Get local brochure data to find latest modification time
-      const localResult = await BrochureManagementService.getBrochureData(brochureId)
+      const localResult = await BrochureManagementService.getBrochureData(storageId)
       let localLastModified: string | undefined
 
       if (localResult.success && localResult.data) {
-        // Find the most recent modification across all slides and groups
         const slideTimestamps = localResult.data.slides.map(s => s.updatedAt).filter(Boolean)
         const groupTimestamps = localResult.data.groups.map(g => g.updatedAt || g.createdAt).filter(Boolean)
         const allTimestamps = [...slideTimestamps, ...groupTimestamps]
@@ -1038,25 +1066,23 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         }
       }
 
-      // Check if server has newer changes
       const statusResult = await BrochureManagementService.checkBrochureSyncStatus(
         userId,
-        brochureId,
+        syncLookupId,
         localLastModified
       )
 
       if (statusResult.success && statusResult.data?.needsDownload) {
         console.log('View: Server has newer changes, downloading and applying them')
         
-        // Download and apply server changes
         const downloadResult = await BrochureManagementService.downloadBrochureChanges(
           userId,
-          brochureId
+          syncLookupId
         )
 
         if (downloadResult.success && downloadResult.data) {
           const applyResult = await BrochureManagementService.applyBrochureChanges(
-            brochureId,
+            storageId,
             downloadResult.data
           )
 
@@ -1102,12 +1128,37 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
         return;
       }
 
+      // Saved copies must open their own storage folder, never the shared source folder
+      if ('localId' in brochure) {
+        const saved = brochure as SavedBrochure
+        try {
+          const { LocalDatabaseService } = await import('../../services/localDatabaseService')
+          const record =
+            (await LocalDatabaseService.getSavedBrochureRecordById(saved.localId)) ||
+            (await LocalDatabaseService.getSavedBrochureById(saved.localId))
+          if (record) {
+            const ensured = await BrochureManagementService.ensureIndependentSavedBrochureStorage({
+              id: record.id,
+              server_id: record.server_id,
+              brochure_id: record.brochure_id,
+              storage_id: record.storage_id || saved.storageId,
+            })
+            saved.storageId = ensured.storageId
+            saved.localId = record.id
+          }
+        } catch (migrateErr) {
+          console.warn('View: Failed to ensure independent storage:', migrateErr)
+        }
+      }
+
       const isOnline = await NetworkService.isOnline()
       let adminFileRefreshed = false
 
       // When online, pull the latest admin file and MR slide edits before viewing
       if (isOnline && 'localId' in brochure) {
-        const prepResult = await ensureBrochureAvailableWithChanges(brochure as SavedBrochure, brochureId)
+        const saved = brochure as SavedBrochure
+        const storageId = saved.storageId || saved.localId
+        const prepResult = await ensureBrochureAvailableWithChanges(saved, storageId)
         if (prepResult.offlineBlocked) {
           NetworkAlerts.viewOfflineNoFile()
           return
@@ -1284,6 +1335,12 @@ export default function BrochuresScreen(props: BrochuresScreenProps = {}) {
           brochureTitle,
           isOffline,
           sourceBrochureId: brochureId,
+          // Link brochure_sync pushes to this saved copy (server id preferred).
+          savedBrochureId:
+            (brochure as SavedBrochure).localId ||
+            (brochure as any).server_id ||
+            (brochure as any).id,
+          customTitle: brochureTitle,
         })
         return
       }

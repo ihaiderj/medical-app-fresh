@@ -29,9 +29,12 @@ interface RequestOptions {
   body?: unknown
   headers?: Record<string, string>
   query?: Record<string, string | number | boolean | undefined>
+  /** Request timeout in ms (default 15000). Use 0 to disable. */
+  timeoutMs?: number
 }
 
 let refreshPromise: Promise<boolean> | null = null
+const DEFAULT_TIMEOUT_MS = 15000
 
 function buildUrl(path: string, query?: RequestOptions['query']): string {
   const base = API_BASE_URL.replace(/\/$/, '')
@@ -119,7 +122,7 @@ async function request<T>(
   options: RequestOptions = {},
   retryOnUnauthorized = true,
 ): Promise<T> {
-  const { auth = true, body, headers = {}, query } = options
+  const { auth = true, body, headers = {}, query, timeoutMs = DEFAULT_TIMEOUT_MS } = options
   const requestHeaders: Record<string, string> = { ...headers }
 
   if (body !== undefined && !(body instanceof FormData)) {
@@ -133,11 +136,18 @@ async function request<T>(
     }
   }
 
+  const controller = timeoutMs > 0 ? new AbortController() : null
+  const timer =
+    controller && timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null
+
   let response: Response
   try {
     response = await fetch(buildUrl(path, query), {
       method,
       headers: requestHeaders,
+      signal: controller?.signal,
       body:
         body === undefined
           ? undefined
@@ -145,8 +155,13 @@ async function request<T>(
             ? body
             : JSON.stringify(body),
     })
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new ApiError(`Request timed out after ${timeoutMs}ms: ${path}`, 'TIMEOUT')
+    }
     throw new ApiError(`Network request failed: cannot reach ${API_BASE_URL}`)
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 
   if (response.status === 401 && auth && retryOnUnauthorized) {
@@ -222,6 +237,6 @@ export const apiClient = {
       })
     }
 
-    return request('POST', endpoint, { body: formData })
+    return request('POST', endpoint, { body: formData, timeoutMs: 120000 })
   },
 }

@@ -1,4 +1,4 @@
-import { View, Text, ScrollView, TouchableOpacity, StyleSheet, SafeAreaView, Alert, ActivityIndicator } from "react-native"
+import { View, Text, ScrollView, TouchableOpacity, StyleSheet, SafeAreaView, Alert, ActivityIndicator, Modal, FlatList } from "react-native"
 import { StatusBar } from "expo-status-bar"
 import { Ionicons } from "@expo/vector-icons"
 import { useState, useEffect, useCallback, useRef } from "react"
@@ -10,7 +10,7 @@ import { SessionManagementService } from "../../services/sessionManagementServic
 // import SavedBrochureSyncStatus from "../../components/SavedBrochureSyncStatus" // DELETED
 import { useAppData } from '../../context/AppDataContext';
 import { OfflineFirstService } from '../../services/offlineFirstService';
-import { LocalDatabaseService } from '../../services/localDatabaseService';
+import { LocalDatabaseService, SyncOperation } from '../../services/localDatabaseService';
 // import { ComprehensiveServerSyncService } from '../../services/comprehensiveServerSyncService'; // DELETED
 // import { AdvancedSyncService } from '../../services/advancedSyncService'; // DELETED
 import { FirstTimeLoginService } from '../../services/firstTimeLoginService';
@@ -22,10 +22,49 @@ import { NetworkAlerts } from '../../utils/networkAlerts';
 import { TokenStorage } from '../../services/tokenStorage';
 import { NotificationService } from '../../services/NotificationService';
 import MeetingRemindersModal from '../../components/MeetingRemindersModal';
-// import SyncTestPanel from '../../components/SyncTestPanel'; // DELETED
 
 interface MRDashboardScreenProps {
   navigation: any
+}
+
+function parseQueueData(data: unknown): Record<string, unknown> {
+  if (!data) return {}
+  if (typeof data === 'object') return data as Record<string, unknown>
+  try {
+    return JSON.parse(String(data)) as Record<string, unknown>
+  } catch {
+    return {}
+  }
+}
+
+function formatQueueTableName(tableName: string): string {
+  const labels: Record<string, string> = {
+    doctors: 'Doctor',
+    meetings: 'Meeting',
+    meeting_notes: 'Slide note',
+    meeting_slide_notes: 'Slide note',
+    meeting_general_notes: 'General note',
+    meeting_followups: 'Follow-up',
+    saved_brochures: 'Saved brochure',
+    brochure_sync: 'Brochure changes',
+    activity_logs: 'Activity',
+  }
+  return labels[tableName] || tableName.replace(/_/g, ' ')
+}
+
+function formatQueueEntryDetail(op: SyncOperation): string {
+  const data = parseQueueData(op.data)
+  const title =
+    data.title ||
+    data.custom_title ||
+    data.brochure_title ||
+    data.note_text ||
+    data.description ||
+    [data.first_name, data.last_name].filter(Boolean).join(' ') ||
+    data.slide_title ||
+    ''
+  const shortId = String(op.record_id || '').slice(0, 8)
+  return title ? String(title) : `id ${shortId}…`
 }
 
 export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps) {
@@ -39,7 +78,9 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [isSyncing, setIsSyncing] = useState(false)
   const [syncProgress, setSyncProgress] = useState<{ step: string; message: string; progress: number } | null>(null)
   const [syncStats, setSyncStats] = useState({ pending: 0, failed: 0, unbackedUp: 0 })
-  const [showTestPanel, setShowTestPanel] = useState(false)
+  const [showSyncQueueModal, setShowSyncQueueModal] = useState(false)
+  const [syncQueueEntries, setSyncQueueEntries] = useState<SyncOperation[]>([])
+  const [isLoadingSyncQueue, setIsLoadingSyncQueue] = useState(false)
   const [reminderRefresh, setReminderRefresh] = useState(0)
   const loadInFlightRef = useRef(false)
   const loadRequestIdRef = useRef(0)
@@ -342,7 +383,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       console.log('🚀 MANUAL SYNC DEBUG: Starting full backup sync for user:', user.id);
       setSyncProgress({ step: 'Reconciling', message: 'Checking local data against server...', progress: 20 });
 
-      const syncResult = await SyncService.syncUpFull(user.id);
+      const syncResult = await SyncService.syncNow(user.id);
       
       if (syncResult.success) {
         console.log('✅ MANUAL SYNC DEBUG: Manual sync completed successfully');
@@ -408,48 +449,21 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
     }
   };
 
-  const handleVerifySync = async () => {
-    if (!user?.id) return;
-    
+  const handleShowSyncQueue = async () => {
+    setShowSyncQueueModal(true)
+    setIsLoadingSyncQueue(true)
     try {
-      Alert.alert(
-        'Sync Verification',
-        'This will verify what data was synced to the server. Check the console logs for detailed results.',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          {
-            text: 'Verify',
-            onPress: async () => {
-              // TODO: Implement sync verification in SyncService if needed
-              console.log('🔍 SYNC VERIFICATION: Sync verification not yet implemented');
-              Alert.alert(
-                'Sync Verification',
-                'Sync verification feature is not yet implemented. Check console logs for sync status.',
-                [{ text: 'OK' }]
-              );
-              // const result = await SyncVerificationService.verifySyncStatus(user.id);
-              // console.log('📊 SYNC VERIFICATION: Results:', JSON.stringify(result.results, null, 2));
-              // SyncVerificationService.printSyncLogs();
-              
-              // Show summary in alert
-              // const summaryLines = result.results.map(r => 
-              //   `${r.entity}: Local=${r.localCount}, Server=${r.serverCount}, Synced=${r.syncedToServerCount}, Queued=${r.queuedCount}`
-              // ).join('\n');
-              
-              Alert.alert(
-                'Sync Verification Complete',
-                `Check console logs for details.\n\nSummary:\n${summaryLines}`,
-                [{ text: 'OK' }]
-              );
-            }
-          }
-        ]
-      );
+      await LocalDatabaseService.ensureReady()
+      const ops = await LocalDatabaseService.getPendingSyncOperations()
+      setSyncQueueEntries(ops)
     } catch (error) {
-      console.error('❌ SYNC VERIFICATION: Error:', error);
-      Alert.alert('Error', 'Failed to verify sync status. Check console logs.');
+      console.error('Failed to load sync queue:', error)
+      setSyncQueueEntries([])
+      Alert.alert('Error', 'Could not load sync queue.')
+    } finally {
+      setIsLoadingSyncQueue(false)
     }
-  };
+  }
 
   const handleLogout = async () => {
     Alert.alert(
@@ -653,17 +667,8 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
                   syncStats.unbackedUp === 0 && !isSyncing && styles.syncButtonIdle,
                 ]} 
                 onPress={handleManualSync}
-                onLongPress={() => {
-                  Alert.alert(
-                    'Sync Options',
-                    'Choose an option',
-                    [
-                      { text: 'Cancel', style: 'cancel' },
-                      { text: 'Verify Sync', onPress: handleVerifySync },
-                      { text: 'Test Panel', onPress: () => setShowTestPanel(true) }
-                    ]
-                  );
-                }}
+                onLongPress={handleShowSyncQueue}
+                delayLongPress={400}
                 disabled={isSyncing}
               >
                 <Ionicons 
@@ -820,15 +825,84 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
         onChanged={() => loadDashboardData({ silent: true })}
       />
 
-      {/* Sync Test Panel Modal */}
-      {/* TODO: Implement sync test panel if needed */}
-      {/* {showTestPanel && (
+      <Modal
+        visible={showSyncQueueModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowSyncQueueModal(false)}
+      >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <SyncTestPanel onClose={() => setShowTestPanel(false)} />
+          <View style={[styles.modalContent, styles.syncQueueModalContent]}>
+            <View style={styles.syncQueueHeader}>
+              <View>
+                <Text style={styles.syncQueueTitle}>Queued for sync</Text>
+                <Text style={styles.syncQueueSubtitle}>
+                  {isLoadingSyncQueue
+                    ? 'Loading…'
+                    : `${syncQueueEntries.length} pending operation${syncQueueEntries.length === 1 ? '' : 's'}`}
+                </Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setShowSyncQueueModal(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+              >
+                <Ionicons name="close" size={24} color="#64748b" />
+              </TouchableOpacity>
+            </View>
+
+            {isLoadingSyncQueue ? (
+              <View style={styles.syncQueueLoading}>
+                <ActivityIndicator size="large" color="#8b5cf6" />
+              </View>
+            ) : syncQueueEntries.length === 0 ? (
+              <View style={styles.syncQueueEmpty}>
+                <Ionicons name="checkmark-circle-outline" size={40} color="#10b981" />
+                <Text style={styles.syncQueueEmptyText}>Nothing queued</Text>
+                <Text style={styles.syncQueueEmptySubtext}>Local changes will appear here until you sync.</Text>
+              </View>
+            ) : (
+              <FlatList
+                data={syncQueueEntries}
+                keyExtractor={(item) => item.id}
+                contentContainerStyle={styles.syncQueueList}
+                renderItem={({ item }) => (
+                  <View style={styles.syncQueueItem}>
+                    <View style={styles.syncQueueItemTop}>
+                      <Text style={styles.syncQueueItemAction}>
+                        {item.operation_type.toUpperCase()}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.syncQueueItemStatus,
+                          item.status === 'failed' && styles.syncQueueItemStatusFailed,
+                        ]}
+                      >
+                        {item.status}
+                      </Text>
+                    </View>
+                    <Text style={styles.syncQueueItemTitle}>
+                      {formatQueueTableName(item.table_name)} · {formatQueueEntryDetail(item)}
+                    </Text>
+                    <Text style={styles.syncQueueItemMeta}>
+                      {item.timestamp
+                        ? new Date(item.timestamp).toLocaleString()
+                        : '—'}
+                      {item.error_message ? ` · ${item.error_message}` : ''}
+                    </Text>
+                  </View>
+                )}
+              />
+            )}
+
+            <TouchableOpacity
+              style={styles.syncQueueCloseButton}
+              onPress={() => setShowSyncQueueModal(false)}
+            >
+              <Text style={styles.syncQueueCloseButtonText}>Close</Text>
+            </TouchableOpacity>
           </View>
         </View>
-      )} */}
+      </Modal>
     </View>
   )
 }
@@ -907,6 +981,110 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: 12,
     overflow: 'hidden',
+  },
+  syncQueueModalContent: {
+    height: '70%',
+    maxHeight: 520,
+    paddingBottom: 12,
+  },
+  syncQueueHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    paddingHorizontal: 20,
+    paddingTop: 18,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  syncQueueTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#0f172a',
+  },
+  syncQueueSubtitle: {
+    marginTop: 4,
+    fontSize: 13,
+    color: '#64748b',
+  },
+  syncQueueLoading: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  syncQueueEmpty: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  syncQueueEmptyText: {
+    marginTop: 12,
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#334155',
+  },
+  syncQueueEmptySubtext: {
+    marginTop: 6,
+    fontSize: 13,
+    color: '#94a3b8',
+    textAlign: 'center',
+  },
+  syncQueueList: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  syncQueueItem: {
+    backgroundColor: '#f8fafc',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    padding: 12,
+    marginBottom: 8,
+  },
+  syncQueueItemTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  syncQueueItemAction: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#7c3aed',
+    letterSpacing: 0.4,
+  },
+  syncQueueItemStatus: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#f59e0b',
+    textTransform: 'uppercase',
+  },
+  syncQueueItemStatusFailed: {
+    color: '#ef4444',
+  },
+  syncQueueItemTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1e293b',
+  },
+  syncQueueItemMeta: {
+    marginTop: 4,
+    fontSize: 12,
+    color: '#64748b',
+  },
+  syncQueueCloseButton: {
+    marginHorizontal: 16,
+    marginTop: 4,
+    backgroundColor: '#0f172a',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  syncQueueCloseButtonText: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '600',
   },
   syncProgressContainer: {
     marginHorizontal: 20,

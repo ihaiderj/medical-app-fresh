@@ -29,6 +29,55 @@ export interface ReconcileResult {
  * See docs/BACKEND_MR_SYNC_REQUIREMENTS.md
  */
 export class SyncReconciliationService {
+  /**
+   * If a living server doctor matches local by name+hospital, link local to that
+   * server_id instead of creating a duplicate. Returns adopted server id or null.
+   */
+  static async tryAdoptMatchingDoctor(
+    localDoctorId: string,
+    mrId: string,
+  ): Promise<string | null> {
+    const local = await LocalDatabaseService.getDoctorRecordById(localDoctorId)
+    if (!local || local.is_deleted) {
+      return null
+    }
+    if (local.server_id) {
+      return String(local.server_id)
+    }
+
+    const listResult = await MRService.getDoctors(mrId)
+    if (!listResult.success || !listResult.data?.length) {
+      return null
+    }
+
+    const locals = await LocalDatabaseService.getDoctors(mrId)
+    const claimed = new Set(
+      locals
+        .filter((d) => !d.is_deleted && d.server_id && d.id !== localDoctorId)
+        .map((d) => String(d.server_id)),
+    )
+
+    const match = this.findMatchingServerDoctor(local, listResult.data, claimed)
+    if (!match) {
+      return null
+    }
+
+    const matchId = String(match.doctor_id || (match as any).id || '').trim()
+    if (!matchId) {
+      return null
+    }
+
+    await LocalDatabaseService.updateDoctor(localDoctorId, {
+      server_id: matchId,
+      sync_status: 'synced',
+      skipSyncQueue: true,
+    })
+    console.log(
+      `🔗 SYNC DOCTOR: Adopted existing server doctor ${matchId} for local ${localDoctorId} (name+hospital)`,
+    )
+    return matchId
+  }
+
   static async getBackupGapStats(mrId: string): Promise<BackupGapStats> {
     await LocalDatabaseService.ensureReady()
     const gaps = await LocalDatabaseService.getBackupGapCounts(mrId)
@@ -223,6 +272,44 @@ export class SyncReconciliationService {
     return {}
   }
 
+  private static doctorMatchKey(
+    firstName?: string | null,
+    lastName?: string | null,
+    hospital?: string | null,
+  ): string {
+    const norm = (value: unknown) =>
+      String(value ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+    return `${norm(firstName)}|${norm(lastName)}|${norm(hospital)}`
+  }
+
+  private static findMatchingServerDoctor(
+    local: {
+      first_name?: string
+      last_name?: string
+      hospital?: string
+    },
+    serverDoctors: MRAssignedDoctor[],
+    adoptedServerIds: Set<string>,
+  ): MRAssignedDoctor | null {
+    const localKey = this.doctorMatchKey(local.first_name, local.last_name, local.hospital)
+    if (!localKey || localKey === '||') {
+      return null
+    }
+
+    for (const server of serverDoctors) {
+      const serverId = String(server.doctor_id || (server as any).id || '').trim()
+      if (!serverId || adoptedServerIds.has(serverId)) continue
+      const serverKey = this.doctorMatchKey(server.first_name, server.last_name, server.hospital)
+      if (serverKey === localKey) {
+        return server
+      }
+    }
+    return null
+  }
+
   private static async reconcileDoctors(mrId: string): Promise<{
     queued: number
     clearedStaleServerIds: number
@@ -245,10 +332,21 @@ export class SyncReconciliationService {
     }
 
     const serverById = new Map(
-      serverDoctors.map((doctor) => [String(doctor.doctor_id || ''), doctor]),
+      serverDoctors
+        .map((doctor) => {
+          const id = String(doctor.doctor_id || (doctor as any).id || '').trim()
+          return [id, doctor] as const
+        })
+        .filter(([id]) => !!id),
     )
     const serverIds = new Set(serverById.keys())
     const locals = await LocalDatabaseService.getDoctors(mrId)
+    // Server ids already claimed by a local row with a valid link
+    const adoptedServerIds = new Set<string>(
+      locals
+        .filter((d) => !d.is_deleted && d.server_id && serverIds.has(String(d.server_id)))
+        .map((d) => String(d.server_id)),
+    )
 
     console.log(
       `🔄 RECONCILE doctors: local=${locals.filter((doctor) => !doctor.is_deleted).length} server=${serverIds.size}`,
@@ -260,16 +358,18 @@ export class SyncReconciliationService {
       try {
         let operation: 'create' | 'update' | undefined
         let clearServerId = false
+        const localServerId = local.server_id ? String(local.server_id) : ''
 
-        if (local.sync_status === 'pending' || local.sync_status === 'error') {
-          operation = local.server_id ? 'update' : 'create'
-        } else if (!local.server_id) {
-          operation = 'create'
-        } else if (!serverIds.has(String(local.server_id))) {
+        // Stale server_id (not on backend) must become create — check before pending/update.
+        if (localServerId && !serverIds.has(localServerId)) {
           operation = 'create'
           clearServerId = true
+        } else if (local.sync_status === 'pending' || local.sync_status === 'error') {
+          operation = localServerId ? 'update' : 'create'
+        } else if (!localServerId) {
+          operation = 'create'
         } else {
-          const serverDoctor = serverById.get(String(local.server_id))
+          const serverDoctor = serverById.get(localServerId)
           if (serverDoctor && this.localDoctorDiffersFromServer(local, serverDoctor)) {
             operation = 'update'
           }
@@ -277,24 +377,63 @@ export class SyncReconciliationService {
 
         const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation('doctors', local.id)
         if (alreadyQueued && !operation) {
-          operation = local.server_id ? 'update' : 'create'
+          operation = localServerId && serverIds.has(localServerId) ? 'update' : 'create'
+          if (operation === 'create' && localServerId) {
+            clearServerId = true
+          }
         }
 
         if (!operation) continue
+
+        // Before creating, adopt an existing server doctor matched by name + hospital.
+        if (operation === 'create') {
+          const match = this.findMatchingServerDoctor(local, serverDoctors, adoptedServerIds)
+          if (match) {
+            const matchId = String(match.doctor_id || (match as any).id || '').trim()
+            if (matchId) {
+              adoptedServerIds.add(matchId)
+              if (clearServerId) {
+                clearedStaleServerIds++
+              }
+              const needsUpdate = this.localDoctorDiffersFromServer(local, match)
+              await LocalDatabaseService.updateDoctor(local.id, {
+                server_id: matchId,
+                sync_status: needsUpdate ? 'pending' : 'synced',
+                skipSyncQueue: true,
+              })
+              console.log(
+                `🔗 RECONCILE: Adopted existing server doctor ${matchId} for local ${local.id} (name+hospital, avoided duplicate)`,
+              )
+              if (needsUpdate) {
+                await LocalDatabaseService.addToSyncQueue('update', 'doctors', local.id, {
+                  ...local,
+                  server_id: matchId,
+                  notes: local.notes ?? '',
+                })
+                queued++
+                console.log(`🔄 RECONCILE: Queued doctors update for ${local.id} after adopt`)
+              }
+              continue
+            }
+          }
+        }
 
         if (clearServerId) {
           await LocalDatabaseService.resetDoctorServerSync(local.id)
           clearedStaleServerIds++
         }
 
-        if (!alreadyQueued) {
-          await LocalDatabaseService.addToSyncQueue(operation, 'doctors', local.id, {
-            ...local,
-            notes: local.notes ?? '',
-          })
+        // Always re-queue so a prior "update" with a stale server_id is superseded.
+        // Strip server_id on create — otherwise resolveQueueOperation turns it into update.
+        await LocalDatabaseService.addToSyncQueue(operation, 'doctors', local.id, {
+          ...local,
+          server_id: operation === 'create' ? null : local.server_id,
+          notes: local.notes ?? '',
+        })
+        if (!alreadyQueued || clearServerId) {
           queued++
-          console.log(`🔄 RECONCILE: Queued doctors ${operation} for ${local.id}`)
         }
+        console.log(`🔄 RECONCILE: Queued doctors ${operation} for ${local.id}`)
 
         await LocalDatabaseService.updateDoctor(local.id, {
           sync_status: 'pending',
@@ -488,7 +627,10 @@ export class SyncReconciliationService {
             clearedStaleServerIds++
           }
 
-          await LocalDatabaseService.addToSyncQueue(operation, 'meeting_followups', followUp.id, followUp)
+          await LocalDatabaseService.addToSyncQueue(operation, 'meeting_followups', followUp.id, {
+            ...followUp,
+            server_id: operation === 'create' ? null : followUp.server_id,
+          })
           await LocalDatabaseService.updateMeetingFollowUp(followUp.id, {
             sync_status: 'pending',
             skipSyncQueue: true,
@@ -549,6 +691,35 @@ export class SyncReconciliationService {
       if (note.is_deleted) continue
 
       try {
+        const noteBrochureId = String(note.brochure_id || '').trim()
+        if (noteBrochureId) {
+          const brochureActive = await LocalDatabaseService.isMeetingNoteBrochureActive(
+            noteBrochureId,
+            note.brochure_title,
+          )
+          if (!brochureActive) {
+            console.log(
+              `🔄 RECONCILE: Soft-deleting orphan meeting note ${note.id} (brochure gone: ${noteBrochureId} / ${note.brochure_title || 'untitled'})`,
+            )
+            await LocalDatabaseService.deleteMeetingNote(note.id)
+            continue
+          }
+
+          // Keep stored title aligned with the live saved copy (fixes stale "66" labels)
+          const { brochureTitle: liveTitle } =
+            await LocalDatabaseService.resolveNoteBrochure(noteBrochureId)
+          if (liveTitle && liveTitle !== note.brochure_title) {
+            await LocalDatabaseService.updateMeetingNote(note.id, {
+              brochure_title: liveTitle,
+              skipActivityLog: true,
+            })
+            note.brochure_title = liveTitle
+            console.log(
+              `🔄 RECONCILE: Refreshed note ${note.id} brochure_title → "${liveTitle}"`,
+            )
+          }
+        }
+
         let operation: 'create' | 'update' | undefined
         let clearServerId = false
 
@@ -784,14 +955,15 @@ export class SyncReconciliationService {
       try {
         let operation: 'create' | 'update' | undefined
         let clearServerId = false
+        const localServerId = local.server_id ? String(local.server_id) : ''
 
-        if (local.sync_status === 'pending' || local.sync_status === 'error') {
-          operation = local.server_id ? 'update' : 'create'
-        } else if (!local.server_id) {
-          operation = 'create'
-        } else if (!serverIds.has(String(local.server_id))) {
+        if (localServerId && !serverIds.has(localServerId)) {
           operation = 'create'
           clearServerId = true
+        } else if (local.sync_status === 'pending' || local.sync_status === 'error') {
+          operation = localServerId ? 'update' : 'create'
+        } else if (!localServerId) {
+          operation = 'create'
         }
 
         if (!operation) continue
@@ -812,14 +984,15 @@ export class SyncReconciliationService {
             : (id: string) => LocalDatabaseService.updateMeeting(id, { sync_status: 'pending', skipSyncQueue: true })
 
         const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation(tableName, local.id)
-        if (!alreadyQueued) {
-          await LocalDatabaseService.addToSyncQueue(operation, tableName, local.id, {
-            ...local,
-            notes: local.notes ?? '',
-          })
+        await LocalDatabaseService.addToSyncQueue(operation, tableName, local.id, {
+          ...local,
+          server_id: operation === 'create' ? null : local.server_id,
+          notes: local.notes ?? '',
+        })
+        if (!alreadyQueued || clearServerId) {
           queued++
-          console.log(`🔄 RECONCILE: Queued ${tableName} ${operation} for ${local.id}`)
         }
+        console.log(`🔄 RECONCILE: Queued ${tableName} ${operation} for ${local.id}`)
         await updateFn(local.id)
       } catch (error) {
         errors.push(

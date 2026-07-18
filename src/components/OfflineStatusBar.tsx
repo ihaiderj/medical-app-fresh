@@ -51,7 +51,7 @@ export default function OfflineStatusBar({ onSyncPress, showSyncStats = true }: 
       }
       
       console.log('OfflineStatusBar: Starting sync with userId:', userId);
-      const result = await SyncService.syncUpFull();
+      const result = await SyncService.syncNow();
       console.log('OfflineStatusBar: Sync result:', result);
       
       if (!result.success && result.errors && result.errors.length > 0) {

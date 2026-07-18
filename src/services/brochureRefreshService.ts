@@ -150,7 +150,22 @@ export class BrochureRefreshService {
       return { success: false, brochures: [], offline: true, error: 'Device is offline' }
     }
 
-    const serverResult = await MRService.getAssignedBrochures(userId)
+    let serverResult: { success: boolean; data?: MRAssignedBrochure[]; error?: string }
+    try {
+      serverResult = await Promise.race([
+        MRService.getAssignedBrochures(userId),
+        new Promise<{ success: boolean; error: string }>((_, reject) =>
+          setTimeout(() => reject(new Error('Assigned brochures timed out after 8000ms')), 8000),
+        ),
+      ])
+    } catch (error) {
+      return {
+        success: false,
+        brochures: [],
+        error: error instanceof Error ? error.message : 'Failed to fetch brochures from server',
+      }
+    }
+
     if (!serverResult.success || !serverResult.data) {
       return {
         success: false,

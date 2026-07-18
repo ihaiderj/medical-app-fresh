@@ -24,6 +24,21 @@ export class OfflineBrochureService {
   private static readonly CACHE_KEY = 'available_brochures_cache';
   private static readonly CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
   private static readonly ESSENTIAL_BROCHURES_KEY = 'essential_brochures';
+  private static readonly SERVER_FETCH_TIMEOUT_MS = 8000;
+
+  private static async withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   private static mapLocalBrochure(b: {
     id: string;
@@ -59,77 +74,98 @@ export class OfflineBrochureService {
   }
 
   /**
-   * Get available brochures — refresh from server when online, otherwise use cache.
+   * Local-only available brochures (SQLite + AsyncStorage). Never hits the network.
+   * Use this to paint the UI instantly when the device looks "online" but the API is down.
+   */
+  static async getLocalAvailableBrochures(userId: string): Promise<BrochureAvailability> {
+    const isDeviceOffline = !(await NetworkService.isOnline());
+
+    try {
+      const { LocalDatabaseService } = await import('./localDatabaseService');
+      const localBrochures = await LocalDatabaseService.getBrochures(userId);
+
+      if (localBrochures.length > 0) {
+        const mappedBrochures = localBrochures.map((b) => this.mapLocalBrochure(b));
+        const cache = await this.getCachedBrochures(userId);
+        console.log(
+          `OfflineBrochure: Local DB has ${mappedBrochures.length} available brochure(s)`,
+        );
+        return {
+          available: mappedBrochures,
+          cached: mappedBrochures,
+          isFromCache: true,
+          isDeviceOffline,
+          lastSync: cache.lastUpdated || Date.now(),
+        };
+      }
+    } catch (localError) {
+      console.warn('OfflineBrochure: Local DB fetch failed:', localError);
+    }
+
+    const cachedBrochures = await this.getCachedBrochures(userId);
+    if (cachedBrochures.brochures.length > 0) {
+      console.log(
+        `OfflineBrochure: Using AsyncStorage cache with ${cachedBrochures.brochures.length} brochure(s)`,
+      );
+      return {
+        available: cachedBrochures.brochures,
+        cached: cachedBrochures.brochures,
+        isFromCache: true,
+        isDeviceOffline,
+        lastSync: cachedBrochures.lastUpdated,
+      };
+    }
+
+    return {
+      available: [],
+      cached: [],
+      isFromCache: true,
+      isDeviceOffline,
+      lastSync: 0,
+    };
+  }
+
+  /**
+   * Get available brochures — local first, then optional short-timeout server refresh.
    */
   static async getAvailableBrochures(userId: string): Promise<BrochureAvailability> {
     try {
       console.log('OfflineBrochure: Getting available brochures for user:', userId);
-      const isDeviceOffline = !(await NetworkService.isOnline());
+      const local = await this.getLocalAvailableBrochures(userId);
+      const isDeviceOffline = local.isDeviceOffline;
 
-      if (!isDeviceOffline) {
-        try {
-          const serverResult = await MRService.getAssignedBrochures(userId);
-          if (serverResult.success) {
-            const brochures = serverResult.data || [];
-            console.log(`OfflineBrochure: Fetched ${brochures.length} brochures from server`);
-
-            const { LocalDatabaseService } = await import('./localDatabaseService');
-            await LocalDatabaseService.syncBrochuresFromServer(brochures);
-            await this.cacheBrochures(userId, brochures);
-
-            return {
-              available: brochures,
-              cached: brochures,
-              isFromCache: false,
-              isDeviceOffline: false,
-              lastSync: Date.now(),
-            };
-          }
-        } catch (error) {
-          console.warn('OfflineBrochure: Server fetch failed, falling back to cache:', error);
-        }
+      if (isDeviceOffline) {
+        return local;
       }
 
-      // Offline or server failed — use local database
       try {
-        const { LocalDatabaseService } = await import('./localDatabaseService');
-        const localBrochures = await LocalDatabaseService.getBrochures(userId);
+        const serverResult = await this.withTimeout(
+          MRService.getAssignedBrochures(userId),
+          this.SERVER_FETCH_TIMEOUT_MS,
+          'Assigned brochures',
+        );
+        if (serverResult.success) {
+          const brochures = serverResult.data || [];
+          console.log(`OfflineBrochure: Fetched ${brochures.length} brochures from server`);
 
-        if (localBrochures.length > 0) {
-          const mappedBrochures = localBrochures.map((b) => this.mapLocalBrochure(b));
-          const cache = await this.getCachedBrochures(userId);
+          const { LocalDatabaseService } = await import('./localDatabaseService');
+          await LocalDatabaseService.syncBrochuresFromServer(brochures);
+          await this.cacheBrochures(userId, brochures);
 
           return {
-            available: mappedBrochures,
-            cached: mappedBrochures,
-            isFromCache: true,
-            isDeviceOffline,
-            lastSync: cache.lastUpdated || Date.now(),
+            available: brochures,
+            cached: brochures,
+            isFromCache: false,
+            isDeviceOffline: false,
+            lastSync: Date.now(),
           };
         }
-      } catch (localError) {
-        console.warn('OfflineBrochure: Local DB fetch failed:', localError);
+        console.warn('OfflineBrochure: Server fetch unsuccessful, using local:', serverResult.error);
+      } catch (error) {
+        console.warn('OfflineBrochure: Server fetch failed/timed out, using local:', error);
       }
 
-      // Fallback to AsyncStorage cache
-      const cachedBrochures = await this.getCachedBrochures(userId);
-      if (cachedBrochures.brochures.length > 0) {
-        return {
-          available: cachedBrochures.brochures,
-          cached: cachedBrochures.brochures,
-          isFromCache: true,
-          isDeviceOffline,
-          lastSync: cachedBrochures.lastUpdated,
-        };
-      }
-
-      return {
-        available: [],
-        cached: [],
-        isFromCache: true,
-        isDeviceOffline,
-        lastSync: 0,
-      };
+      return local;
     } catch (error) {
       console.error('OfflineBrochure: Error getting available brochures:', error);
       return {

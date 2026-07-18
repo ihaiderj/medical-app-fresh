@@ -18,6 +18,7 @@ import { Ionicons } from "@expo/vector-icons"
 import { UnifiedDataService } from "../../services/UnifiedDataService"
 import { useGlobalForms } from "../../context/GlobalFormContext"
 import { OfflineFirstService } from "../../services/offlineFirstService"
+import { LocalDatabaseService } from "../../services/localDatabaseService"
 import { AuthService } from "../../services/AuthService"
 import { useModalQueue } from "../../hooks/useModalQueue"
 import { useAppData, useDoctorSync } from "../../context/AppDataContext"
@@ -84,11 +85,11 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     return doctor.id || doctor.doctor_id || doctor.server_id || ''
   }
 
-  const findDoctorById = (doctorId?: string | null) => {
-    if (!doctorId) {
+  const findDoctorByIdInList = (doctorId: string | null | undefined, doctorsList: any[]) => {
+    if (!doctorId || !doctorsList?.length) {
       return undefined
     }
-    return availableDoctors.find((doctor) => {
+    return doctorsList.find((doctor) => {
       const identifiers = [
         getDoctorIdentifier(doctor),
         doctor.id,
@@ -97,6 +98,10 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
       ].filter(Boolean)
       return identifiers.includes(doctorId)
     })
+  }
+
+  const findDoctorById = (doctorId?: string | null) => {
+    return findDoctorByIdInList(doctorId, availableDoctors)
   }
 
   // Doctor form state for inline creation
@@ -224,18 +229,26 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     }
   }
 
-  // Helper function to get doctor details for a meeting
-  const getDoctorForMeeting = (meeting: any) => {
+  // Helper function to get doctor details for a meeting.
+  // Pass doctorsList when calling from loadMeetings — React state may still be
+  // stale right after await loadAvailableDoctors().
+  const getDoctorForMeeting = (meeting: any, doctorsList?: any[]) => {
     if (!meeting) return null
-    
-    // For local meetings, find doctor by doctor_id
-    if (meeting.doctor_id && availableDoctors.length > 0) {
-      const doctor = findDoctorById(meeting.doctor_id)
-      if (doctor) {
-        return doctor
-      }
+
+    const list = doctorsList && doctorsList.length > 0 ? doctorsList : availableDoctors
+    if (!list.length) return null
+
+    // Match local id, server id, or either field stored on the meeting.
+    const candidates = [
+      meeting.doctor_id,
+      meeting.doctor_server_id,
+    ].filter(Boolean) as string[]
+
+    for (const candidate of candidates) {
+      const doctor = findDoctorByIdInList(candidate, list)
+      if (doctor) return doctor
     }
-    
+
     return null
   }
 
@@ -261,13 +274,54 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
     return `${meeting.doctor_specialty || 'N/A'} • ${meeting.hospital || 'N/A'}`
   }
 
+  /**
+   * True orphan = doctor row is gone from local DB (by local id AND server id).
+   * Do NOT use the in-memory doctors list alone — it can be empty due to a
+   * React state race right after loadAvailableDoctors().
+   */
+  const isMeetingDoctorMissingInDb = async (meeting: any): Promise<boolean> => {
+    const doctorId = String(meeting?.doctor_id || '').trim()
+    const doctorServerId = String(meeting?.doctor_server_id || '').trim()
+    if (!doctorId && !doctorServerId) {
+      // No doctor linked — keep the meeting visible rather than hiding it.
+      return false
+    }
+
+    try {
+      if (doctorId) {
+        const byId = await LocalDatabaseService.getDoctorById(doctorId)
+        if (byId && !byId.is_deleted) return false
+
+        // Meeting may store a server UUID in doctor_id (common when selecting
+        // a just-synced doctor via id || server_id).
+        const byServerAsId = await LocalDatabaseService.getDoctorByServerId(doctorId)
+        if (byServerAsId && !byServerAsId.is_deleted) return false
+      }
+
+      if (doctorServerId) {
+        const byServer = await LocalDatabaseService.getDoctorByServerId(doctorServerId)
+        if (byServer && !byServer.is_deleted) return false
+
+        const byLocal = await LocalDatabaseService.getDoctorById(doctorServerId)
+        if (byLocal && !byLocal.is_deleted) return false
+      }
+    } catch (error) {
+      console.warn('MeetingsScreen: Doctor existence check failed, keeping meeting visible:', error)
+      return false
+    }
+
+    return true
+  }
+
   const loadMeetings = async () => {
     setIsLoading(true)
     try {
-      // Ensure doctors are loaded first (needed for deduplication)
-      if (availableDoctors.length === 0) {
-        await loadAvailableDoctors();
-      }
+      // Always use the returned list — setState is async and availableDoctors
+      // in this closure may still be [] after await loadAvailableDoctors().
+      const doctorsList =
+        availableDoctors.length > 0
+          ? availableDoctors
+          : (await loadAvailableDoctors()) || []
       
       // Load meetings from local database using UnifiedDataService
       const userId = user?.id;
@@ -323,7 +377,7 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
             if (titleDateGroup && titleDateGroup.length > 1 && !meeting.server_id) {
               // Multiple meetings with same title+date - keep the one with valid doctor_id
               const validDoctorMeeting = titleDateGroup.find(m => {
-                const doctor = getDoctorForMeeting(m);
+                const doctor = getDoctorForMeeting(m, doctorsList);
                 return doctor !== null;
               });
               
@@ -340,8 +394,8 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
             // Multiple meetings with same key - keep the best one
             // Priority: valid doctor_id > server_id > most recent updated_at
             const bestMeeting = meetings.reduce((best, current) => {
-              const bestDoctor = getDoctorForMeeting(best);
-              const currentDoctor = getDoctorForMeeting(current);
+              const bestDoctor = getDoctorForMeeting(best, doctorsList);
+              const currentDoctor = getDoctorForMeeting(current, doctorsList);
               
               // Prefer meeting with valid doctor
               if (currentDoctor && !bestDoctor) return current;
@@ -363,18 +417,52 @@ export default function MeetingsScreen({ navigation, route }: MeetingsScreenProp
           }
         });
         
-        // Third pass: filter out orphaned meetings (meetings with invalid doctor_id)
-        const finalMeetings = dedupedMeetings.filter(meeting => {
-          // If meeting has no server_id and doctor_id doesn't match any available doctor, it's orphaned
+        // Third pass: only hide meetings whose doctor is truly missing from the
+        // local DB. Never hide based solely on the in-memory doctors list (that
+        // caused valid meetings created from brochure slide-notes to disappear
+        // on reload due to a state race / id mismatch).
+        const finalMeetings: any[] = []
+        for (const meeting of dedupedMeetings) {
           if (!meeting.server_id && meeting.doctor_id) {
-            const doctor = getDoctorForMeeting(meeting);
-            if (!doctor) {
-              console.log(`🔴 MEETING_DEDUP: Filtering out orphaned meeting "${meeting.title}" with invalid doctor_id: ${meeting.doctor_id}`);
-              return false;
+            const inList = getDoctorForMeeting(meeting, doctorsList)
+            if (!inList) {
+              const missingInDb = await isMeetingDoctorMissingInDb(meeting)
+              if (missingInDb) {
+                console.log(
+                  `🔴 MEETING_DEDUP: Filtering out orphaned meeting "${meeting.title}" — doctor not in DB: ${meeting.doctor_id}`,
+                )
+                continue
+              }
+              console.log(
+                `🟡 MEETING_DEDUP: Keeping meeting "${meeting.title}" — doctor ${meeting.doctor_id} exists in DB but was not in UI list`,
+              )
+              // Attach display fields so the card doesn't show "Unknown Doctor"
+              try {
+                const dbDoctor =
+                  (await LocalDatabaseService.getDoctorById(meeting.doctor_id)) ||
+                  (await LocalDatabaseService.getDoctorByServerId(meeting.doctor_id)) ||
+                  (meeting.doctor_server_id
+                    ? await LocalDatabaseService.getDoctorByServerId(meeting.doctor_server_id)
+                    : null)
+                if (dbDoctor) {
+                  meeting.doctor_name = `${dbDoctor.first_name} ${dbDoctor.last_name}`.trim()
+                  meeting.doctor_specialty = dbDoctor.specialty
+                  meeting.hospital = dbDoctor.hospital
+                  // Prefer the stable local id going forward
+                  if (dbDoctor.id && meeting.doctor_id !== dbDoctor.id) {
+                    meeting.doctor_id = dbDoctor.id
+                  }
+                  if (dbDoctor.server_id && !meeting.doctor_server_id) {
+                    meeting.doctor_server_id = dbDoctor.server_id
+                  }
+                }
+              } catch {
+                // Non-fatal — meeting still shown
+              }
             }
           }
-          return true;
-        });
+          finalMeetings.push(meeting)
+        }
         
         dedupedMeetings.length = 0;
         dedupedMeetings.push(...finalMeetings);

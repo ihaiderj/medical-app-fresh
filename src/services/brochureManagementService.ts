@@ -671,21 +671,25 @@ export class BrochureManagementService {
         )
       }
       
-      // Queue changes for sync if userId provided
-      if (userId) {
-        try {
-          // Use static import to avoid Metro bundler issues
-          const { LocalDatabaseService } = require('./localDatabaseService');
-          await LocalDatabaseService.addBrochureToSyncQueue(brochureId, userId, {
-            brochureId,
-            title: brochureData.title,
-            slides: brochureData.slides,
-            groups: brochureData.groups,
-            lastModified: now
-          });
-        } catch (error) {
-          console.warn('Failed to queue brochure changes:', error);
-        }
+      // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
+      await this.markBrochureAsModified(brochureId, userId, {
+        type: 'slide_renamed',
+        description: `Renamed slide to: ${newTitle}`,
+        metadata: { slide_id: slideId, slide_title: newTitle },
+      }).catch(err => {
+        console.warn('Failed to mark brochure as modified after slide rename:', err);
+      });
+
+      // Keep meeting-note display names in sync and re-queue those notes
+      try {
+        const { LocalDatabaseService } = require('./localDatabaseService')
+        await LocalDatabaseService.cascadeSlideTitleToMeetingNotes(
+          brochureId,
+          slideId,
+          newTitle,
+        )
+      } catch (cascadeErr) {
+        console.warn('Failed to cascade slide title to meeting notes:', cascadeErr)
       }
       
       return { success: true }
@@ -762,7 +766,8 @@ export class BrochureManagementService {
     groupName: string,
     slideIds: string[],
     color: string = '#8b5cf6',
-    doctorId?: string
+    doctorId?: string,
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
   ): Promise<{ success: boolean; groupId?: string; error?: string }> {
     try {
       const { data: brochureData } = await this.getBrochureData(brochureId)
@@ -771,6 +776,17 @@ export class BrochureManagementService {
       }
       
       const groupId = `${brochureId}_group_${Date.now()}`
+      // Prefer server doctor UUID for admin linking (fall back to local id until synced).
+      let resolvedDoctorId = doctorId
+      if (doctorId) {
+        try {
+          const { LocalDatabaseService } = require('./localDatabaseService')
+          const serverId = await LocalDatabaseService.resolveDoctorServerId(doctorId)
+          if (serverId) resolvedDoctorId = serverId
+        } catch {
+          // keep local doctorId
+        }
+      }
       const newGroup: SlideGroup = {
         id: groupId,
         name: groupName,
@@ -779,7 +795,7 @@ export class BrochureManagementService {
         order: brochureData.groups.length + 1,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        doctorId: doctorId  // Store doctor ID if provided
+        doctorId: resolvedDoctorId  // Store doctor ID if provided
       }
       
       brochureData.groups.push(newGroup)
@@ -827,7 +843,16 @@ export class BrochureManagementService {
       )
       
       // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
-      await this.markBrochureAsModified(brochureId).catch(err => {
+      await this.markBrochureAsModified(brochureId, undefined, {
+        type: 'group_created',
+        description: `Created slide group: ${groupName}`,
+        metadata: {
+          group_id: groupId,
+          group_name: groupName,
+          slide_count: slideIds.length,
+          doctor_id: doctorId || null,
+        },
+      }, syncHints).catch(err => {
         console.warn('Failed to mark brochure as modified after group creation:', err);
       });
       
@@ -868,12 +893,256 @@ export class BrochureManagementService {
     }
   }
 
+  private static async writeBrochureData(brochureId: string, brochureData: BrochureData): Promise<void> {
+    const brochureDir = `${this.STORAGE_DIR}${brochureId}/`
+    await FileSystem.writeAsStringAsync(
+      `${brochureDir}brochure_data.json`,
+      JSON.stringify(brochureData, null, 2),
+    )
+  }
+
+  private static detachSlideFromGroup(slide: BrochureSlide, groupId: string): void {
+    if (slide.groupIds && slide.groupIds.includes(groupId)) {
+      slide.groupIds = slide.groupIds.filter((id) => id !== groupId)
+      if (slide.groupIds.length === 0) {
+        delete slide.groupIds
+        delete slide.groupId
+      } else {
+        slide.groupId = slide.groupIds[slide.groupIds.length - 1]
+      }
+      slide.updatedAt = new Date().toISOString()
+      return
+    }
+    if (slide.groupId === groupId) {
+      delete slide.groupId
+      slide.updatedAt = new Date().toISOString()
+    }
+  }
+
+  private static attachSlideToGroup(slide: BrochureSlide, groupId: string): void {
+    if (!slide.groupIds) {
+      slide.groupIds = []
+      if (slide.groupId) {
+        slide.groupIds.push(slide.groupId)
+      }
+    }
+    if (!slide.groupIds.includes(groupId)) {
+      slide.groupIds.push(groupId)
+    }
+    slide.groupId = groupId
+    slide.updatedAt = new Date().toISOString()
+  }
+
+  /**
+   * Delete a slide group (slides remain in the brochure).
+   */
+  static async deleteSlideGroup(
+    brochureId: string,
+    groupId: string,
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data: brochureData } = await this.getBrochureData(brochureId)
+      if (!brochureData) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      const group = brochureData.groups.find((g) => g.id === groupId)
+      if (!group) {
+        return { success: false, error: 'Group not found' }
+      }
+
+      brochureData.slides.forEach((slide) => this.detachSlideFromGroup(slide, groupId))
+      brochureData.groups = brochureData.groups.filter((g) => g.id !== groupId)
+      brochureData.updatedAt = new Date().toISOString()
+
+      await this.writeBrochureData(brochureId, brochureData)
+      await this.markBrochureAsModified(
+        brochureId,
+        undefined,
+        {
+          type: 'group_deleted',
+          description: `Deleted slide group: ${group.name}`,
+          metadata: { group_id: groupId, group_name: group.name },
+        },
+        syncHints,
+      )
+
+      return { success: true }
+    } catch (error) {
+      console.error('Delete group error:', error)
+      return { success: false, error: 'Failed to delete group' }
+    }
+  }
+
+  /**
+   * Rename a slide group.
+   */
+  static async renameSlideGroup(
+    brochureId: string,
+    groupId: string,
+    newName: string,
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const name = newName.trim()
+      if (!name) {
+        return { success: false, error: 'Group name is required' }
+      }
+
+      const { data: brochureData } = await this.getBrochureData(brochureId)
+      if (!brochureData) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      const groupIndex = brochureData.groups.findIndex((g) => g.id === groupId)
+      if (groupIndex === -1) {
+        return { success: false, error: 'Group not found' }
+      }
+
+      const oldName = brochureData.groups[groupIndex].name
+      brochureData.groups[groupIndex].name = name
+      brochureData.groups[groupIndex].updatedAt = new Date().toISOString()
+      brochureData.updatedAt = new Date().toISOString()
+
+      await this.writeBrochureData(brochureId, brochureData)
+      await this.markBrochureAsModified(
+        brochureId,
+        undefined,
+        {
+          type: 'group_renamed',
+          description: `Renamed slide group to: ${name}`,
+          metadata: { group_id: groupId, group_name: name, from: oldName, to: name },
+        },
+        syncHints,
+      )
+
+      return { success: true }
+    } catch (error) {
+      console.error('Rename group error:', error)
+      return { success: false, error: 'Failed to rename group' }
+    }
+  }
+
+  /**
+   * Add existing brochure slides into a group.
+   */
+  static async addSlidesToGroup(
+    brochureId: string,
+    groupId: string,
+    slideIds: string[],
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
+  ): Promise<{ success: boolean; addedCount?: number; error?: string }> {
+    try {
+      const { data: brochureData } = await this.getBrochureData(brochureId)
+      if (!brochureData) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      const groupIndex = brochureData.groups.findIndex((g) => g.id === groupId)
+      if (groupIndex === -1) {
+        return { success: false, error: 'Group not found' }
+      }
+
+      const newSlideIds = slideIds.filter(
+        (slideId) => !brochureData.groups[groupIndex].slideIds.includes(slideId),
+      )
+      if (newSlideIds.length === 0) {
+        return { success: true, addedCount: 0 }
+      }
+
+      brochureData.groups[groupIndex].slideIds.push(...newSlideIds)
+      brochureData.groups[groupIndex].updatedAt = new Date().toISOString()
+
+      newSlideIds.forEach((slideId) => {
+        const slide = brochureData.slides.find((s) => s.id === slideId)
+        if (slide) {
+          this.attachSlideToGroup(slide, groupId)
+        }
+      })
+
+      brochureData.updatedAt = new Date().toISOString()
+      await this.writeBrochureData(brochureId, brochureData)
+      await this.markBrochureAsModified(
+        brochureId,
+        undefined,
+        {
+          type: 'group_slides_added',
+          description: `Added ${newSlideIds.length} slide(s) to group: ${brochureData.groups[groupIndex].name}`,
+          metadata: { group_id: groupId, slide_ids: newSlideIds },
+        },
+        syncHints,
+      )
+
+      return { success: true, addedCount: newSlideIds.length }
+    } catch (error) {
+      console.error('Add slides to group error:', error)
+      return { success: false, error: 'Failed to add slides to group' }
+    }
+  }
+
+  /**
+   * Remove slides from a group (slides remain in the brochure).
+   */
+  static async removeSlidesFromGroup(
+    brochureId: string,
+    groupId: string,
+    slideIds: string[],
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
+  ): Promise<{ success: boolean; removedCount?: number; error?: string }> {
+    try {
+      const { data: brochureData } = await this.getBrochureData(brochureId)
+      if (!brochureData) {
+        return { success: false, error: 'Brochure not found' }
+      }
+
+      const groupIndex = brochureData.groups.findIndex((g) => g.id === groupId)
+      if (groupIndex === -1) {
+        return { success: false, error: 'Group not found' }
+      }
+
+      const toRemove = new Set(slideIds)
+      slideIds.forEach((slideId) => {
+        const slide = brochureData.slides.find((s) => s.id === slideId)
+        if (slide) {
+          this.detachSlideFromGroup(slide, groupId)
+        }
+      })
+
+      const before = brochureData.groups[groupIndex].slideIds.length
+      brochureData.groups[groupIndex].slideIds = brochureData.groups[groupIndex].slideIds.filter(
+        (id) => !toRemove.has(id),
+      )
+      brochureData.groups[groupIndex].updatedAt = new Date().toISOString()
+      brochureData.updatedAt = new Date().toISOString()
+
+      const removedCount = before - brochureData.groups[groupIndex].slideIds.length
+      await this.writeBrochureData(brochureId, brochureData)
+      await this.markBrochureAsModified(
+        brochureId,
+        undefined,
+        {
+          type: 'group_slides_removed',
+          description: `Removed ${removedCount} slide(s) from group: ${brochureData.groups[groupIndex].name}`,
+          metadata: { group_id: groupId, slide_ids: slideIds },
+        },
+        syncHints,
+      )
+
+      return { success: true, removedCount }
+    } catch (error) {
+      console.error('Remove slides from group error:', error)
+      return { success: false, error: 'Failed to remove slides from group' }
+    }
+  }
+
   /**
    * Delete slide
    */
   static async deleteSlide(
     brochureId: string,
-    slideId: string
+    slideId: string,
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
   ): Promise<{ success: boolean; error?: string }> {
     try {
       const { data: brochureData } = await this.getBrochureData(brochureId)
@@ -915,7 +1184,11 @@ export class BrochureManagementService {
       )
       
       // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
-      await this.markBrochureAsModified(brochureId).catch(err => {
+      await this.markBrochureAsModified(brochureId, undefined, {
+        type: 'slide_deleted',
+        description: `Deleted slide: ${slideToDelete.title || 'Untitled'}`,
+        metadata: { slide_id: slideId, slide_title: slideToDelete.title },
+      }, syncHints).catch(err => {
         console.warn('Failed to mark brochure as modified after slide deletion:', err);
       });
       
@@ -932,7 +1205,8 @@ export class BrochureManagementService {
   static async addSlideImage(
     brochureId: string,
     imageUri: string,
-    title: string
+    title: string,
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
   ): Promise<{ success: boolean; slideId?: string; error?: string }> {
     try {
       const { data: brochureData } = await this.getBrochureData(brochureId)
@@ -985,7 +1259,11 @@ export class BrochureManagementService {
       console.log('BrochureManager: Slide added successfully, total slides now:', brochureData.slides.length)
       
       // Queue changes for sync (markBrochureAsModified will get userId from AuthService)
-      await this.markBrochureAsModified(brochureId).catch(err => {
+      await this.markBrochureAsModified(brochureId, undefined, {
+        type: 'slide_added',
+        description: `Added slide: ${title}`,
+        metadata: { slide_id: slideId, slide_title: title },
+      }, syncHints).catch(err => {
         console.warn('Failed to mark brochure as modified after slide addition:', err);
       });
       
@@ -1172,7 +1450,19 @@ export class BrochureManagementService {
   /**
    * Mark brochure as modified (for sync tracking)
    */
-  static async markBrochureAsModified(brochureId: string, userId?: string): Promise<{ success: boolean; error?: string }> {
+  static async markBrochureAsModified(
+    brochureId: string,
+    userId?: string,
+    activity?: {
+      type: string
+      description: string
+      metadata?: Record<string, unknown>
+    },
+    syncHints?: {
+      savedBrochureId?: string
+      customTitle?: string
+    },
+  ): Promise<{ success: boolean; error?: string }> {
     try {
       // Get userId from AuthService if not provided
       let finalUserId = userId;
@@ -1205,7 +1495,8 @@ export class BrochureManagementService {
       result.data.updatedAt = now
 
       console.log('🔵 BROCHURE_SYNC: Marking brochure as modified')
-      console.log('🔵 BROCHURE_SYNC: - Brochure ID:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: - Brochure ID (storage):', brochureId)
+      console.log('🔵 BROCHURE_SYNC: - Saved brochure hint:', syncHints?.savedBrochureId || 'none')
       console.log('🔵 BROCHURE_SYNC: - Was modified:', wasModified, '→ Now: true')
       console.log('🔵 BROCHURE_SYNC: - Was needsSync:', wasNeedsSync, '→ Now: true')
       console.log('🔵 BROCHURE_SYNC: - Local lastModified:', now)
@@ -1227,12 +1518,36 @@ export class BrochureManagementService {
           const { LocalDatabaseService } = require('./localDatabaseService');
           await LocalDatabaseService.addBrochureToSyncQueue(brochureId, finalUserId, {
             brochureId,
-            title: result.data.title,
+            title: syncHints?.customTitle || result.data.title,
+            customTitle: syncHints?.customTitle || result.data.title,
+            savedBrochureId: syncHints?.savedBrochureId,
+            storageId: brochureId,
             slides: result.data.slides,
             groups: result.data.groups,
             lastModified: now
           });
           console.log('🔵 BROCHURE_SYNC: Added brochure changes to sync queue');
+
+          // Optional per-action activity log (slide add/delete/rename, groups, etc.)
+          if (activity?.type && activity?.description) {
+            try {
+              await LocalDatabaseService.createActivityLog({
+                user_id: finalUserId,
+                mr_id: finalUserId,
+                activity_type: activity.type,
+                description: activity.description,
+                metadata: JSON.stringify({
+                  brochure_id: brochureId,
+                  brochure_title: syncHints?.customTitle || result.data.title,
+                  saved_brochure_id: syncHints?.savedBrochureId,
+                  ...(activity.metadata || {}),
+                }),
+                is_deleted: false,
+              });
+            } catch (activityError) {
+              console.warn('🔵 BROCHURE_SYNC: Failed to create activity log:', activityError);
+            }
+          }
         } catch (error) {
           console.warn('🔵 BROCHURE_SYNC: Failed to add to sync queue:', error);
           // Don't fail the operation if queue add fails
@@ -1327,60 +1642,184 @@ export class BrochureManagementService {
   }
 
   /**
-   * Sync brochure changes to server
+   * Ensure brochure changes are queued for SyncService.syncNow().
+   * Does not upload — callers should run syncNow() when the user requests sync.
    */
   static async syncBrochureToServer(
     mrId: string,
     brochureId: string,
     brochureTitle: string,
     slides: BrochureSlide[],
-    groups: SlideGroup[]
-  ): Promise<{ success: boolean; error?: string; lastModified?: string }> {
+    groups: SlideGroup[],
+    syncHints?: { savedBrochureId?: string; customTitle?: string },
+  ): Promise<{ success: boolean; error?: string; lastModified?: string; queued?: boolean }> {
     try {
-      console.log('🔵 BROCHURE_SYNC: Starting sync to server')
+      console.log('🔵 BROCHURE_SYNC: Queuing brochure changes for SyncService')
       console.log('🔵 BROCHURE_SYNC: MR ID:', mrId)
-      console.log('🔵 BROCHURE_SYNC: Brochure ID:', brochureId)
+      console.log('🔵 BROCHURE_SYNC: Storage ID:', brochureId)
       console.log('🔵 BROCHURE_SYNC: Brochure Title:', brochureTitle)
       console.log('🔵 BROCHURE_SYNC: Slides count:', slides.length)
       console.log('🔵 BROCHURE_SYNC: Groups count:', groups.length)
-      console.log('🔵 BROCHURE_SYNC: All slide titles:', slides.map(s => s.title))
-      console.log('🔵 BROCHURE_SYNC: All slide IDs:', slides.map(s => s.id))
-      console.log('🔵 BROCHURE_SYNC: All group names:', groups.map(g => g.name))
-      console.log('🔵 BROCHURE_SYNC: All group IDs:', groups.map(g => g.id))
-      console.log('🔵 BROCHURE_SYNC: Group details:', groups.map(g => ({
-        id: g.id,
-        name: g.name,
-        color: g.color,
-        slideIds: g.slideIds,
-        slideCount: g.slideIds.length
-      })))
-      
-      // TODO: Replace with SyncService when brochure sync RPCs are available
-      // For now, brochure changes are queued and will be synced by SyncService.syncUp()
-      console.warn('🔵 BROCHURE_SYNC: brochureSyncService deleted, changes are queued and will be synced by SyncService')
-      const result = {
-        success: false,
-        error: 'Brochure sync service deleted. Changes are queued and will be synced by SyncService.syncUp()',
-        lastModified: undefined
+      console.log('🔵 BROCHURE_SYNC: Saved brochure hint:', syncHints?.savedBrochureId || 'none')
+
+      const markResult = await this.markBrochureAsModified(
+        brochureId,
+        mrId,
+        undefined,
+        {
+          savedBrochureId: syncHints?.savedBrochureId,
+          customTitle: syncHints?.customTitle || brochureTitle,
+        },
+      )
+
+      if (!markResult.success) {
+        return {
+          success: false,
+          error: markResult.error || 'Failed to queue brochure changes',
+        }
       }
-      
-      if (result.success) {
-        console.log('🔵 BROCHURE_SYNC: Successfully uploaded brochure data')
-        console.log('🔵 BROCHURE_SYNC: - Slides uploaded:', slides.length)
-        console.log('🔵 BROCHURE_SYNC: - Groups uploaded:', groups.length)
-        console.log('🔵 BROCHURE_SYNC: - Server lastModified:', result.lastModified)
-      } else {
-        console.error('🔵 BROCHURE_SYNC: Failed to upload brochure data:', result.error)
+
+      console.log('🔵 BROCHURE_SYNC: Changes queued — will upload on next SyncService.syncNow()')
+      return {
+        success: true,
+        queued: true,
+        lastModified: new Date().toISOString(),
       }
-      
-      return result
     } catch (error) {
-      console.error('🔵 BROCHURE_SYNC: Exception during sync:', error)
+      console.error('🔵 BROCHURE_SYNC: Exception while queuing brochure sync:', error)
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Failed to sync brochure'
+        error: error instanceof Error ? error.message : 'Failed to queue brochure sync',
       }
     }
+  }
+
+  /**
+   * Deep-copy a brochure folder and rewrite image URIs to the destination id.
+   */
+  static async copyBrochureFolder(
+    sourceId: string,
+    destId: string,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (!sourceId || !destId) {
+        return { success: false, error: 'Missing source or destination id' }
+      }
+      if (sourceId === destId) {
+        return { success: true }
+      }
+
+      const srcDir = `${this.STORAGE_DIR}${sourceId}/`
+      const destDir = `${this.STORAGE_DIR}${destId}/`
+      const srcInfo = await FileSystem.getInfoAsync(srcDir)
+      if (!srcInfo.exists) {
+        return { success: false, error: `Source folder missing: ${sourceId}` }
+      }
+
+      const destDataPath = `${destDir}brochure_data.json`
+      const destDataInfo = await FileSystem.getInfoAsync(destDataPath)
+      if (destDataInfo.exists) {
+        console.log(`BrochureManager: Destination ${destId} already has data — skip copy`)
+        return { success: true }
+      }
+
+      const destInfo = await FileSystem.getInfoAsync(destDir)
+      if (destInfo.exists) {
+        await FileSystem.deleteAsync(destDir, { idempotent: true })
+      }
+
+      await FileSystem.copyAsync({ from: srcDir, to: destDir })
+
+      const dataInfo = await FileSystem.getInfoAsync(destDataPath)
+      if (dataInfo.exists) {
+        const raw = await FileSystem.readAsStringAsync(destDataPath)
+        const brochureData = JSON.parse(raw)
+        const rewrite = (uri?: string) =>
+          typeof uri === 'string'
+            ? uri.split(`/brochures/${sourceId}/`).join(`/brochures/${destId}/`)
+            : uri
+
+        if (Array.isArray(brochureData.slides)) {
+          brochureData.slides = brochureData.slides.map((slide: BrochureSlide) => ({
+            ...slide,
+            imageUri: rewrite(slide.imageUri) || slide.imageUri,
+          }))
+        }
+        if (brochureData.thumbnailUri) {
+          brochureData.thumbnailUri = rewrite(brochureData.thumbnailUri)
+        }
+        brochureData.id = destId
+        await FileSystem.writeAsStringAsync(destDataPath, JSON.stringify(brochureData, null, 2))
+      }
+
+      console.log(`BrochureManager: Copied brochure folder ${sourceId} → ${destId}`)
+      return { success: true }
+    } catch (error) {
+      console.error('BrochureManager: copyBrochureFolder failed:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to copy brochure folder',
+      }
+    }
+  }
+
+  /**
+   * Each saved brochure must own its own storage folder so edits stay independent.
+   * Migrates legacy rows that pointed storage_id at the shared source brochure id.
+   */
+  static async ensureIndependentSavedBrochureStorage(saved: {
+    id: string
+    server_id?: string | null
+    brochure_id: string
+    storage_id?: string | null
+  }): Promise<{ storageId: string; migrated: boolean }> {
+    const desiredId = String(saved.server_id || saved.id)
+    const currentId = String(saved.storage_id || saved.id)
+    const sourceId = String(saved.brochure_id || '')
+
+    const desiredDataPath = `${this.STORAGE_DIR}${desiredId}/brochure_data.json`
+    const desiredExists = (await FileSystem.getInfoAsync(desiredDataPath)).exists
+
+    if (currentId === desiredId && desiredExists) {
+      return { storageId: desiredId, migrated: false }
+    }
+
+    const candidateSources = [currentId, sourceId].filter(
+      (id, index, arr) => id && id !== desiredId && arr.indexOf(id) === index,
+    )
+
+    let cloned = false
+    for (const fromId of candidateSources) {
+      const fromPath = `${this.STORAGE_DIR}${fromId}/brochure_data.json`
+      if (!(await FileSystem.getInfoAsync(fromPath)).exists) continue
+      const copyResult = await this.copyBrochureFolder(fromId, desiredId)
+      if (copyResult.success) {
+        cloned = true
+        break
+      }
+    }
+
+    if (currentId !== desiredId || cloned) {
+      try {
+        const { LocalDatabaseService } = require('./localDatabaseService')
+        await LocalDatabaseService.updateSavedBrochure(saved.id, {
+          storage_id: desiredId,
+          skipSyncQueue: true,
+        })
+      } catch (error) {
+        console.warn('BrochureManager: Failed to update storage_id after migration:', error)
+      }
+    }
+
+    if (cloned || currentId !== desiredId) {
+      console.log(
+        `BrochureManager: Independent storage for saved ${saved.id}: ${currentId} → ${desiredId}` +
+          (cloned ? ' (cloned)' : ''),
+      )
+      return { storageId: desiredId, migrated: true }
+    }
+
+    return { storageId: desiredId, migrated: false }
   }
 
   /**
