@@ -6606,6 +6606,13 @@ export class LocalDatabaseService {
     );
   }
 
+  static async resetSavedBrochureServerSync(id: string): Promise<void> {
+    await this.runSql(
+      `UPDATE saved_brochures SET server_id = NULL, sync_status = 'pending' WHERE id = ?`,
+      [id],
+    );
+  }
+
   static async getMeetingNotesForMr(mrId: string): Promise<LocalMeetingNote[]> {
     await this.initialize();
 
@@ -8399,7 +8406,7 @@ export class LocalDatabaseService {
   static async saveUserCredentials(userId: string, email: string, passwordHash: string): Promise<void> {
     await this.initialize();
     const now = new Date().toISOString();
-     if (this.isUsingAsyncStorage()) {
+    if (this.isUsingAsyncStorage()) {
       const credentials = { user_id: userId, email, password_hash: passwordHash, updated_at: now };
       await AsyncStorage.setItem(`user_credentials_${email}`, JSON.stringify(credentials));
       return;
@@ -8408,20 +8415,28 @@ export class LocalDatabaseService {
       if (!(await this.tableExists('user_credentials'))) {
         await this.createTables();
       }
-      await this.db.runAsync(`
+      // email is UNIQUE; user_id is PRIMARY KEY. Replace by email when the server
+      // assigns a new user id so we don't trip UNIQUE(email) or flip storage mode.
+      await this.db.runAsync(`DELETE FROM user_credentials WHERE email = ? OR user_id = ?`, [
+        email,
+        userId,
+      ]);
+      await this.db.runAsync(
+        `
         INSERT INTO user_credentials (user_id, email, password_hash, updated_at)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          email = excluded.email,
-          password_hash = excluded.password_hash,
-          updated_at = excluded.updated_at;
-      `, [userId, email, passwordHash, now]);
+      `,
+        [userId, email, passwordHash, now],
+      );
     } catch (error) {
-      console.error('LocalDB: Failed to save credentials to SQLite, using AsyncStorage:', error);
-      this.db = null;
-      this.useAsyncStorage = true;
-      const credentials = { user_id: userId, email, password_hash: passwordHash, updated_at: now };
-      await AsyncStorage.setItem(`user_credentials_${email}`, JSON.stringify(credentials));
+      console.error('LocalDB: Failed to save credentials to SQLite:', error);
+      // Cache credentials only — do not switch the whole DB layer to AsyncStorage.
+      try {
+        const credentials = { user_id: userId, email, password_hash: passwordHash, updated_at: now };
+        await AsyncStorage.setItem(`user_credentials_${email}`, JSON.stringify(credentials));
+      } catch {
+        // ignore
+      }
     }
   }
 

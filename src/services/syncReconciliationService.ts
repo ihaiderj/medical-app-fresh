@@ -1,6 +1,8 @@
 import { LocalDatabaseService, LocalSavedBrochure } from './localDatabaseService'
 import { MRService, MRAssignedDoctor } from './MRService'
 import { NetworkService } from './networkService'
+import { BrochureManagementService } from './brochureManagementService'
+import { getSavedBrochureStorageId } from '../utils/brochureTypeUtils'
 
 export interface BackupGapStats {
   saved_brochures: number
@@ -207,11 +209,11 @@ export class SyncReconciliationService {
       try {
         const action = await this.resolveSavedBrochureAction(local, serverById)
         if (action.clearServerId) {
-          await LocalDatabaseService.updateSavedBrochure(local.id, {
-            server_id: null,
-            skipSyncQueue: true,
-          })
+          await LocalDatabaseService.resetSavedBrochureServerSync(local.id)
           clearedStaleServerIds++
+          console.log(
+            `🔄 RECONCILE: Cleared stale saved_brochure server_id for ${local.id} (${local.custom_title}) — will create as new`,
+          )
         }
 
         if (!action.operation) {
@@ -249,22 +251,25 @@ export class SyncReconciliationService {
     local: LocalSavedBrochure,
     serverById: Map<string, { id: string; custom_title?: string }>,
   ): Promise<{ operation?: 'create' | 'update'; clearServerId?: boolean }> {
-    if (local.sync_status === 'pending' || local.sync_status === 'error') {
-      const op = local.server_id ? 'update' : 'create'
-      return { operation: op }
-    }
+    const serverId = local.server_id ? String(local.server_id) : ''
+    const serverRow = serverId ? serverById.get(serverId) : undefined
 
-    if (!local.server_id) {
-      return { operation: 'create' }
-    }
-
-    const serverRow = serverById.get(String(local.server_id))
-    if (!serverRow) {
+    // Never keep a server_id that is absent on the current backend (e.g. Render
+    // after migrating off local Django). Clear it and treat as a fresh create.
+    if (serverId && !serverRow) {
       return { operation: 'create', clearServerId: true }
     }
 
+    if (local.sync_status === 'pending' || local.sync_status === 'error') {
+      return { operation: serverRow ? 'update' : 'create' }
+    }
+
+    if (!serverId) {
+      return { operation: 'create' }
+    }
+
     const localTitle = (local.custom_title || local.brochure_title || '').trim()
-    const serverTitle = (serverRow.custom_title || '').trim()
+    const serverTitle = (serverRow?.custom_title || '').trim()
     if (localTitle && serverTitle && localTitle !== serverTitle) {
       return { operation: 'update' }
     }
@@ -722,14 +727,17 @@ export class SyncReconciliationService {
 
         let operation: 'create' | 'update' | undefined
         let clearServerId = false
+        const noteServerId = note.server_id ? String(note.server_id) : ''
+        const noteOnServer = noteServerId ? serverIds.has(noteServerId) : false
 
-        if (note.sync_status === 'pending' || note.sync_status === 'error') {
-          operation = note.server_id ? 'update' : 'create'
-        } else if (!note.server_id) {
-          operation = 'create'
-        } else if (!serverIds.has(String(note.server_id))) {
+        // Stale server_id from another backend → clear and recreate
+        if (noteServerId && !noteOnServer) {
           operation = 'create'
           clearServerId = true
+        } else if (note.sync_status === 'pending' || note.sync_status === 'error') {
+          operation = noteOnServer ? 'update' : 'create'
+        } else if (!noteServerId) {
+          operation = 'create'
         }
 
         if (!operation) continue
@@ -780,9 +788,20 @@ export class SyncReconciliationService {
         if (clearServerId) {
           await LocalDatabaseService.resetMeetingNoteServerSync(note.id)
           clearedStaleServerIds++
+          console.log(
+            `🔄 RECONCILE: Cleared stale meeting_note server_id for ${note.id} — will create as new`,
+          )
         }
 
-        await LocalDatabaseService.addToSyncQueue(operation, 'meeting_notes', note.id, note)
+        const freshNote = clearServerId
+          ? { ...note, server_id: null as string | null, sync_status: 'pending' as const }
+          : note
+        await LocalDatabaseService.addToSyncQueue(
+          operation,
+          'meeting_notes',
+          note.id,
+          freshNote,
+        )
         await LocalDatabaseService.updateMeetingNote(note.id, {
           sync_status: 'pending',
           skipSyncQueue: true,
@@ -804,20 +823,67 @@ export class SyncReconciliationService {
   }> {
     let queued = 0
     const errors: string[] = []
-    const syncs = await LocalDatabaseService.getBrochureSyncs(mrId)
 
+    // Server brochure_sync rows are keyed by saved-brochure server_id.
+    // After migration we often have saved rows on the server but no sync payload yet.
+    const serverList = await MRService.getBrochureChangesForMr(mrId)
+    const serverBrochureIds = new Set<string>()
+    if (serverList.success && Array.isArray(serverList.data)) {
+      for (const row of serverList.data as Array<Record<string, unknown>>) {
+        const id = String(row.brochure_id || row.id || '').trim()
+        if (id) serverBrochureIds.add(id)
+      }
+    }
+
+    const savedCopies = await LocalDatabaseService.getSavedBrochures(mrId)
+    for (const saved of savedCopies) {
+      if (saved.is_deleted || !saved.server_id) continue
+      const serverId = String(saved.server_id)
+      if (serverBrochureIds.has(serverId)) continue
+
+      try {
+        const storageId = getSavedBrochureStorageId(saved)
+        console.log(
+          `🔄 RECONCILE brochure_sync: Saved ${saved.id} ("${saved.custom_title}") has server_id ${serverId} but no brochure_sync on server — queuing slides/groups`,
+        )
+        await BrochureManagementService.markBrochureAsModified(storageId, mrId, undefined, {
+          savedBrochureId: saved.id,
+          customTitle: saved.custom_title || saved.brochure_title,
+        })
+        queued++
+      } catch (error) {
+        errors.push(
+          `brochure_sync for saved ${saved.id}: ${error instanceof Error ? error.message : 'Unknown'}`,
+        )
+      }
+    }
+
+    const syncs = await LocalDatabaseService.getBrochureSyncs(mrId)
     for (const sync of syncs) {
       if (sync.is_deleted) continue
       const op = await this.localRecordNeedsQueue(sync.sync_status, sync.server_id)
       if (!op) continue
 
       try {
+        const alreadyQueued = await LocalDatabaseService.hasPendingSyncOperation(
+          'brochure_sync',
+          sync.id,
+        )
+        if (alreadyQueued) continue
+
         await LocalDatabaseService.addToSyncQueue(op, 'brochure_sync', sync.id, sync)
-        await LocalDatabaseService.updateBrochureSync(sync.id, { sync_status: 'pending', skipSyncQueue: true })
+        await LocalDatabaseService.updateBrochureSync(sync.id, {
+          sync_status: 'pending',
+          skipSyncQueue: true,
+        })
         queued++
       } catch (error) {
         errors.push(`brochure_sync ${sync.id}: ${error instanceof Error ? error.message : 'Unknown'}`)
       }
+    }
+
+    if (queued > 0) {
+      console.log(`🔄 RECONCILE brochure_sync: queued=${queued}`)
     }
 
     return { queued, clearedStaleServerIds: 0, errors }

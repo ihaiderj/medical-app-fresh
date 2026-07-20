@@ -6,7 +6,7 @@ import { FileStorageService } from './fileStorageService'
 import { BrochureManagementService } from './brochureManagementService'
 import { apiClient } from './apiClient'
 import { TokenStorage } from './tokenStorage'
-import { resolveServerBrochureId } from '../utils/brochureTypeUtils'
+import { resolveServerBrochureId, getSavedBrochureStorageId } from '../utils/brochureTypeUtils'
 import { resolveMediaUrl } from '../config/apiConfig'
 import { SyncReconciliationService } from './syncReconciliationService'
 import { FirstTimeLoginService } from './firstTimeLoginService'
@@ -1099,6 +1099,18 @@ export class SyncService {
           })
           return true
         }
+
+        // Stale note server_id from another backend — clear and create as new
+        if (this.isMissingOnServerError((result as { error?: string }).error)) {
+          console.warn(
+            `⚠️ SYNC NOTE: Stale server_id ${data.server_id} — clearing and creating as new`,
+          )
+          await LocalDatabaseService.resetMeetingNoteServerSync(op.record_id)
+          return this.syncMeetingNote(
+            { ...op, operation_type: 'create', data: { ...data, server_id: null } },
+            userId,
+          )
+        }
         return false
       } else if (op.operation_type === 'delete') {
         if (!data.server_id) {
@@ -1342,10 +1354,14 @@ export class SyncService {
     if (local?.server_id) {
       const title = String(customTitle || local.custom_title || local.brochure_title || '')
       console.log(
-        `⏭️ SYNC SAVED BROCHURE: Skip duplicate create for ${opRecordId} — already has server_id ${local.server_id}`,
+        `🔍 SYNC SAVED BROCHURE: Local ${opRecordId} has server_id ${local.server_id} — verifying on server`,
       )
       if (title) {
-        const updateResult = await MRService.updateSavedBrochureTitle(userId, String(local.server_id), title)
+        const updateResult = await MRService.updateSavedBrochureTitle(
+          userId,
+          String(local.server_id),
+          title,
+        )
         if (updateResult.success) {
           await LocalDatabaseService.updateSavedBrochure(opRecordId, {
             sync_status: 'synced',
@@ -1353,18 +1369,62 @@ export class SyncService {
           })
           return true
         }
+        // Stale server_id from another backend — clear and create fresh
+        if (updateResult.notFound || this.isMissingOnServerError(updateResult.error)) {
+          console.warn(
+            `⚠️ SYNC SAVED BROCHURE: Stale server_id ${local.server_id} — clearing and creating as new`,
+          )
+          await LocalDatabaseService.resetSavedBrochureServerSync(opRecordId)
+        } else {
+          console.warn('⚠️ SYNC SAVED BROCHURE: Verify update failed:', updateResult.error)
+          return false
+        }
+      } else {
+        // No title to PATCH — still must not keep an unverified stale id
+        await LocalDatabaseService.resetSavedBrochureServerSync(opRecordId)
       }
-      await LocalDatabaseService.updateSavedBrochure(opRecordId, {
-        sync_status: 'synced',
-        skipSyncQueue: true,
-      })
-      return true
     }
 
-    const resolvedBrochureId = brochureId || String(local?.brochure_id || '')
+    const freshLocal = await LocalDatabaseService.getSavedBrochureRecordById(opRecordId)
+    let resolvedBrochureId = brochureId || String(freshLocal?.brochure_id || '')
     const resolvedTitle = String(
-      customTitle || local?.custom_title || local?.brochure_title || '',
+      customTitle || freshLocal?.custom_title || freshLocal?.brochure_title || '',
     )
+
+    // Prefer the original catalog title (e.g. "Fervid") for rematch after backend migration.
+    let catalogTitleHint = String(freshLocal?.brochure_title || '').trim()
+    try {
+      const original =
+        typeof freshLocal?.original_brochure_data === 'string'
+          ? JSON.parse(freshLocal.original_brochure_data)
+          : freshLocal?.original_brochure_data
+      const originalTitle = String((original as { title?: string } | null)?.title || '').trim()
+      if (originalTitle) {
+        catalogTitleHint = originalTitle
+      }
+    } catch {
+      // ignore parse errors
+    }
+
+    const catalog = await MRService.resolveCatalogBrochureId({
+      brochureId: resolvedBrochureId,
+      title: catalogTitleHint,
+    })
+    if (catalog && catalog.id !== resolveServerBrochureId(resolvedBrochureId)) {
+      console.log(
+        `🔗 SYNC SAVED BROCHURE: Remapped stale catalog id ${resolvedBrochureId} → ${catalog.id} ("${catalog.title}")`,
+      )
+      resolvedBrochureId = catalog.id
+      await LocalDatabaseService.updateSavedBrochure(opRecordId, {
+        brochure_id: catalog.id,
+        brochure_title: catalog.title || freshLocal?.brochure_title,
+        skipSyncQueue: true,
+      })
+    } else if (!catalog) {
+      console.warn(
+        `⚠️ SYNC SAVED BROCHURE: No matching catalog brochure for id=${resolvedBrochureId} title="${catalogTitleHint}"`,
+      )
+    }
 
     const result = await MRService.saveBrochureForMr(userId, resolvedBrochureId, resolvedTitle)
 
@@ -1376,11 +1436,161 @@ export class SyncService {
         skipSyncQueue: true,
       })
       console.log(`✅ SYNC SAVED BROCHURE: ${logLabel} with id ${result.data.id}`)
+
+      // Admin slides/groups come from brochure_sync keyed by saved brochure server_id.
+      // Push local customizations now that the saved row exists on the server.
+      const syncPushed = await this.pushBrochureSyncForSavedBrochure(opRecordId, userId)
+      if (!syncPushed) {
+        console.warn(
+          `⚠️ SYNC SAVED BROCHURE: Saved row created but brochure_sync (slides/groups) not pushed yet for ${opRecordId}`,
+        )
+      }
       return true
     }
 
     console.warn(`⚠️ SYNC SAVED BROCHURE: ${logLabel} failed:`, result.error)
     return false
+  }
+
+  /**
+   * Push local slide/group customizations so Django admin can show previews.
+   * Backend requires brochure_sync.brochure_id = SavedBrochure.server_id.
+   */
+  private static async pushBrochureSyncForSavedBrochure(
+    savedLocalId: string,
+    userId: string,
+  ): Promise<boolean> {
+    try {
+      const saved = await LocalDatabaseService.getSavedBrochureRecordById(savedLocalId)
+      if (!saved || saved.is_deleted || !saved.server_id) {
+        return false
+      }
+
+      const storageId = getSavedBrochureStorageId(saved)
+      const brochureResult = await BrochureManagementService.getBrochureData(storageId)
+      if (!brochureResult.success || !brochureResult.data) {
+        console.warn(
+          `⚠️ SYNC BROCHURE CHANGES: No local slide data under storage ${storageId} for saved ${savedLocalId}`,
+        )
+        // Still queue so a later edit/retry can pick it up if files appear
+        await BrochureManagementService.markBrochureAsModified(storageId, userId, undefined, {
+          savedBrochureId: saved.id,
+          customTitle: saved.custom_title || saved.brochure_title,
+        })
+        return false
+      }
+
+      const brochureData = brochureResult.data
+      const slides = brochureData.slides || []
+      const groups = brochureData.groups || []
+
+      const resolvedGroups = await Promise.all(
+        groups.map(async (group: any) => {
+          const rawDoctorId = group.doctorId || group.doctor_id
+          if (!rawDoctorId) return group
+          const serverDoctorId = await LocalDatabaseService.resolveDoctorServerId(rawDoctorId)
+          return { ...group, doctorId: serverDoctorId || rawDoctorId }
+        }),
+      )
+
+      const sanitizedSlides = slides.map((slide: any) => {
+        const fileName =
+          slide.fileName ||
+          (typeof slide.imageUri === 'string' && slide.imageUri.includes('/')
+            ? slide.imageUri.split('/').pop()
+            : undefined) ||
+          `slide_${slide.order ?? 0}.jpg`
+
+        const remoteUrl =
+          typeof slide.imageUri === 'string' &&
+          (slide.imageUri.startsWith('http://') || slide.imageUri.startsWith('https://'))
+            ? slide.imageUri
+            : typeof slide.image_url === 'string' &&
+                (slide.image_url.startsWith('http://') ||
+                  slide.image_url.startsWith('https://') ||
+                  slide.image_url.startsWith('/'))
+              ? slide.image_url
+              : undefined
+
+        const clean: Record<string, unknown> = {
+          id: slide.id,
+          title: slide.title,
+          fileName,
+          order: slide.order,
+          groupIds: slide.groupIds || (slide.groupId ? [slide.groupId] : []),
+        }
+        if (remoteUrl) clean.image_url = remoteUrl
+        return clean
+      })
+
+      const pushTitle =
+        saved.custom_title || saved.brochure_title || brochureData.title || 'Brochure'
+      const pushBrochureId = String(saved.server_id)
+
+      console.log(
+        `🔄 SYNC BROCHURE CHANGES: Pushing slides/groups for saved ${savedLocalId} → server ${pushBrochureId} ` +
+          `(slides=${sanitizedSlides.length} groups=${resolvedGroups.length})`,
+      )
+
+      const saveResult = await MRService.saveBrochureChanges({
+        mr_id: userId,
+        brochure_id: pushBrochureId,
+        brochure_title: pushTitle,
+        brochure_data: {
+          slides: sanitizedSlides,
+          groups: resolvedGroups,
+        },
+        last_modified:
+          brochureData.updatedAt || brochureData.localLastModified || new Date().toISOString(),
+      })
+
+      if (!saveResult.success || !saveResult.data) {
+        console.warn('⚠️ SYNC BROCHURE CHANGES: Push after saved create failed:', saveResult.error)
+        await BrochureManagementService.markBrochureAsModified(storageId, userId, undefined, {
+          savedBrochureId: saved.id,
+          customTitle: pushTitle,
+        })
+        return false
+      }
+
+      // Keep / create local brochure_sync row aligned to the saved server id
+      await LocalDatabaseService.addBrochureToSyncQueue(storageId, userId, {
+        brochureId: storageId,
+        title: pushTitle,
+        customTitle: pushTitle,
+        savedBrochureId: saved.id,
+        storageId,
+        slides: sanitizedSlides,
+        groups: resolvedGroups,
+        lastModified:
+          brochureData.updatedAt || brochureData.localLastModified || new Date().toISOString(),
+      })
+
+      const syncRows = await LocalDatabaseService.getBrochureSyncs(userId)
+      const syncRow = syncRows.find(
+        (row) =>
+          String(row.brochure_id) === pushBrochureId ||
+          String(row.brochure_id) === saved.id ||
+          String(row.brochure_id) === storageId,
+      )
+      if (syncRow) {
+        await LocalDatabaseService.updateBrochureSync(syncRow.id, {
+          server_id: saveResult.data.id,
+          brochure_id: pushBrochureId,
+          brochure_title: pushTitle,
+          sync_status: 'synced',
+          skipSyncQueue: true,
+        })
+      }
+
+      console.log(
+        `✅ SYNC BROCHURE CHANGES: Slides/groups linked to saved brochure ${pushBrochureId}`,
+      )
+      return true
+    } catch (error) {
+      console.error('❌ SYNC BROCHURE CHANGES: pushBrochureSyncForSavedBrochure error:', error)
+      return false
+    }
   }
 
   /**
@@ -1437,15 +1647,12 @@ export class SyncService {
           return true
         }
 
-        // Stale server_id (e.g. admin deleted the row) — recreate on server.
-        if (result.notFound) {
+        // Stale server_id (e.g. admin deleted the row / other backend) — recreate.
+        if (result.notFound || this.isMissingOnServerError(result.error)) {
           console.log(
-            `⚠️ SYNC SAVED BROCHURE: Server record ${serverId} not found — recreating local copy ${op.record_id}`,
+            `⚠️ SYNC SAVED BROCHURE: Server record ${serverId} not found — clearing and recreating ${op.record_id}`,
           )
-          await LocalDatabaseService.updateSavedBrochure(op.record_id, {
-            server_id: null,
-            skipSyncQueue: true,
-          })
+          await LocalDatabaseService.resetSavedBrochureServerSync(op.record_id)
           return this.pushSavedBrochureCreate(
             op.record_id,
             userId,

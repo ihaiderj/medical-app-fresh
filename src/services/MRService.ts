@@ -251,6 +251,47 @@ export class MRService {
     }
   }
 
+  /**
+   * After backend migration, local copies may still reference an old catalog UUID.
+   * Resolve a live catalog id by exact id first, then by normalized title.
+   */
+  static async resolveCatalogBrochureId(options: {
+    brochureId?: string | null
+    title?: string | null
+  }): Promise<{ id: string; title: string } | null> {
+    const result = await this.getAssignedBrochures('')
+    if (!result.success || !result.data?.length) {
+      return null
+    }
+
+    const catalog = result.data
+    const wantedId = resolveServerBrochureId(options.brochureId || '')
+    if (wantedId) {
+      const byId = catalog.find(
+        (b) => String(b.id) === wantedId || String(b.brochure_id || '') === wantedId,
+      )
+      if (byId) {
+        return { id: String(byId.id || byId.brochure_id), title: byId.title || '' }
+      }
+    }
+
+    const norm = (value: unknown) =>
+      String(value ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+    const wantedTitle = norm(options.title)
+    if (!wantedTitle) {
+      return null
+    }
+
+    const byTitle = catalog.find((b) => norm(b.title) === wantedTitle)
+    if (!byTitle) {
+      return null
+    }
+    return { id: String(byTitle.id || byTitle.brochure_id), title: byTitle.title || '' }
+  }
+
   static async getUpcomingMeetings(_mrId: string, limit: number = 5): Promise<{ success: boolean; data?: MRUpcomingMeeting[]; error?: string }> {
     try {
       const data = await apiClient.get<MRUpcomingMeeting[]>('/api/mr/meetings/upcoming/', { query: { limit } })

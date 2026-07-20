@@ -61,7 +61,7 @@
       "expo-notifications"
     ],
     "extra": {
-      "apiBaseUrl": "https://fervid-backend.onrender.com",
+      "apiBaseUrl": "https://fervid.pythonanywhere.com",
       "eas": {
         "projectId": "264174ba-9998-4c8d-ae1f-4cbcf3c52715"
       }
