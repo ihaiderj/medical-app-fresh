@@ -14,14 +14,15 @@ import {
   Alert,
 } from "react-native"
 import { TouchableOpacity } from "react-native"
-import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler'
-import Animated, { FadeIn, FadeOut, SlideInRight, SlideOutLeft, SlideInLeft, SlideOutRight, runOnJS } from 'react-native-reanimated'
+import { GestureHandlerRootView } from 'react-native-gesture-handler'
+import Animated, { FadeIn, FadeOut } from 'react-native-reanimated'
 import { Ionicons } from "@expo/vector-icons"
 import { StatusBar } from "expo-status-bar"
 import * as ScreenOrientation from 'expo-screen-orientation'
 import { BrochureManagementService, BrochureSlide } from "../../services/brochureManagementService"
 import { FilePathUtils } from "../../utils/filePathUtils"
 import DoctorSelectionModal from "../../components/DoctorSelectionModal"
+import SlideDeckPager from "../../components/SlideDeckPager"
 import { MRService } from "../../services/MRService"
 import { AuthService } from "../../services/AuthService"
 import { OfflineFirstService } from "../../services/offlineFirstService"
@@ -54,7 +55,6 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
   const [currentOrientation, setCurrentOrientation] = useState<'portrait' | 'landscape'>('landscape')
   const [showControls, setShowControls] = useState(true)
   const [showSlideList, setShowSlideList] = useState(false)
-  const [slideDirection, setSlideDirection] = useState<'left' | 'right'>('right')
   
   // Notes state
   const [showNotesModal, setShowNotesModal] = useState(false)
@@ -277,24 +277,6 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
         },
       ],
     )
-  }
-
-  const handlePreviousSlide = () => {
-    console.log('DoctorGroupViewer: Previous slide requested, current:', currentSlideIndex)
-    if (currentSlideIndex > 0 && slides.length > 0) {
-      setSlideDirection('right') // Coming from left, so slide in from right
-      setCurrentSlideIndex(prev => Math.max(0, prev - 1))
-      console.log('DoctorGroupViewer: Moving to previous slide')
-    }
-  }
-
-  const handleNextSlide = () => {
-    console.log('DoctorGroupViewer: Next slide requested, current:', currentSlideIndex, 'total:', slides.length)
-    if (currentSlideIndex < slides.length - 1 && slides.length > 0) {
-      setSlideDirection('left') // Going right, so slide in from right
-      setCurrentSlideIndex(prev => Math.min(slides.length - 1, prev + 1))
-      console.log('DoctorGroupViewer: Moving to next slide')
-    }
   }
 
   // Load available meetings for notes (offline-first: read from local DB only)
@@ -548,20 +530,7 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
   }
 
 
-  // Swipe gesture handler - simplified for maximum reliability
-  const swipeGesture = Gesture.Pan()
-    .activeOffsetX([-15, 15])
-    .failOffsetY([-30, 30])
-    .onEnd((event) => {
-      'worklet'
-      const SWIPE_THRESHOLD = 50
-      
-      if (event.translationX < -SWIPE_THRESHOLD) {
-        runOnJS(handleNextSlide)()
-      } else if (event.translationX > SWIPE_THRESHOLD) {
-        runOnJS(handlePreviousSlide)()
-      }
-    })
+  // Keep handlers for programmatic next/prev if needed; paging is native FlatList.
 
   const getImageSource = (imagePath: string) => {
     if (!imagePath) {
@@ -638,7 +607,7 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
 
           {/* Floating Toggle Button - Always Visible */}
           <TouchableOpacity 
-            style={styles.floatingToggleButton} 
+            style={[styles.floatingToggleButton, showControls && { top: 118 }]} 
             onPress={() => setShowControls(prev => !prev)}
           >
             <Ionicons name={showControls ? "eye-off" : "eye"} size={24} color="#ffffff" />
@@ -655,49 +624,38 @@ export default function DoctorGroupViewerScreen({ navigation, route }: DoctorGro
             </Text>
           </TouchableOpacity>
 
-          {/* Fullscreen Slide Display with Swipe Gesture */}
-          <GestureDetector gesture={swipeGesture}>
-            <View style={styles.slideContainer}>
-              {isLoading ? (
-                <View style={styles.loadingContainer}>
-                  <ActivityIndicator size="large" color="#8b5cf6" />
-                  <Text style={styles.loadingText}>Loading slides...</Text>
-                </View>
-              ) : currentSlide && slides.length > 0 ? (
-                <>
-                  {/* Animated Slide Image */}
-                  <Animated.Image 
-                    key={`slide-${currentSlideIndex}`}
-                    entering={slideDirection === 'left' ? SlideInRight.duration(200).springify() : SlideInLeft.duration(200).springify()}
-                    exiting={slideDirection === 'left' ? SlideOutLeft.duration(200).springify() : SlideOutRight.duration(200).springify()}
-                    source={getImageSource(currentSlide.imageUri)} 
-                    style={styles.slideImage}
-                    resizeMode="contain"
-                    onError={(error) => {
-                      console.error('DoctorGroupViewer: Image load error for slide:', currentSlide.id)
-                      console.error('DoctorGroupViewer: Image path:', currentSlide.imageUri)
-                      console.error('DoctorGroupViewer: Error details:', error.nativeEvent)
-                    }}
-                    onLoad={() => console.log('DoctorGroupViewer: Image loaded successfully:', currentSlide.id)}
-                  />
-                  
-                  {/* Bottom Controls - Animated (only slide title) */}
-                  {showControls && currentSlide.title && (
-                    <Animated.View entering={FadeIn.duration(300)} exiting={FadeOut.duration(300)} style={styles.bottomControlsOverlay}>
-                      <View style={styles.slideTitleOverlay}>
-                        <Text style={styles.slideTitleText} numberOfLines={2}>{currentSlide.title}</Text>
-                      </View>
-                    </Animated.View>
-                  )}
-                </>
-              ) : (
-                <View style={styles.noSlideContainer}>
-                  <Ionicons name="document-text" size={64} color="#9ca3af" />
-                  <Text style={styles.noSlideText}>No slides available</Text>
-                </View>
-              )}
-            </View>
-          </GestureDetector>
+          {/* Fullscreen Slide Display — native paging (swipe right→left = next) */}
+          <View style={styles.slideContainer}>
+            {isLoading ? (
+              <View style={styles.loadingContainer}>
+                <ActivityIndicator size="large" color="#8b5cf6" />
+                <Text style={styles.loadingText}>Loading slides...</Text>
+              </View>
+            ) : slides.length > 0 ? (
+              <>
+                <SlideDeckPager
+                  slides={slides.map((s) => ({ id: s.id, imageUri: s.imageUri, title: s.title }))}
+                  initialIndex={currentSlideIndex}
+                  advanceOnSwipeRight={false}
+                  onIndexChange={setCurrentSlideIndex}
+                  imageSource={(uri) => getImageSource(uri)}
+                />
+
+                {showControls && currentSlide?.title && (
+                  <Animated.View entering={FadeIn.duration(300)} exiting={FadeOut.duration(300)} style={styles.bottomControlsOverlay}>
+                    <View style={styles.slideTitleOverlay}>
+                      <Text style={styles.slideTitleText} numberOfLines={2}>{currentSlide.title}</Text>
+                    </View>
+                  </Animated.View>
+                )}
+              </>
+            ) : (
+              <View style={styles.noSlideContainer}>
+                <Ionicons name="document-text" size={64} color="#9ca3af" />
+                <Text style={styles.noSlideText}>No slides available</Text>
+              </View>
+            )}
+          </View>
 
           {/* Navigation hints */}
           {slides.length > 1 && showControls && (

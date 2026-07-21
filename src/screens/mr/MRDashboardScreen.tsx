@@ -68,7 +68,7 @@ function formatQueueEntryDetail(op: SyncOperation): string {
 }
 
 export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps) {
-  const { user, onMeetingChange, onDoctorChange, onBrochureChange, onActivityChange, logoutUser } = useAppData();
+  const { user, onMeetingChange, onDoctorChange, onBrochureChange, onActivityChange, notifyActivityChange, logoutUser } = useAppData();
   const [dashboardStats, setDashboardStats] = useState<MRDashboardStats | null>(null)
   const [recentActivities, setRecentActivities] = useState<MRRecentActivity[]>([])
   const [upcomingMeetings, setUpcomingMeetings] = useState<MRUpcomingMeeting[]>([])
@@ -82,6 +82,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const [syncQueueEntries, setSyncQueueEntries] = useState<SyncOperation[]>([])
   const [isLoadingSyncQueue, setIsLoadingSyncQueue] = useState(false)
   const [reminderRefresh, setReminderRefresh] = useState(0)
+  const [canUploadBrochures, setCanUploadBrochures] = useState(false)
   const loadInFlightRef = useRef(false)
   const loadRequestIdRef = useRef(0)
   const hasLoadedOnceRef = useRef(false)
@@ -128,6 +129,30 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       setUserProfile(user);
     }
   }, [user]);
+
+  // Resolve upload permission from /me + local mr_permissions (do not trust context user alone —
+  // auto-login omits can_upload_brochures and later loads were wiping a successful refresh).
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      if (!user?.id) {
+        setCanUploadBrochures(false)
+        return
+      }
+      try {
+        const perm = await MRService.hasBrochureUploadPermission()
+        if (!cancelled && perm.success) {
+          console.log('🔍 DASHBOARD: can_upload_brochures =', !!perm.hasPermission)
+          setCanUploadBrochures(!!perm.hasPermission)
+        }
+      } catch (error) {
+        console.warn('🔍 DASHBOARD: permission check failed', error)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [user?.id]);
 
   // Initialize local notifications (permissions + channel) once.
   useEffect(() => {
@@ -288,6 +313,17 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
       const timer = setTimeout(() => {
         loadDashboardData({ silent: hasLoadedOnceRef.current });
       }, hasLoadedOnceRef.current ? 0 : 1500);
+      // Re-resolve upload permission on each focus (survives silent dashboard reloads)
+      ;(async () => {
+        try {
+          const perm = await MRService.hasBrochureUploadPermission()
+          if (perm.success) {
+            setCanUploadBrochures(!!perm.hasPermission)
+          }
+        } catch {
+          // non-fatal
+        }
+      })()
       // Re-check meeting reminders (upcoming today + expired) on each focus.
       setReminderRefresh((prev) => prev + 1);
       return () => clearTimeout(timer);
@@ -553,6 +589,7 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
                 const result = await MRService.clearRecentActivities(userResult.user.id)
                 if (result.success) {
                   setRecentActivities([])
+                  notifyActivityChange()
                   Alert.alert('Success', 'Recent activities cleared successfully')
                 } else {
                   Alert.alert('Error', result.error || 'Failed to clear activities')
@@ -628,7 +665,20 @@ export default function MRDashboardScreen({ navigation }: MRDashboardScreenProps
   const quickActions = [
     { title: "Schedule Meeting", icon: "calendar-outline", action: () => navigation.navigate("Doctors") },
     { title: `View Brochures (${availableBrochuresCount})`, icon: "document-outline", action: () => navigation.navigate("Brochures") },
-    { title: "Upload Brochure", icon: "cloud-upload-outline", action: () => navigation.navigate("AddBrochure") },
+    ...(canUploadBrochures
+      ? [{
+          title: "Upload Brochure",
+          icon: "cloud-upload-outline",
+          action: async () => {
+            const perm = await MRService.hasBrochureUploadPermission()
+            if (!perm.success || !perm.hasPermission) {
+              Alert.alert('Permission Denied', 'You do not have permission to upload brochures.')
+              return
+            }
+            navigation.navigate("AddBrochure")
+          },
+        }]
+      : []),
     { title: "Meeting Records", icon: "list-outline", action: () => navigation.navigate("Meetings") },
   ]
 

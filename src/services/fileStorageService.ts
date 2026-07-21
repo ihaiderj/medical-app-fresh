@@ -49,7 +49,8 @@ export class FileStorageService {
       }
 
       const fileSizeMB = (fileInfo.size || 0) / (1024 * 1024)
-      const maxSizeMB = 10
+      // Keep in sync with AddBrochureScreen (brochure ZIP uploads are often >10MB)
+      const maxSizeMB = 50
 
       if (fileSizeMB > maxSizeMB) {
         return {

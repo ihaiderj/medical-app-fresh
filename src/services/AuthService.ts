@@ -98,7 +98,9 @@ export class AuthService {
     try {
       const memoryUser = this.getCurrentUserFromMemory()
       if (memoryUser) {
-        return { success: true, user: memoryUser }
+        const withPerms = await this.attachLocalPermissions(memoryUser)
+        this.setCurrentUser(withPerms)
+        return { success: true, user: withPerms }
       }
 
       if (!(await TokenStorage.hasTokens())) {
@@ -107,8 +109,10 @@ export class AuthService {
 
       const profile = await apiClient.get<UserProfile>('/api/auth/me/')
       const userProfile = this.mapUserProfile(profile)
-      this.setCurrentUser(userProfile)
-      return { success: true, user: userProfile }
+      await this.syncPermissionsFromProfile(userProfile)
+      const withPerms = await this.attachLocalPermissions(userProfile)
+      this.setCurrentUser(withPerms)
+      return { success: true, user: withPerms }
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         await TokenStorage.clearTokens()
@@ -128,6 +132,21 @@ export class AuthService {
   }
 
   private static mapUserProfile(profile: UserProfile & Record<string, unknown>): UserProfile {
+    const flag = (value: unknown, fallback = false) => {
+      if (value === undefined || value === null) return fallback
+      return LocalDatabaseService.coercePermissionFlag(value)
+    }
+    const raw = profile as Record<string, unknown>
+    // Backend may send can_upload_brochures or legacy upload_brochures
+    const uploadRaw =
+      raw.can_upload_brochures ??
+      raw.upload_brochures ??
+      raw.canUploadBrochures
+    const manageRaw =
+      raw.can_manage_doctors ?? raw.manage_doctors ?? raw.canManageDoctors
+    const scheduleRaw =
+      raw.can_schedule_meetings ?? raw.schedule_meetings ?? raw.canScheduleMeetings
+
     return {
       id: profile.id,
       email: profile.email,
@@ -137,10 +156,37 @@ export class AuthService {
       phone: profile.phone,
       profile_image_url: profile.profile_image_url,
       address: profile.address,
-      can_upload_brochures: profile.can_upload_brochures,
-      can_manage_doctors: profile.can_manage_doctors,
-      can_schedule_meetings: profile.can_schedule_meetings,
-      is_active: profile.is_active,
+      can_upload_brochures: flag(uploadRaw),
+      can_manage_doctors: flag(manageRaw),
+      can_schedule_meetings: flag(
+        scheduleRaw,
+        scheduleRaw === undefined ? true : false,
+      ),
+      is_active: profile.is_active !== false,
+    }
+  }
+
+  /** Merge permission flags from local mr_permissions (survives auto-login). */
+  static async attachLocalPermissions(user: UserProfile): Promise<UserProfile> {
+    try {
+      const upload = await LocalDatabaseService.getPermissionValue(user.id, 'can_upload_brochures')
+      const manageDoctors = await LocalDatabaseService.getPermissionValue(user.id, 'can_manage_doctors')
+      const schedule = await LocalDatabaseService.getPermissionValue(user.id, 'can_schedule_meetings')
+
+      // Prefer true from either profile or local store (admin may have enabled after last login)
+      const canUpload =
+        upload === null ? !!user.can_upload_brochures : upload || !!user.can_upload_brochures
+
+      return {
+        ...user,
+        can_upload_brochures: canUpload,
+        can_manage_doctors:
+          manageDoctors === null ? !!user.can_manage_doctors : manageDoctors,
+        can_schedule_meetings:
+          schedule === null ? user.can_schedule_meetings !== false : schedule,
+      }
+    } catch {
+      return user
     }
   }
 
@@ -193,21 +239,22 @@ export class AuthService {
       is_active: localUser.is_active,
     }
 
-    this.setCurrentUser(userProfile)
-    await SessionManagementService.recordLocalSession(userProfile.id)
+    const withPerms = await this.attachLocalPermissions(userProfile)
+    this.setCurrentUser(withPerms)
+    await SessionManagementService.recordLocalSession(withPerms.id)
 
     if (rememberMe) {
       await PersistentAuthService.saveSession(
-        userProfile.id,
-        userProfile.email,
-        userProfile.role,
+        withPerms.id,
+        withPerms.email,
+        withPerms.role,
         localCreds.password_hash,
         rememberMe,
         true,
       )
     }
 
-    return { success: true, user: userProfile, isOfflineAuthenticated: true } as AuthResult
+    return { success: true, user: withPerms, isOfflineAuthenticated: true } as AuthResult
   }
 
   private static async finalizeOnlineLogin(
@@ -217,11 +264,13 @@ export class AuthService {
     rememberMe: boolean,
   ) {
     const userProfile = this.mapUserProfile(profile)
-    this.setCurrentUser(userProfile)
+    await this.syncPermissionsFromProfile(userProfile)
+    const withPerms = await this.attachLocalPermissions(userProfile)
+    this.setCurrentUser(withPerms)
 
     const now = new Date().toISOString()
     await LocalDatabaseService.upsertUser({
-      ...userProfile,
+      ...withPerms,
       created_at: profile.created_at || now,
       updated_at: profile.updated_at || now,
       sync_status: 'synced',
@@ -229,16 +278,14 @@ export class AuthService {
 
     const salt = bcrypt.genSaltSync(10)
     const hashedPassword = bcrypt.hashSync(password, salt)
-    await LocalDatabaseService.saveUserCredentials(userProfile.id, email, hashedPassword)
+    await LocalDatabaseService.saveUserCredentials(withPerms.id, email, hashedPassword)
 
-    await this.syncPermissionsFromProfile(userProfile)
-
-    const sessionResult = await SessionManagementService.registerSessionWithConflictCheck(userProfile.id)
+    const sessionResult = await SessionManagementService.registerSessionWithConflictCheck(withPerms.id)
 
     await PersistentAuthService.saveSession(
-      userProfile.id,
-      userProfile.email,
-      userProfile.role,
+      withPerms.id,
+      withPerms.email,
+      withPerms.role,
       hashedPassword,
       rememberMe,
       true,
@@ -247,13 +294,60 @@ export class AuthService {
     if (sessionResult.success) {
       return {
         success: true,
-        user: userProfile,
+        user: withPerms,
         hasSessionConflict: sessionResult.hasConflict,
         conflictDevice: sessionResult.conflictDevice,
       } as AuthResult & { hasSessionConflict?: boolean; conflictDevice?: string }
     }
 
-    return { success: true, user: userProfile } as AuthResult
+    return { success: true, user: withPerms } as AuthResult
+  }
+
+  /** Refresh permissions from /api/auth/me/ when online, else local mr_permissions. */
+  static async refreshPermissions(): Promise<UserProfile | null> {
+    const memory = this.getCurrentUserFromMemory()
+    if (!memory) return null
+
+    try {
+      if (await NetworkService.isOnline() && (await TokenStorage.hasTokens())) {
+        const profile = await apiClient.get<UserProfile & Record<string, unknown>>('/api/auth/me/')
+        console.log('🔐 AUTH: /api/auth/me/ permissions raw', {
+          can_upload_brochures: (profile as any).can_upload_brochures,
+          upload_brochures: (profile as any).upload_brochures,
+        })
+        const mapped = this.mapUserProfile(profile)
+        const raw = profile as Record<string, unknown>
+        const uploadFieldPresent =
+          'can_upload_brochures' in raw ||
+          'upload_brochures' in raw ||
+          'canUploadBrochures' in raw
+
+        // Never overwrite a stored true with false just because /me omitted the field
+        if (uploadFieldPresent) {
+          await this.syncPermissionsFromProfile(mapped)
+        } else {
+          console.warn(
+            '🔐 AUTH: /me omitted upload permission fields — keeping local mr_permissions',
+          )
+        }
+
+        const withPerms = await this.attachLocalPermissions({
+          ...mapped,
+          // If API omitted the field, keep whatever memory/local already had
+          can_upload_brochures: uploadFieldPresent
+            ? mapped.can_upload_brochures
+            : memory.can_upload_brochures,
+        })
+        this.setCurrentUser(withPerms)
+        return withPerms
+      }
+    } catch (error) {
+      console.warn('AuthService: refreshPermissions online failed, using local:', error)
+    }
+
+    const withPerms = await this.attachLocalPermissions(memory)
+    this.setCurrentUser(withPerms)
+    return withPerms
   }
 
   private static async syncPermissionsFromProfile(user: UserProfile) {

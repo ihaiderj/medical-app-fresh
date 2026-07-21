@@ -15,8 +15,12 @@ import { Ionicons } from '@expo/vector-icons'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import { AdminService } from '../../services/AdminService'
+import { MRService } from '../../services/MRService'
+import { AuthService } from '../../services/AuthService'
 import { FileStorageService, UploadProgress } from '../../services/fileStorageService'
 import { BrochureManagementService } from '../../services/brochureManagementService'
+import { LocalDatabaseService } from '../../services/localDatabaseService'
+import { BrochureRefreshService } from '../../services/brochureRefreshService'
 import { fixStorageBucket } from '../../utils/fixStorageBucket'
 
 
@@ -103,12 +107,11 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
       return
     }
 
-    // Validate file size before upload
     const fileSizeMB = selectedFile.fileSize / (1024 * 1024)
     const maxSizeMB = 50
     if (fileSizeMB > maxSizeMB) {
       Alert.alert(
-        'File Too Large', 
+        'File Too Large',
         `The selected file (${fileSizeMB.toFixed(1)}MB) exceeds the maximum allowed size of ${maxSizeMB}MB.\n\nPlease:\n• Compress your ZIP file\n• Reduce image quality\n• Remove unnecessary files\n\nTip: Use online ZIP compressors or reduce image resolution to under ${maxSizeMB}MB.`,
         [{ text: 'OK' }]
       )
@@ -118,104 +121,193 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
     setIsLoading(true)
     setIsUploading(true)
     setUploadProgress(null)
-    
-    try {
-      if (uploadType === 'zip' && selectedFile) {
-        // Step 1: Upload file to Supabase Storage with progress
-        console.log('Uploading file to Supabase Storage...')
-        const uploadResult = await FileStorageService.uploadFile(
-          selectedFile.uri,
-          selectedFile.fileName,
-          (progress) => {
-            setUploadProgress(progress)
-            // Remove duplicate console.log - already logged in FileStorageService
-          }
-        )
 
-        if (!uploadResult.success || !uploadResult.publicUrl) {
-          throw new Error(uploadResult.error || 'Failed to upload file')
+    try {
+      const userResult = await AuthService.getCurrentUser()
+      const isMr = userResult.success && userResult.user?.role === 'mr'
+      if (isMr) {
+        const perm = await MRService.hasBrochureUploadPermission()
+        if (!perm.success || !perm.hasPermission) {
+          Alert.alert('Permission Denied', 'You do not have permission to upload brochures.')
+          return
+        }
+      }
+
+      const goAfterSuccess = () => {
+        if (isMr) {
+          navigation.navigate('MRTabs', { screen: 'Brochures' })
+        } else {
+          navigation.navigate('ViewAllBrochures')
+        }
+      }
+
+      if (uploadType === 'zip' && selectedFile) {
+        console.log('Uploading file...', { isMr, fileName: selectedFile.fileName, mimeType: selectedFile.mimeType })
+
+        let brochureId: string | undefined
+        let remoteFileUrl: string | undefined
+
+        if (isMr) {
+          // Backend: multipart POST /api/mr/brochures/upload/ (file + fields).
+          // Do not use /api/files/brochures/upload/ then JSON create — that causes 415.
+          setUploadProgress({
+            loaded: 0,
+            total: selectedFile.fileSize || 0,
+            percentage: 10,
+          })
+          const mrUpload = await MRService.uploadBrochureMultipart({
+            localFilePath: selectedFile.uri,
+            fileName: selectedFile.fileName,
+            mimeType: selectedFile.mimeType || 'application/zip',
+            title: formData.title,
+            category: formData.category,
+            description: formData.description || undefined,
+            tags: formData.tags
+              ? formData.tags.split(',').map((tag) => tag.trim()).filter(Boolean)
+              : undefined,
+            fileSize: `${Math.round(selectedFile.fileSize / 1024)}KB`,
+          })
+          setUploadProgress({
+            loaded: selectedFile.fileSize || 0,
+            total: selectedFile.fileSize || 0,
+            percentage: 100,
+          })
+
+          if (!mrUpload.success || !(mrUpload.data?.brochure_id || mrUpload.data?.id)) {
+            throw new Error(mrUpload.error || 'Failed to upload brochure')
+          }
+
+          brochureId = mrUpload.data?.brochure_id || mrUpload.data?.id
+          remoteFileUrl = mrUpload.data?.file_url
+        } else {
+          const uploadResult = await FileStorageService.uploadFile(
+            selectedFile.uri,
+            selectedFile.fileName,
+            (progress) => setUploadProgress(progress),
+          )
+
+          if (!uploadResult.success || !uploadResult.publicUrl) {
+            throw new Error(uploadResult.error || 'Failed to upload file')
+          }
+
+          remoteFileUrl = uploadResult.publicUrl
+
+          const result = await AdminService.createBrochure(
+            formData.title,
+            formData.category,
+            formData.description || undefined,
+            uploadResult.publicUrl,
+            selectedFile.fileName,
+            selectedFile.mimeType || 'application/zip',
+            undefined,
+            undefined,
+            `${Math.round(selectedFile.fileSize / 1024)}KB`,
+            formData.tags ? formData.tags.split(',').map(tag => tag.trim()) : undefined,
+          )
+
+          brochureId =
+            (result.data as { brochure_id?: string; id?: string } | undefined)?.brochure_id ||
+            (result.data as { id?: string } | undefined)?.id
+
+          if (!result.success || !brochureId) {
+            Alert.alert('Error', result.error || 'Failed to create brochure record')
+            return
+          }
         }
 
-        console.log('File uploaded successfully to:', uploadResult.publicUrl)
         setUploadProgress(null)
         setIsUploading(false)
         setIsProcessing(true)
 
-        // Step 2: Create brochure record in database with public URL
-        const result = await AdminService.createBrochure(
-          formData.title,
-          formData.category,
-          formData.description || undefined,
-          uploadResult.publicUrl, // Use public URL from Supabase Storage
-          selectedFile.fileName,
-          selectedFile.mimeType || 'application/zip',
-          undefined, // No thumbnail yet
-          undefined, // Pages will be updated after processing
-          `${Math.round(selectedFile.fileSize / 1024)}KB`,
-          formData.tags ? formData.tags.split(',').map(tag => tag.trim()) : undefined
-        )
-        
-        if (result.success && result.data?.brochure_id) {
-          // Step 3: Process ZIP file with the actual database brochure ID
-          const brochureId = result.data.brochure_id
-          console.log('Processing ZIP file for slide extraction...')
+        if (brochureId) {
+          // Prefer local ZIP URI for extraction (avoids re-download).
+          const zipSource = selectedFile.uri.startsWith('file')
+            ? selectedFile.uri
+            : remoteFileUrl || selectedFile.uri
+
           const zipResult = await BrochureManagementService.processZipFile(
             brochureId,
-            uploadResult.publicUrl, // Use public URL instead of local URI
-            formData.title
+            zipSource,
+            formData.title,
           )
-          
+
           if (zipResult.success && zipResult.brochureData) {
-            // Step 4: Upload thumbnail to Supabase Storage for cross-device access
             let thumbnailUrl = zipResult.brochureData.thumbnailUri
-            
+
             if (thumbnailUrl && thumbnailUrl.startsWith('file://')) {
-              console.log('Uploading thumbnail to Supabase Storage...')
               try {
-                const thumbnailFileName = `thumbnail_${brochureId}.jpg`
                 const thumbnailUploadResult = await FileStorageService.uploadFile(
                   thumbnailUrl,
-                  thumbnailFileName
+                  `thumbnail_${brochureId}.jpg`,
                 )
-                
                 if (thumbnailUploadResult.success && thumbnailUploadResult.publicUrl) {
                   thumbnailUrl = thumbnailUploadResult.publicUrl
-                  console.log('Thumbnail uploaded successfully:', thumbnailUrl)
-                } else {
-                  console.log('Thumbnail upload failed, using local path')
                 }
               } catch (thumbnailError) {
                 console.log('Thumbnail upload error:', thumbnailError)
-                // Continue with local path
               }
             }
-            
-            // Update brochure record with thumbnail and slide count
-            const updateResult = await AdminService.updateBrochure(
-              brochureId,
-              undefined, // title
-              undefined, // description
-              undefined, // category
-              undefined, // tags
-              undefined, // isPublic
-              thumbnailUrl, // thumbnail (now public URL if upload succeeded)
-              zipResult.brochureData.totalSlides // pages
-            )
-            
+
+            if (!isMr) {
+              await AdminService.updateBrochure(
+                brochureId,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                thumbnailUrl,
+                zipResult.brochureData.totalSlides,
+              )
+            } else if (userResult.user) {
+              const now = new Date().toISOString()
+              await LocalDatabaseService.upsertBrochure({
+                id: brochureId,
+                title: formData.title,
+                category: formData.category?.trim() || 'General',
+                description: formData.description || '',
+                file_url: remoteFileUrl || '',
+                thumbnail_url: thumbnailUrl || '',
+                pages: zipResult.brochureData.totalSlides || 0,
+                file_size: `${Math.round(selectedFile.fileSize / 1024)}KB`,
+                status: 'active',
+                assigned_by: userResult.user.id,
+                download_count: 0,
+                view_count: 0,
+                created_at: now,
+                updated_at: now,
+                file_name: selectedFile.fileName,
+                file_type: selectedFile.mimeType || 'application/zip',
+                uploaded_by: userResult.user.id,
+                is_public: true,
+                tags: formData.tags || '',
+                version: 1,
+                sync_status: 'synced',
+                local_changes: null,
+                last_synced_at: now,
+                needs_sync: false,
+              } as any)
+              try {
+                await BrochureRefreshService.refreshFromServer(userResult.user.id)
+              } catch {
+                // local upsert is enough for Available tab
+              }
+            }
+
             Alert.alert(
               'Success',
               `ZIP processed successfully! Created ${zipResult.brochureData.totalSlides} slides.`,
-              [{ text: 'OK', onPress: () => navigation.navigate('ViewAllBrochures') }]
+              [{ text: 'OK', onPress: goAfterSuccess }],
             )
           } else {
             Alert.alert('Error', zipResult.error || 'Failed to process ZIP file')
           }
-        } else {
-          Alert.alert('Error', result.error || 'Failed to create brochure record')
         }
       } else {
-        // Handle single file upload (existing logic)
-        const result = await AdminService.createBrochure(
+        const createBrochure = isMr
+          ? MRService.createBrochure.bind(MRService)
+          : AdminService.createBrochure.bind(AdminService)
+        const result = await createBrochure(
           formData.title,
           formData.category,
           formData.description || undefined,
@@ -225,15 +317,20 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
           selectedFile?.uri || undefined,
           undefined,
           selectedFile ? `${Math.round(selectedFile.fileSize / 1024)}KB` : undefined,
-          formData.tags ? formData.tags.split(',').map(tag => tag.trim()) : undefined
+          formData.tags ? formData.tags.split(',').map(tag => tag.trim()) : undefined,
         )
 
         if (result.success) {
-          Alert.alert(
-            'Success',
-            'Brochure created successfully!',
-            [{ text: 'OK', onPress: () => navigation.navigate('ViewAllBrochures') }]
-          )
+          if (isMr && userResult.user) {
+            try {
+              await BrochureRefreshService.refreshFromServer(userResult.user.id)
+            } catch {
+              // non-fatal
+            }
+          }
+          Alert.alert('Success', 'Brochure created successfully!', [
+            { text: 'OK', onPress: goAfterSuccess },
+          ])
         } else {
           Alert.alert('Error', result.error || 'Failed to create brochure')
         }
@@ -241,14 +338,12 @@ export default function AddBrochureScreen({ navigation }: AddBrochureScreenProps
     } catch (error) {
       console.error('Upload error:', error)
       const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred'
-      
-      // Show storage fix option if it's a size limit error
       if (errorMessage.includes('exceeded the maximum allowed size')) {
         setShowStorageFix(true)
         Alert.alert(
           'Upload Failed',
           'File size limit exceeded. This might be a storage bucket configuration issue.\n\nTry the "Fix Storage" button below to reset the storage bucket.',
-          [{ text: 'OK' }]
+          [{ text: 'OK' }],
         )
       } else {
         Alert.alert('Error', errorMessage)

@@ -231,7 +231,7 @@ export interface LocalPermission {
   id: string;
   user_id: string;
   permission_key: string;
-  value: string;
+  value: string | boolean;
   created_at: string;
   updated_at: string;
   sync_status: 'pending' | 'synced' | 'conflict' | 'error';
@@ -6486,7 +6486,10 @@ export class LocalDatabaseService {
           created_at = excluded.created_at,
           timestamp = excluded.timestamp,
           sync_status = excluded.sync_status,
-          is_deleted = excluded.is_deleted,
+          is_deleted = CASE
+            WHEN activity_logs.is_deleted = 1 THEN 1
+            ELSE excluded.is_deleted
+          END,
           needs_sync = 0`,
         [
           targetId,
@@ -6544,7 +6547,7 @@ export class LocalDatabaseService {
     
     try {
       const result = await this.db.getFirstAsync(`
-        SELECT * FROM activity_logs WHERE id = ? AND is_deleted = 0
+        SELECT * FROM activity_logs WHERE id = ?
       `, [id]);
 
       if (!result) return null;
@@ -6558,6 +6561,29 @@ export class LocalDatabaseService {
       } as LocalActivityLog;
     } catch (error) {
       console.error('LocalDB: Failed to get activity log by ID:', error);
+      throw error;
+    }
+  }
+
+  static async getActivityLogByServerId(serverId: string): Promise<LocalActivityLog | null> {
+    await this.initialize();
+
+    try {
+      const result = await this.db.getFirstAsync(
+        `SELECT * FROM activity_logs WHERE server_id = ? LIMIT 1`,
+        [serverId],
+      );
+      if (!result) return null;
+
+      const row = result as any;
+      return {
+        ...row,
+        activity_type: row.activity_type || row.action || '',
+        description: row.description || row.details || '',
+        is_deleted: Boolean(row.is_deleted),
+      } as LocalActivityLog;
+    } catch (error) {
+      console.error('LocalDB: Failed to get activity log by server ID:', error);
       throw error;
     }
   }
@@ -6743,20 +6769,66 @@ export class LocalDatabaseService {
     await this.initialize();
     
     try {
-      const now = new Date().toISOString();
-      
       await this.db.runAsync(`
         UPDATE activity_logs 
-        SET is_deleted = 1, updated_at = ?, version = version + 1, sync_status = ? 
+        SET is_deleted = 1, version = version + 1, sync_status = 'synced', needs_sync = 0
         WHERE id = ?
-      `, [now, 'pending', id]);
+      `, [id]);
 
-      // Add to sync queue
-      await this.addToSyncQueue('delete', 'activity_logs', id, { id, is_deleted: true });
+      // Backend has no activity_logs delete action — local tombstone only.
+      await this.db.runAsync(
+        `UPDATE sync_operations
+         SET status = 'completed', error_message = 'activity_logs delete is local-only'
+         WHERE table_name = 'activity_logs' AND record_id = ? AND status IN ('pending', 'failed')`,
+        [id],
+      );
       
       console.log('LocalDB: Activity log deleted:', id);
     } catch (error) {
       console.error('LocalDB: Failed to delete activity log:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Soft-delete all activity logs for an MR so dashboard Clear persists across navigation.
+   * Backend sync does not support activity_logs delete — keep tombstones local only.
+   */
+  static async clearActivityLogsForMr(mrId: string): Promise<number> {
+    await this.initialize();
+
+    try {
+      const rows = await this.db.getAllAsync<{ id: string }>(
+        `SELECT id FROM activity_logs WHERE mr_id = ? AND is_deleted = 0`,
+        [mrId],
+      );
+      if (!rows?.length) {
+        return 0;
+      }
+
+      // activity_logs has no updated_at column — only soft-delete flags.
+      // Mark synced: server has no delete action for this entity.
+      await this.db.runAsync(
+        `UPDATE activity_logs
+         SET is_deleted = 1, version = version + 1, sync_status = 'synced', needs_sync = 0
+         WHERE mr_id = ? AND is_deleted = 0`,
+        [mrId],
+      );
+
+      // Drop any pending/failed create/delete ops for these rows so Clear doesn't break Sync Now.
+      for (const row of rows) {
+        await this.db.runAsync(
+          `UPDATE sync_operations
+           SET status = 'completed', error_message = 'activity_logs clear is local-only'
+           WHERE table_name = 'activity_logs' AND record_id = ? AND status IN ('pending', 'failed')`,
+          [row.id],
+        );
+      }
+
+      console.log(`LocalDB: Cleared ${rows.length} activity log(s) for MR ${mrId}`);
+      return rows.length;
+    } catch (error) {
+      console.error('LocalDB: Failed to clear activity logs:', error);
       throw error;
     }
   }
@@ -7164,18 +7236,27 @@ export class LocalDatabaseService {
           ) {
             stale = true;
           }
-        } else if (op.table_name === 'activity_logs' && op.operation_type === 'create') {
-          const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data;
-          const doctorId = data?.metadata
-            ? (typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata)?.doctor_id
-            : undefined;
-          const activityType = data?.activity_type || data?.action;
-          if (doctorId && activityType === 'doctor_added') {
-            const doctor = await this.queryFirstSql<{ is_deleted: number; server_id: string | null }>(
-              `SELECT is_deleted, server_id FROM doctors WHERE id = ?`,
-              [doctorId],
-            );
-            if (!doctor || (doctor.is_deleted && !doctor.server_id)) {
+        } else if (op.table_name === 'activity_logs') {
+          // Backend sync push only supports activity_logs create.
+          if (op.operation_type === 'delete' || op.operation_type === 'update') {
+            stale = true;
+          } else if (op.operation_type === 'create') {
+            const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data;
+            const doctorId = data?.metadata
+              ? (typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata)?.doctor_id
+              : undefined;
+            const activityType = data?.activity_type || data?.action;
+            if (doctorId && activityType === 'doctor_added') {
+              const doctor = await this.queryFirstSql<{ is_deleted: number; server_id: string | null }>(
+                `SELECT is_deleted, server_id FROM doctors WHERE id = ?`,
+                [doctorId],
+              );
+              if (!doctor || (doctor.is_deleted && !doctor.server_id)) {
+                stale = true;
+              }
+            }
+            const log = await this.getActivityLogById(op.record_id);
+            if (log?.is_deleted) {
               stale = true;
             }
           }
@@ -8455,9 +8536,17 @@ export class LocalDatabaseService {
 
   static async upsertPermission(permission: LocalPermission): Promise<void> {
     await this.initialize();
+    const normalizedValue =
+      typeof permission.value === 'boolean'
+        ? permission.value
+          ? '1'
+          : '0'
+        : String(permission.value ?? '');
+    const payload = { ...permission, value: normalizedValue };
+
     if (this.isUsingAsyncStorage()) {
         const key = `permission_${permission.user_id}_${permission.permission_key}`;
-        await AsyncStorage.setItem(key, JSON.stringify(permission));
+        await AsyncStorage.setItem(key, JSON.stringify(payload));
         return;
     }
     
@@ -8496,15 +8585,47 @@ export class LocalDatabaseService {
         sync_status = excluded.sync_status,
         local_changes = excluded.local_changes;
     `, [
-      permission.id,
-      permission.user_id,
-      permission.permission_key,
-      permission.value,
-      permission.created_at,
-      permission.updated_at,
-      permission.sync_status,
-      permission.local_changes || null
+      payload.id,
+      payload.user_id,
+      payload.permission_key,
+      payload.value,
+      payload.created_at,
+      payload.updated_at,
+      payload.sync_status,
+      payload.local_changes || null
     ]);
+  }
+
+  /** Read a stored MR permission flag (from login sync). */
+  static async getPermissionValue(userId: string, permissionKey: string): Promise<boolean | null> {
+    await this.initialize();
+    try {
+      if (this.isUsingAsyncStorage()) {
+        const raw = await AsyncStorage.getItem(`permission_${userId}_${permissionKey}`);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as { value?: unknown };
+        return this.coercePermissionFlag(parsed.value);
+      }
+
+      const row = await this.db.getFirstAsync<{ value: unknown }>(
+        `SELECT value FROM mr_permissions WHERE user_id = ? AND permission_key = ? LIMIT 1`,
+        [userId, permissionKey],
+      );
+      if (!row) return null;
+      return this.coercePermissionFlag(row.value);
+    } catch (error) {
+      console.warn('LocalDB: Failed to read permission', permissionKey, error);
+      return null;
+    }
+  }
+
+  static coercePermissionFlag(value: unknown): boolean {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value === 1;
+    const normalized = String(value ?? '')
+      .trim()
+      .toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'yes';
   }
 
   static async upsertSession(session: LocalSession): Promise<void> {

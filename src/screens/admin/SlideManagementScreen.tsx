@@ -38,9 +38,11 @@ import * as ImagePicker from 'expo-image-picker'
 import * as FileSystem from 'expo-file-system'
 import * as ScreenOrientation from 'expo-screen-orientation'
 import { BrochureManagementService, BrochureSlide, SlideGroup } from '../../services/brochureManagementService'
+import SlideDeckPager from '../../components/SlideDeckPager'
 import { MRService } from '../../services/MRService'
 import { AuthService } from '../../services/AuthService'
 import { OfflineFirstService } from '../../services/offlineFirstService'
+import { LocalDatabaseService } from '../../services/localDatabaseService'
 import { UnifiedDataService } from '../../services/UnifiedDataService'
 // import BrochureSyncStatus from '../../components/BrochureSyncStatus' // DELETED
 // import SyncStatusIndicator from '../../components/SyncStatusIndicator' // DELETED
@@ -102,6 +104,8 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const [showFullscreenViewer, setShowFullscreenViewer] = useState(false)
   const [fullscreenSlides, setFullscreenSlides] = useState<BrochureSlide[]>([])
   const [fullscreenStartIndex, setFullscreenStartIndex] = useState(0)
+  const [presentNotesBySlide, setPresentNotesBySlide] = useState<Record<string, number>>({})
+  const [presentNoteTextBySlide, setPresentNoteTextBySlide] = useState<Record<string, string>>({})
 
   // Doctor selection for group creation (MR only)
   const [availableDoctors, setAvailableDoctors] = useState<any[]>([])
@@ -1485,13 +1489,33 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
   const filteredSlides = getFilteredSlides()
 
   // Open fullscreen viewer with current context
-  const openFullscreenViewer = (startSlide?: BrochureSlide) => {
+  const openFullscreenViewer = async (startSlide?: BrochureSlide) => {
     const slidesToShow = getFilteredSlides()
     const startIndex = startSlide ? slidesToShow.findIndex(s => s.id === startSlide.id) : 0
     
     setFullscreenSlides(slidesToShow)
     setFullscreenStartIndex(Math.max(0, startIndex))
     setShowFullscreenViewer(true)
+
+    try {
+      const ids = slidesToShow.map((s) => s.id).filter(Boolean)
+      const notes = await LocalDatabaseService.getMeetingNotesForBrochureSlides(brochureId, ids)
+      const counts: Record<string, number> = {}
+      const texts: Record<string, string> = {}
+      for (const note of notes) {
+        const key = String(note.slide_id || '')
+        if (!key) continue
+        counts[key] = (counts[key] || 0) + 1
+        if (!texts[key] && note.note_text) {
+          texts[key] = String(note.note_text)
+        }
+      }
+      setPresentNotesBySlide(counts)
+      setPresentNoteTextBySlide(texts)
+    } catch {
+      setPresentNotesBySlide({})
+      setPresentNoteTextBySlide({})
+    }
   }
 
   return (
@@ -3156,6 +3180,21 @@ export default function SlideManagementScreen({ navigation, route }: SlideManage
             startIndex={fullscreenStartIndex}
             groupName={selectedGroup ? groups.find(g => g.id === selectedGroup)?.name : 'All Slides'}
             onClose={() => setShowFullscreenViewer(false)}
+            onAddNote={(slide) => {
+              setCurrentSlideForNotes(slide)
+              setShowNotesModal(true)
+              loadAvailableMeetings()
+            }}
+            getNotesCount={(slideId) => presentNotesBySlide[slideId] || 0}
+            onViewNotes={(slide) => {
+              const text = presentNoteTextBySlide[slide.id]
+              const count = presentNotesBySlide[slide.id] || 0
+              if (!text && count <= 0) return
+              Alert.alert(
+                count > 1 ? `Notes (${count})` : 'Slide Note',
+                text || 'Note saved for this slide.',
+              )
+            }}
           />
         </Modal>
       </SafeAreaView>
@@ -3169,66 +3208,28 @@ interface FullscreenSlideViewerProps {
   startIndex: number
   groupName?: string
   onClose: () => void
+  onAddNote?: (slide: BrochureSlide) => void
+  onViewNotes?: (slide: BrochureSlide) => void
+  getNotesCount?: (slideId: string) => number
 }
 
-function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: FullscreenSlideViewerProps) {
+function FullscreenSlideViewer({
+  slides,
+  startIndex,
+  groupName,
+  onClose,
+  onAddNote,
+  onViewNotes,
+  getNotesCount,
+}: FullscreenSlideViewerProps) {
   const [currentSlideIndex, setCurrentSlideIndex] = useState(startIndex)
   const [showControls, setShowControls] = useState(true)
   const [showSlideList, setShowSlideList] = useState(false)
-  const [slideDirection, setSlideDirection] = useState<'left' | 'right'>('right')
-  
-  // Manual swipe detection with fallback
-  const [touchStart, setTouchStart] = useState<number | null>(null)
-  const [touchEnd, setTouchEnd] = useState<number | null>(null)
-  const [lastTouchMove, setLastTouchMove] = useState<number | null>(null)
-  
-  // Simple transition animations
-  const slideOpacity = useSharedValue(1)
-  
-  useEffect(() => {
-    // Initialize simple animations
-    slideOpacity.value = 1
-  }, [])
-  
 
+  const currentSlide =
+    slides && slides.length > 0 ? slides[Math.min(currentSlideIndex, slides.length - 1)] : null
+  const notesCount = currentSlide && getNotesCount ? getNotesCount(currentSlide.id) : 0
 
-  const handlePreviousSlide = () => {
-    if (currentSlideIndex > 0 && slides.length > 0) {
-      setSlideDirection('right')
-      setCurrentSlideIndex(prev => Math.max(0, prev - 1))
-      
-      // Reset touch states
-      setTouchStart(null)
-      setTouchEnd(null)
-      setLastTouchMove(null)
-    }
-  }
-
-  const handleNextSlide = () => {
-    if (currentSlideIndex < slides.length - 1 && slides.length > 0) {
-      setSlideDirection('left')
-      setCurrentSlideIndex(prev => Math.min(slides.length - 1, prev + 1))
-      
-      // Reset touch states
-      setTouchStart(null)
-      setTouchEnd(null)
-      setLastTouchMove(null)
-    }
-  }
-
-  // Remove gesture handlers to prevent conflicts and crashes
-  
-  // Simple animated style for slide transitions
-  const animatedSlideStyle = useAnimatedStyle(() => {
-    return {
-      opacity: slideOpacity.value,
-    }
-  })
-  
-  const currentSlide = slides && slides.length > 0 ? slides[Math.min(currentSlideIndex, slides.length - 1)] : null
-
-
-  // Ensure we have a valid slide
   if (!slides || slides.length === 0) {
     return (
       <View style={styles.fullscreenContainer}>
@@ -3236,24 +3237,11 @@ function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: Fulls
         <View style={styles.fullscreenNoSlideContainer}>
           <Ionicons name="document-text" size={64} color="#9ca3af" />
           <Text style={styles.fullscreenNoSlideText}>No slides available</Text>
-          <TouchableOpacity style={{marginTop: 20, padding: 12, backgroundColor: '#8b5cf6', borderRadius: 8}} onPress={onClose}>
-            <Text style={{color: '#ffffff', fontWeight: '600'}}>Close</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    )
-  }
-
-  if (!currentSlide) {
-    console.error('FullscreenViewer: No current slide!')
-    return (
-      <View style={styles.fullscreenContainer}>
-        <StatusBar style="light" hidden />
-        <View style={styles.fullscreenNoSlideContainer}>
-          <Ionicons name="image-outline" size={64} color="#9ca3af" />
-          <Text style={styles.fullscreenNoSlideText}>Slide not available</Text>
-          <TouchableOpacity style={{marginTop: 20, padding: 12, backgroundColor: '#8b5cf6', borderRadius: 8}} onPress={onClose}>
-            <Text style={{color: '#ffffff', fontWeight: '600'}}>Close</Text>
+          <TouchableOpacity
+            style={{ marginTop: 20, padding: 12, backgroundColor: '#8b5cf6', borderRadius: 8 }}
+            onPress={onClose}
+          >
+            <Text style={{ color: '#ffffff', fontWeight: '600' }}>Close</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -3262,135 +3250,147 @@ function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: Fulls
 
   return (
     <>
-    <View style={styles.fullscreenContainer}>
-      <StatusBar style="light" hidden />
-      
-      {/* Header Overlay - Animated */}
-      {showControls && (
-        <Animated.View entering={FadeIn.duration(300)} exiting={FadeOut.duration(300)} style={styles.fullscreenHeaderOverlay}>
-          <TouchableOpacity style={styles.fullscreenCloseButton} onPress={onClose}>
-            <Ionicons name="close" size={28} color="#ffffff" />
-          </TouchableOpacity>
-          
-          <View style={styles.fullscreenHeaderInfo}>
-            <Text style={styles.fullscreenTitleText}>{groupName || 'Slides'}</Text>
-            <Text style={styles.fullscreenSubtitleText}>Swipe to navigate</Text>
-          </View>
+      <View style={styles.fullscreenContainer}>
+        <StatusBar style="light" hidden />
 
-        </Animated.View>
-      )}
+        {showControls && (
+          <Animated.View
+            entering={FadeIn.duration(300)}
+            exiting={FadeOut.duration(300)}
+            style={styles.fullscreenHeaderOverlay}
+          >
+            <TouchableOpacity style={styles.fullscreenCloseButton} onPress={onClose}>
+              <Ionicons name="close" size={28} color="#ffffff" />
+            </TouchableOpacity>
 
-      {/* Floating Toggle Button - Always Visible */}
-      <TouchableOpacity 
-        style={styles.fullscreenFloatingToggle} 
-        onPress={() => setShowControls(prev => !prev)}
-      >
-        <Ionicons name={showControls ? "eye-off" : "eye"} size={24} color="#ffffff" />
-      </TouchableOpacity>
-
-      {/* Floating Counter - Always Visible */}
-      <TouchableOpacity 
-        style={styles.fullscreenFloatingCounter} 
-        onPress={() => setShowSlideList(true)}
-      >
-        <Ionicons name="list" size={16} color="#ffffff" style={{ marginRight: 6 }} />
-        <Text style={styles.fullscreenFloatingCounterText}>
-          {currentSlideIndex + 1} / {slides.length}
-        </Text>
-      </TouchableOpacity>
-
-
-      {/* Fullscreen Slide Display with Manual Swipe Detection */}
-      <View 
-        style={styles.fullscreenSlideContainer}
-        onTouchStart={(event) => {
-          const touchX = event.nativeEvent.touches[0]?.pageX
-          setTouchStart(touchX)
-        }}
-        onTouchMove={(event) => {
-          const touchX = event.nativeEvent.touches[0]?.pageX
-          setLastTouchMove(touchX)
-        }}
-        onTouchEnd={(event) => {
-          const touchX = event.nativeEvent.changedTouches[0]?.pageX
-          setTouchEnd(touchX)
-          
-          // Ultra-sensitive swipe detection with fallback
-          const endX = touchX || lastTouchMove
-          if (touchStart !== null && endX !== null) {
-            const swipeDistance = endX - touchStart
-            
-            if (swipeDistance > 10) {
-              handleNextSlide()
-            } else if (swipeDistance < -10) {
-              handlePreviousSlide()
-            }
-          }
-        }}
-      >
-          {currentSlide && slides.length > 0 ? (
-            <>
-              {/* Slide Image - With smooth transitions */}
-              <Animated.Image
-                source={{ uri: currentSlide.imageUri }}
-                style={[styles.fullscreenSlideImage, animatedSlideStyle]}
-                resizeMode="contain"
-                onError={(error) => {
-                  // Handle image load error silently
-                }}
-                onLoad={() => {
-                  // Image loaded successfully
-                }}
-              />
-              
-              {/* Bottom Controls - Animated (only slide title) */}
-              {showControls && currentSlide.title && (
-                <Animated.View entering={FadeIn.duration(300)} exiting={FadeOut.duration(300)} style={styles.fullscreenBottomControls}>
-                  <View style={styles.fullscreenSlideTitleOverlay}>
-                    <Text style={styles.fullscreenSlideTitleText} numberOfLines={2}>{currentSlide.title}</Text>
-                  </View>
-                </Animated.View>
-              )}
-            </>
-          ) : (
-            <View style={styles.fullscreenNoSlideContainer}>
-              <Ionicons name="document-text" size={64} color="#9ca3af" />
-              <Text style={styles.fullscreenNoSlideText}>No slides available</Text>
+            <View style={[styles.fullscreenHeaderInfo, { flex: 1, marginHorizontal: 12 }]}>
+              <Text style={styles.fullscreenTitleText}>{groupName || 'Slides'}</Text>
+              <Text style={styles.fullscreenSubtitleText}>Swipe right to left for next</Text>
             </View>
+
+            {/* View notes + Add note + Eye toggle — same row (right side) */}
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              {notesCount > 0 && (
+                <TouchableOpacity
+                  style={{
+                    width: 44,
+                    height: 44,
+                    borderRadius: 22,
+                    backgroundColor: 'rgba(59, 130, 246, 0.95)',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                  onPress={() => currentSlide && onViewNotes?.(currentSlide)}
+                >
+                  <Ionicons name="document-text" size={20} color="#ffffff" />
+                  <View
+                    style={{
+                      position: 'absolute',
+                      top: -2,
+                      right: -2,
+                      backgroundColor: '#ef4444',
+                      borderRadius: 8,
+                      minWidth: 16,
+                      height: 16,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      paddingHorizontal: 3,
+                    }}
+                  >
+                    <Text style={{ color: '#fff', fontSize: 10, fontWeight: '700' }}>
+                      {notesCount > 9 ? '9+' : String(notesCount)}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              )}
+              {onAddNote && (
+                <TouchableOpacity
+                  style={{
+                    width: 44,
+                    height: 44,
+                    borderRadius: 22,
+                    backgroundColor: 'rgba(16, 185, 129, 0.9)',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                  onPress={() => currentSlide && onAddNote(currentSlide)}
+                >
+                  <Ionicons name="create" size={20} color="#ffffff" />
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: 22,
+                  backgroundColor: 'rgba(139, 92, 246, 0.9)',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+                onPress={() => setShowControls(false)}
+              >
+                <Ionicons name="eye-off" size={22} color="#ffffff" />
+              </TouchableOpacity>
+            </View>
+          </Animated.View>
+        )}
+
+        {/* Eye toggle stays available when header controls are hidden */}
+        {!showControls && (
+          <TouchableOpacity
+            style={styles.fullscreenFloatingToggle}
+            onPress={() => setShowControls(true)}
+          >
+            <Ionicons name="eye" size={24} color="#ffffff" />
+          </TouchableOpacity>
+        )}
+
+        <TouchableOpacity
+          style={styles.fullscreenFloatingCounter}
+          onPress={() => setShowSlideList(true)}
+        >
+          <Ionicons name="list" size={16} color="#ffffff" style={{ marginRight: 6 }} />
+          <Text style={styles.fullscreenFloatingCounterText}>
+            {currentSlideIndex + 1} / {slides.length}
+          </Text>
+        </TouchableOpacity>
+
+        <View style={styles.fullscreenSlideContainer}>
+          <SlideDeckPager
+            slides={slides.map((s) => ({ id: s.id, imageUri: s.imageUri, title: s.title }))}
+            initialIndex={currentSlideIndex}
+            advanceOnSwipeRight={false}
+            onIndexChange={setCurrentSlideIndex}
+          />
+
+          {showControls && currentSlide?.title && (
+            <Animated.View
+              entering={FadeIn.duration(300)}
+              exiting={FadeOut.duration(300)}
+              style={styles.fullscreenBottomControls}
+            >
+              <View style={styles.fullscreenSlideTitleOverlay}>
+                <Text style={styles.fullscreenSlideTitleText} numberOfLines={2}>
+                  {currentSlide.title}
+                </Text>
+              </View>
+            </Animated.View>
           )}
+        </View>
+
+        {currentSlideIndex === 0 && (
+          <Animated.View style={styles.boundaryIndicator}>
+            <Text style={styles.boundaryText}>First slide</Text>
+          </Animated.View>
+        )}
+        {currentSlideIndex === slides.length - 1 && (
+          <Animated.View style={styles.boundaryIndicator}>
+            <Text style={styles.boundaryText}>Last slide</Text>
+          </Animated.View>
+        )}
       </View>
 
-      {/* Navigation hints */}
-      {slides.length > 1 && showControls && (
-        <>
-          {currentSlideIndex > 0 && (
-            <Animated.View entering={FadeIn} exiting={FadeOut} style={styles.fullscreenNavHintLeft}>
-              <Ionicons name="chevron-back" size={32} color="rgba(255, 255, 255, 0.3)" />
-            </Animated.View>
-          )}
-          {currentSlideIndex < slides.length - 1 && (
-            <Animated.View entering={FadeIn} exiting={FadeOut} style={styles.fullscreenNavHintRight}>
-              <Ionicons name="chevron-forward" size={32} color="rgba(255, 255, 255, 0.3)" />
-            </Animated.View>
-          )}
-        </>
-      )}
-
-      {/* Boundary indicators */}
-      {currentSlideIndex === 0 && (
-        <Animated.View style={styles.boundaryIndicator}>
-          <Text style={styles.boundaryText}>First slide</Text>
-        </Animated.View>
-      )}
-      {currentSlideIndex === slides.length - 1 && (
-        <Animated.View style={styles.boundaryIndicator}>
-          <Text style={styles.boundaryText}>Last slide</Text>
-        </Animated.View>
-      )}
-    </View>
-
-    {/* Slide List Modal */}
-    <Modal visible={showSlideList} transparent animationType="slide">
+      <Modal visible={showSlideList} transparent animationType="slide">
         <View style={styles.slideListModalOverlay}>
           <View style={styles.slideListModalContent}>
             <View style={styles.slideListHeader}>
@@ -3399,7 +3399,7 @@ function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: Fulls
                 <Ionicons name="close" size={24} color="#1f2937" />
               </TouchableOpacity>
             </View>
-            
+
             <FlatList
               data={slides}
               keyExtractor={(item, index) => `${item.id}-${index}`}
@@ -3407,15 +3407,15 @@ function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: Fulls
                 <TouchableOpacity
                   style={[
                     styles.slideListItem,
-                    currentSlideIndex === index && styles.slideListItemActive
+                    currentSlideIndex === index && styles.slideListItemActive,
                   ]}
                   onPress={() => {
                     setCurrentSlideIndex(index)
                     setShowSlideList(false)
                   }}
                 >
-                  <Image 
-                    source={{ uri: item.imageUri }} 
+                  <Image
+                    source={{ uri: item.imageUri }}
                     style={styles.slideListThumbnail}
                     resizeMode="cover"
                   />
@@ -3437,6 +3437,7 @@ function FullscreenSlideViewer({ slides, startIndex, groupName, onClose }: Fulls
     </>
   )
 }
+
 
 const styles = StyleSheet.create({
   container: {

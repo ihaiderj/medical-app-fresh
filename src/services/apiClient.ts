@@ -218,16 +218,20 @@ export const apiClient = {
     localFilePath: string,
     fileName: string,
     extraFields?: Record<string, string>,
+    mimeType?: string,
   ): Promise<{ file_url: string; file_name: string; file_type: string; file_size: string }> {
     const fileInfo = await FileSystem.getInfoAsync(localFilePath)
     if (!fileInfo.exists) {
       throw new ApiError('File does not exist')
     }
 
+    const resolvedType = mimeType || mimeTypeFromFileName(fileName)
     const formData = new FormData()
+    // React Native FormData file part — do not set Content-Type on the request
+    // so fetch can attach the multipart boundary automatically.
     formData.append('file', {
       uri: localFilePath,
-      type: mimeTypeFromFileName(fileName),
+      type: resolvedType,
       name: fileName,
     } as unknown as Blob)
 
@@ -237,6 +241,14 @@ export const apiClient = {
       })
     }
 
-    return request('POST', endpoint, { body: formData, timeoutMs: 120000 })
+    console.log('apiClient.uploadFile:', {
+      endpoint,
+      fileName,
+      type: resolvedType,
+      size: fileInfo.size,
+      extraFieldKeys: extraFields ? Object.keys(extraFields) : [],
+    })
+
+    return request('POST', endpoint, { body: formData, timeoutMs: 180000 })
   },
 }

@@ -1,6 +1,7 @@
 import { apiClient, ApiError } from './apiClient'
 import { resolveMediaUrl } from '../config/apiConfig'
 import { AuthService } from './AuthService'
+import { NetworkService } from './networkService'
 import { resolveServerBrochureId } from '../utils/brochureTypeUtils'
 import * as FileSystem from 'expo-file-system'
 
@@ -428,9 +429,9 @@ export class MRService {
     pages?: number,
     fileSize?: string,
     tags?: string[],
-  ): Promise<{ success: boolean; data?: unknown; error?: string }> {
+  ): Promise<{ success: boolean; data?: { brochure_id?: string; id?: string }; error?: string }> {
     try {
-      const data = await apiClient.post('/api/mr/brochures/upload/', {
+      const data = await apiClient.post<{ brochure_id?: string; id?: string }>('/api/mr/brochures/upload/', {
         title,
         category: category?.trim() || 'General',
         description,
@@ -443,9 +444,71 @@ export class MRService {
         tags,
         is_public: true,
       })
-      return { success: true, data }
+      const brochureId = data?.brochure_id || data?.id
+      return { success: true, data: { ...data, brochure_id: brochureId } }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to create brochure') }
+    }
+  }
+
+  /**
+   * Backend expects multipart on POST /api/mr/brochures/upload/
+   * (file + brochure fields) — not a separate /api/files/... call + JSON body.
+   */
+  static async uploadBrochureMultipart(params: {
+    localFilePath: string
+    fileName: string
+    mimeType?: string
+    title: string
+    category?: string
+    description?: string
+    tags?: string[]
+    fileSize?: string
+  }): Promise<{
+    success: boolean
+    data?: { brochure_id?: string; id?: string; file_url?: string }
+    error?: string
+  }> {
+    try {
+      const extraFields: Record<string, string> = {
+        title: params.title.trim(),
+        category: (params.category || 'General').trim() || 'General',
+        is_public: 'true',
+      }
+      if (params.description) extraFields.description = params.description
+      if (params.fileSize) extraFields.file_size = params.fileSize
+      if (params.tags?.length) extraFields.tags = params.tags.join(',')
+      if (params.mimeType) extraFields.file_type = params.mimeType.substring(0, 100)
+      if (params.fileName) extraFields.file_name = params.fileName
+
+      const data = await apiClient.uploadFile(
+        '/api/mr/brochures/upload/',
+        params.localFilePath,
+        params.fileName,
+        extraFields,
+        params.mimeType,
+      )
+
+      // uploadFile normally returns file_url shape; MR endpoint may return brochure fields
+      const anyData = data as unknown as {
+        brochure_id?: string
+        id?: string
+        file_url?: string
+        file_name?: string
+        file_type?: string
+        file_size?: string
+      }
+      const brochureId = anyData.brochure_id || anyData.id
+      return {
+        success: true,
+        data: {
+          brochure_id: brochureId,
+          id: brochureId,
+          file_url: anyData.file_url ? resolveMediaUrl(anyData.file_url) : anyData.file_url,
+        },
+      }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to upload brochure') }
     }
   }
 
@@ -455,11 +518,17 @@ export class MRService {
 
   static async hasBrochureUploadPermission(): Promise<{ success: boolean; hasPermission?: boolean; error?: string }> {
     try {
+      const refreshed = await AuthService.refreshPermissions()
+      if (refreshed) {
+        return { success: true, hasPermission: !!refreshed.can_upload_brochures }
+      }
+
       const userResult = await AuthService.getCurrentUser()
       if (!userResult.success || !userResult.user) {
         return { success: false, error: 'User not authenticated' }
       }
-      return { success: true, hasPermission: !!userResult.user.can_upload_brochures }
+      const withPerms = await AuthService.attachLocalPermissions(userResult.user)
+      return { success: true, hasPermission: !!withPerms.can_upload_brochures }
     } catch (error) {
       return { success: false, error: serviceError(error, 'Failed to check permission') }
     }
@@ -780,9 +849,14 @@ export class MRService {
     }
   }
 
-  static async clearRecentActivities(_userId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
-    console.warn('clearRecentActivities: no server delete endpoint; clearing local cache only')
-    return { success: true, data: null }
+  static async clearRecentActivities(userId: string): Promise<{ success: boolean; data?: unknown; error?: string }> {
+    try {
+      const { LocalDatabaseService } = await import('./localDatabaseService')
+      const cleared = await LocalDatabaseService.clearActivityLogsForMr(userId)
+      return { success: true, data: { cleared } }
+    } catch (error) {
+      return { success: false, error: serviceError(error, 'Failed to clear recent activities') }
+    }
   }
 
   static async addDoctor(_mrId: string, doctorData: Record<string, unknown>): Promise<{ success: boolean; data?: unknown; error?: string }> {

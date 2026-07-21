@@ -183,10 +183,11 @@ export class PersistentAuthService {
         await SessionManagementService.recordLocalSession(userProfile.id)
         // Import AuthService statically to avoid Metro bundler issues
         const { AuthService } = require('./AuthService')
-        AuthService.setCurrentUser(userProfile)
+        const withPerms = await AuthService.attachLocalPermissions(userProfile)
+        AuthService.setCurrentUser(withPerms)
 
         console.log('Auto-login succeeded using local credentials')
-        return { success: true, user: userProfile }
+        return { success: true, user: withPerms }
       }
 
       // Attempt login with saved credentials
@@ -241,11 +242,12 @@ export class PersistentAuthService {
 
       await SessionManagementService.recordLocalSession(userProfile.id)
       const { AuthService } = require('./AuthService')
-      AuthService.setCurrentUser(userProfile)
+      const withPerms = await AuthService.attachLocalPermissions(userProfile)
+      AuthService.setCurrentUser(withPerms)
       await this.saveSession(extended.userId, extended.email, extended.role, undefined, true)
 
       console.log('Auto-login succeeded using extended offline session')
-      return { success: true, user: userProfile }
+      return { success: true, user: withPerms }
     } catch (error) {
       console.warn('PersistentAuth: Extended session restore failed:', error)
       return { success: false, error: 'Extended session restore failed' }

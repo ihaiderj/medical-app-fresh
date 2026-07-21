@@ -175,6 +175,7 @@ function AppNavigator() {
             // MR user - show MRTabs
             <>
               <Stack.Screen name="MRTabs" component={MRTabs} options={{ headerShown: false }} />
+              <Stack.Screen name="AddBrochure" component={AddBrochureScreen} />
               <Stack.Screen name="SlideManagement" component={SlideManagementScreen} />
               <Stack.Screen name="BrochureViewer" component={BrochureViewerScreen} />
               <Stack.Screen name="DoctorBrochures" component={DoctorBrochuresScreen} />

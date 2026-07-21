@@ -1894,9 +1894,24 @@ export class SyncService {
       const data = typeof op.data === 'string' ? JSON.parse(op.data) : op.data
       console.log(`🔄 SYNC ACTIVITY LOG: ${op.operation_type}`, data)
 
+      // Backend sync push does not support activity_logs delete/update.
+      // Clear Activity is local-only; complete the queue op so Sync Now succeeds.
+      if (op.operation_type === 'delete' || op.operation_type === 'update') {
+        console.log(
+          `⏭️ SYNC ACTIVITY LOG: Skipping ${op.operation_type} for ${op.record_id} (local-only)`,
+        )
+        return true
+      }
+
       if (op.operation_type === 'create') {
         // Prefer live local row (correct field mapping); fall back to queue payload aliases.
         const local = await LocalDatabaseService.getActivityLogById(op.record_id)
+        if (local?.is_deleted) {
+          console.log(
+            `⏭️ SYNC ACTIVITY LOG: Skipping create for cleared activity ${op.record_id}`,
+          )
+          return true
+        }
         const activityType = String(
           local?.activity_type || data.activity_type || data.action || '',
         ).trim()
@@ -2582,7 +2597,15 @@ export class SyncService {
     }
 
     if (op.table_name === 'activity_logs') {
+      // Backend only accepts create for activity_logs — delete/update stay local.
+      if (op.operation_type === 'delete' || op.operation_type === 'update') {
+        return { skip: true }
+      }
+
       const local = await LocalDatabaseService.getActivityLogById(op.record_id)
+      if (local?.is_deleted) {
+        return { skip: true }
+      }
       const activityType = String(
         local?.activity_type || data.activity_type || data.action || '',
       ).trim()
@@ -3203,11 +3226,21 @@ export class SyncService {
       for (const alog of data.activity_logs || []) {
         try {
           if (alog.is_deleted) continue
+
+          const localId = `activity_${alog.id}`
+          // Preserve Clear Activity tombstones — do not resurrect from sync-down.
+          const existingByServer = await LocalDatabaseService.getActivityLogByServerId(
+            String(alog.id),
+          )
+          if (existingByServer?.is_deleted) {
+            continue
+          }
+
           // Backend note: the meaningful field is `activity_type` (`action` is a
           // legacy column that is always empty). Likewise `description` is the
           // human-readable text; `details` is an empty {} object on all rows.
           await LocalDatabaseService.upsertActivityLog({
-            id: `activity_${alog.id}`,
+            id: localId,
             server_id: String(alog.id),
             user_id: alog.user_id || userId,
             mr_id: userId,
